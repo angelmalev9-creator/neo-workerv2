@@ -845,15 +845,14 @@ class HotSessionManager {
 
 async function main() {
   const manager = new HotSessionManager();
-  await manager.start();
-  
+
   const app = express();
   app.use(express.json({ limit: "10mb" }));
-  
+
   // Auth middleware
   app.use((req, res, next) => {
     if (req.path === "/" || req.path === "/health") return next();
-    
+
     const token = req.headers.authorization?.replace("Bearer ", "");
     if (token !== WORKER_SECRET) {
       console.log(`[AUTH] Rejected request to ${req.path}`);
@@ -861,100 +860,95 @@ async function main() {
     }
     next();
   });
-  
-  // Health check
+
+  // Root
   app.get("/", (_, res) => {
-    res.json({ 
+    res.json({
       name: "NEO Worker",
-      version: "4.0.0", 
+      version: "4.0.0",
       type: "hot-session",
-      status: "running"
+      status: "running",
     });
   });
-  
+
+  // Health check (НЕ ЗАВИСИ от browser)
   app.get("/health", (_, res) => {
-    res.json({ 
-      status: "ok", 
+    res.json({
+      status: "ok",
       ...manager.getStatus(),
     });
   });
-  
-  // PREPARE SESSION - called by Crawler after training
+
+  // --- ROUTES (не пипаме логиката) ---
   app.post("/prepare-session", async (req, res) => {
     const { site_id, site_map } = req.body;
-    
     if (!site_id || !site_map) {
       return res.json({ success: false, error: "Missing site_id or site_map" });
     }
-    
+
     const success = await manager.prepareSession(site_id, site_map);
     res.json({ success, session_ready: success });
   });
-  
-  // EXECUTE - main endpoint for actions (called by neo-agent-core)
+
   app.post("/execute", async (req, res) => {
     const { site_id, keywords, data } = req.body;
-    
-    if (!site_id) {
-      return res.json({ success: false, message: "Missing site_id" });
+    if (!site_id || !Array.isArray(keywords)) {
+      return res.json({ success: false, message: "Invalid request" });
     }
-    
-    if (!keywords || !Array.isArray(keywords)) {
-      return res.json({ success: false, message: "Missing keywords array" });
-    }
-    
+
     const result = await manager.execute({ site_id, keywords, data });
     res.json(result);
   });
-  
-  // CLOSE SESSION
+
   app.post("/close-session", async (req, res) => {
-    const { site_id } = req.body;
-    if (site_id) {
-      await manager.closeSession(site_id);
+    if (req.body.site_id) {
+      await manager.closeSession(req.body.site_id);
     }
     res.json({ success: true });
   });
-  
-  // Legacy /interact endpoint for backwards compatibility
+
   app.post("/interact", async (req, res) => {
     const request = req.body as InteractRequest;
-    
     if (!request.site_url || !request.user_message || !request.session_id) {
       return res.json({ success: false, message: "Missing fields", logs: [] });
     }
-    
+
     const result = await manager.interact(request);
     res.json(result);
   });
-  
-  // Legacy /close endpoint
+
   app.post("/close", async (req, res) => {
     if (req.body.session_id) {
       await manager.closeSession(req.body.session_id);
     }
     res.json({ success: true });
   });
-  
-  // Start server
+
+  // 🚀 START SERVER FIRST
   app.listen(PORT, () => {
     console.log(`\n🚀 NEO Worker v4.0 (Hot Sessions)`);
     console.log(`   Port: ${PORT}`);
-    console.log(`   Max Sessions: ${manager.getStatus().maxSessions}`);
-    console.log(`   Ready for requests!\n`);
+    console.log(`   Ready: ${manager.getStatus().ready}\n`);
   });
-  
+
+  // 🔥 START BROWSER ASYNC (НЕ блокира boot)
+  manager.start()
+    .then(() => console.log("[BOOT] HotSessionManager ready"))
+    .catch(err => {
+      console.error("[BOOT] HotSessionManager failed:", err);
+    });
+
   // Graceful shutdown
-  process.on("SIGTERM", async () => { 
+  process.on("SIGTERM", async () => {
     console.log("\n[SIGTERM] Shutting down...");
-    await manager.shutdown(); 
-    process.exit(0); 
+    await manager.shutdown();
+    process.exit(0);
   });
-  
-  process.on("SIGINT", async () => { 
+
+  process.on("SIGINT", async () => {
     console.log("\n[SIGINT] Shutting down...");
-    await manager.shutdown(); 
-    process.exit(0); 
+    await manager.shutdown();
+    process.exit(0);
   });
 }
 
@@ -962,3 +956,4 @@ main().catch(err => {
   console.error("Fatal error:", err);
   process.exit(1);
 });
+
