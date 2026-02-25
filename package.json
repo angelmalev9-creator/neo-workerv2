@@ -1,7 +1,7 @@
 {
-  "name": "neo-worker-v4",
-  "version": "4.0.0",
-  "description": "NEO Worker with Hot Sessions for instant browser automation",
+  "name": "neo-worker-v5",
+  "version": "5.0.0",
+  "description": "NEO Worker with Hot Sessions + DB Form Schemas",
   "main": "dist/worker.js",
   "scripts": {
     "build": "tsc",
@@ -9,6 +9,7 @@
     "dev": "npx ts-node src/worker.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
     "express": "^4.18.2",
     "playwright": "^1.58.1"
   },
