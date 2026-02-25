@@ -330,6 +330,62 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
+  // DB: LOAD single form_schema by id (preferred for deterministic execution)
+  // ─────────────────────────────────────────────────────────
+
+  private async loadFormSchemaById(formId: string): Promise<FormSchemaRow | null> {
+    if (!this.supabase || !formId) return null;
+    try {
+      const { data, error } = await this.supabase
+        .from("form_schemas")
+        .select("*")
+        .eq("id", formId)
+        .maybeSingle();
+
+      if (error) {
+        console.error("[DB] form_schema by id query error:", error.message);
+        return null;
+      }
+      return (data as FormSchemaRow) || null;
+    } catch (err) {
+      console.error("[DB] form_schema by id exception:", err);
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // DB: LOAD single form_schema by fingerprint within a session
+  // ─────────────────────────────────────────────────────────
+
+  private async loadFormSchemaByFingerprint(
+    sessionId: string,
+    fingerprint: string
+  ): Promise<FormSchemaRow | null> {
+    if (!this.supabase || !sessionId || !fingerprint) return null;
+    try {
+      const { data, error } = await this.supabase
+        .from("form_schemas")
+        .select("*")
+        .eq("session_id", sessionId)
+        .eq("fingerprint", fingerprint)
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        console.error(
+          "[DB] form_schema by fingerprint query error:",
+          error.message
+        );
+        return null;
+      }
+      return (data as FormSchemaRow) || null;
+    } catch (err) {
+      console.error("[DB] form_schema by fingerprint exception:", err);
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
   // PREPARE SESSION - Called by Crawler after training
   // ─────────────────────────────────────────────────────────
 
@@ -596,27 +652,59 @@ class HotSessionManager {
       return { success: false, message: "Няма активна сесия" };
     }
 
-    // Ensure schemas are loaded
-    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
-      session.formSchemas = await this.loadFormSchemas(
-        session_id || session.sessionId || site_id
-      );
+    // Find the target schema (prefer single-row DB fetch when possible)
+    let schema: FormSchemaRow | null = null;
+
+    // 1) Strongest key: form_id
+    if (form_id) {
+      schema = session.formSchemas.find((s) => s.id === form_id) || null;
+      if (!schema) {
+        schema = await this.loadFormSchemaById(form_id);
+        if (schema) {
+          // cache locally for this hot session (helps retries)
+          session.formSchemas = [
+            schema,
+            ...session.formSchemas.filter((s) => s.id !== schema!.id),
+          ];
+        }
+      }
     }
 
-    // Find the target schema
-    let schema: FormSchemaRow | undefined;
+    // 2) Next best: fingerprint within a session
+    if (!schema && fingerprint) {
+      schema =
+        session.formSchemas.find((s) => s.fingerprint === fingerprint) || null;
+      if (!schema) {
+        const sid = session_id || session.sessionId;
+        if (sid) {
+          schema = await this.loadFormSchemaByFingerprint(sid, fingerprint);
+          if (schema) {
+            session.formSchemas = [
+              schema,
+              ...session.formSchemas.filter((s) => s.id !== schema!.id),
+            ];
+          }
+        }
+      }
+    }
 
-    if (form_id) {
-      schema = session.formSchemas.find((s) => s.id === form_id);
-    } else if (fingerprint) {
-      schema = session.formSchemas.find((s) => s.fingerprint === fingerprint);
-    } else if (kind) {
-      schema = session.formSchemas.find((s) => s.kind === kind);
-    } else {
-      // Default: first form or wizard
-      schema = session.formSchemas.find(
-        (s) => s.kind === "form" || s.kind === "wizard"
-      );
+    // 3) If caller only provided kind, we need the list for the session
+    if (!schema) {
+      if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
+        session.formSchemas = await this.loadFormSchemas(
+          session_id || session.sessionId || site_id
+        );
+      }
+
+      if (kind) {
+        schema = session.formSchemas.find((s) => s.kind === kind) || null;
+      } else {
+        // Default: prefer wizard first
+        schema =
+          session.formSchemas.find(
+            (s) => s.kind === "wizard" || s.kind === "form"
+          ) || null;
+      }
     }
 
     if (!schema) {
