@@ -1,23 +1,22 @@
 /**
- * NEO WORKER v5.0 - Hot Session + DB Form Schemas
+ * NEO WORKER v5.1 - Deterministic Form Actions (DB form_schemas first)
  *
- * ПРОМЕНИ от v4.0:
- * 1. Supabase connection — worker чете form_schemas от DB
- * 2. FormSchema-aware execution — използва rich schema (selector_candidates, labels, required)
- * 3. Wizard/multi-step support — detect & navigate steps
- * 4. File upload support — приема base64 файл от agent и го прикачва
- * 5. Fallback — ако DB е недостъпна, работи по стария начин (SiteMap-only)
+ * ВАЖНО:
+ * - /fill-form е главният deterministic flow (form_schema -> fill -> submit).
+ * - /execute е оставен за backward compatibility, но НЕ разчита на site-specific keywords.
+ *   Ако има data -> опитва да попълни най-подходящата форма по schema scoring.
  *
- * ENDPOINTS (непроменени + нови):
- * - GET  /               — info
- * - GET  /health         — status
- * - POST /prepare-session — подготвя hot session (от crawler)
- * - POST /execute         — изпълнява действие (от neo-agent-core)
- * - POST /interact        — legacy endpoint
- * - POST /close-session   — затваря session
- * - POST /close           — legacy close
- * - POST /fill-form       — NEW: попълва конкретна form_schema по id/fingerprint
+ * ENDPOINTS:
+ * - GET  /                 — info
+ * - GET  /health           — status
+ * - POST /prepare-session  — подготвя hot session (от crawler)
+ * - POST /execute          — legacy compatible (data-driven, not keyword-driven)
+ * - POST /interact         — legacy endpoint
+ * - POST /close-session    — затваря session
+ * - POST /close            — legacy close
+ * - POST /fill-form        — NEW: deterministic fill конкретна form_schema по id/fingerprint
  * - GET  /forms/:sessionId — NEW: връща form_schemas за session
+ * - POST /refresh-forms    — refresh schema cache
  */
 
 import { chromium, Browser, Page, BrowserContext } from "playwright";
@@ -34,9 +33,9 @@ const SUPABASE_SERVICE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   "";
 
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 // TYPES
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 
 interface SiteMapButton {
   text: string;
@@ -128,7 +127,7 @@ interface HotSession {
 interface ExecuteRequest {
   site_id: string;
   session_id?: string; // optional DB session_id for form_schemas lookup
-  keywords: string[];
+  keywords: string[]; // legacy, но вече не се ползва за решения
   data?: Record<string, unknown>;
 }
 
@@ -139,13 +138,23 @@ interface FillFormRequest {
   fingerprint?: string; // form_schemas.fingerprint
   kind?: string; // filter by kind
   data: Record<string, string>; // field_name → value
+
+  // ✅ Gemini confirmed / cleaned sensitive data (preferred over raw STT)
+  confirmed?: {
+    name?: string;
+    email?: string;
+    phone?: string;
+    message?: string;
+    [k: string]: string | undefined;
+  };
+
   file?: {
-    // optional file upload
     field_name: string;
     base64: string;
     filename: string;
     mime_type: string;
   };
+
   auto_submit?: boolean; // default true
 }
 
@@ -162,90 +171,9 @@ interface InteractRequest {
   };
 }
 
-// ═══════════════════════════════════════════════════════════════
-// UNIVERSAL KEYWORD PATTERNS
-// ═══════════════════════════════════════════════════════════════
-
-const PATTERNS = {
-  booking: [
-    "резерв",
-    "book",
-    "запази",
-    "наличност",
-    "свободн",
-    "availability",
-    "reserve",
-    "нощувк",
-  ],
-  check_in: [
-    "от",
-    "check-in",
-    "checkin",
-    "настаняване",
-    "пристигане",
-    "arrival",
-    "from",
-    "start",
-  ],
-  check_out: [
-    "до",
-    "check-out",
-    "checkout",
-    "напускане",
-    "заминаване",
-    "departure",
-    "to",
-    "end",
-  ],
-  guests: [
-    "човека",
-    "души",
-    "гости",
-    "guests",
-    "adults",
-    "persons",
-    "двама",
-    "трима",
-    "възрастни",
-    "брой",
-  ],
-  prices: ["цена", "цени", "price", "струва", "колко", "cost", "rate", "тариф"],
-  contact: [
-    "контакт",
-    "contact",
-    "свържи",
-    "обади",
-    "телефон",
-    "имейл",
-    "email",
-  ],
-  search: ["търси", "search", "find", "провери", "check", "покажи", "show"],
-  rooms: [
-    "стая",
-    "стаи",
-    "room",
-    "rooms",
-    "апартамент",
-    "suite",
-    "настаняване",
-  ],
-  form: [
-    "форма",
-    "form",
-    "попълни",
-    "запитване",
-    "заяви",
-    "оферта",
-    "консултация",
-    "записване",
-    "анкета",
-    "регистрация",
-  ],
-};
-
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 // SUPABASE HELPER
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 
 function createSupabase(): SupabaseClient | null {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -260,9 +188,105 @@ function createSupabase(): SupabaseClient | null {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
+// NORMALIZATION + CONFIRMED MERGE (Gemini > raw STT)
+// ───────────────────────────────────────────────────────────────
+
+function normalizeEmail(input: unknown): string {
+  const s = (typeof input === "string" ? input : "").trim().toLowerCase();
+  if (!s) return "";
+  let out = s
+    .replace(/\s+/g, "")
+    .replace(/\(at\)|\[at\]/g, "@")
+    .replace(/\(dot\)|\[dot\]/g, ".")
+    .replace(/。/g, ".")
+    .replace(/[;,]+$/g, "");
+
+  // common speech-to-text artifacts
+  out = out.replace(/( at | at)/g, "@").replace(/( dot | dot)/g, ".");
+  out = out.replace(/,/g, "."); // some STT returns comma
+
+  const parts = out.split("@");
+  if (parts.length > 2) out = parts[0] + "@" + parts.slice(1).join("");
+  return out;
+}
+
+function normalizePhone(input: unknown): string {
+  let s = (typeof input === "string" ? input : "").trim();
+  if (!s) return "";
+  s = s.replace(/[^\d+]/g, "");
+  if (s.startsWith("00")) s = "+" + s.slice(2);
+  return s;
+}
+
+function mergeConfirmedData(
+  data: Record<string, unknown>,
+  confirmed?: Record<string, unknown>
+): Record<string, unknown> {
+  if (!confirmed || typeof confirmed !== "object") {
+    const out = { ...data };
+    if ((out as any).email) (out as any).email = normalizeEmail((out as any).email);
+    if ((out as any).phone) (out as any).phone = normalizePhone((out as any).phone);
+    return out;
+  }
+
+  const merged: Record<string, unknown> = { ...data, ...confirmed };
+
+  // normalize common keys
+  if ((merged as any).email) (merged as any).email = normalizeEmail((merged as any).email);
+  if ((merged as any).phone) (merged as any).phone = normalizePhone((merged as any).phone);
+
+  // alias keys (optional)
+  if (!(merged as any).email && (merged as any).e_mail)
+    (merged as any).email = normalizeEmail((merged as any).e_mail);
+
+  if (!(merged as any).phone && (merged as any).telephone)
+    (merged as any).phone = normalizePhone((merged as any).telephone);
+
+  return merged;
+}
+
+// ───────────────────────────────────────────────────────────────
+// FIELD SEMANTIC MATCHING (NO site-specific keyword lists)
+// ───────────────────────────────────────────────────────────────
+
+function fieldText(field: FormSchemaField): string {
+  return `${field.name || ""} ${field.label || ""} ${field.placeholder || ""} ${field.autocomplete || ""} ${field.aria_label || ""}`.toLowerCase();
+}
+
+function looksLikeEmailField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return field.type === "email" || /e-?mail|email|имейл|поща/.test(t);
+}
+
+function looksLikePhoneField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return field.type === "tel" || /phone|tel|телефон|мобил|gsm/.test(t);
+}
+
+function looksLikeNameField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return /name|име|first|last|fullname|фамил/.test(t);
+}
+
+function looksLikeMessageField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return field.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t);
+}
+
+function looksLikeDateField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return field.type === "date" || /date|дата|check.?in|check.?out|arrival|departure|настан|напуск/.test(t);
+}
+
+function looksLikeGuestsField(field: FormSchemaField): boolean {
+  const t = fieldText(field);
+  return /guests|adults|persons|people|гост|душ|човек|брой/.test(t) || field.type === "number";
+}
+
+// ───────────────────────────────────────────────────────────────
 // HOT SESSION MANAGER
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 
 class HotSessionManager {
   private browser: Browser | null = null;
@@ -292,7 +316,6 @@ class HotSessionManager {
 
     this.isReady = true;
 
-    // Periodic cleanup of inactive sessions
     setInterval(() => this.cleanupSessions(), this.CLEANUP_INTERVAL);
 
     console.log("[WORKER] ✓ Ready!");
@@ -319,9 +342,7 @@ class HotSessionManager {
       }
 
       const rows = (data || []) as FormSchemaRow[];
-      console.log(
-        `[DB] Loaded ${rows.length} form_schemas for session ${sessionId.slice(0, 8)}…`
-      );
+      console.log(`[DB] Loaded ${rows.length} form_schemas for session ${sessionId.slice(0, 8)}…`);
       return rows;
     } catch (err) {
       console.error("[DB] loadFormSchemas error:", err);
@@ -330,70 +351,10 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // DB: LOAD single form_schema by id (preferred for deterministic execution)
+  // PREPARE SESSION
   // ─────────────────────────────────────────────────────────
 
-  private async loadFormSchemaById(formId: string): Promise<FormSchemaRow | null> {
-    if (!this.supabase || !formId) return null;
-    try {
-      const { data, error } = await this.supabase
-        .from("form_schemas")
-        .select("*")
-        .eq("id", formId)
-        .maybeSingle();
-
-      if (error) {
-        console.error("[DB] form_schema by id query error:", error.message);
-        return null;
-      }
-      return (data as FormSchemaRow) || null;
-    } catch (err) {
-      console.error("[DB] form_schema by id exception:", err);
-      return null;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // DB: LOAD single form_schema by fingerprint within a session
-  // ─────────────────────────────────────────────────────────
-
-  private async loadFormSchemaByFingerprint(
-    sessionId: string,
-    fingerprint: string
-  ): Promise<FormSchemaRow | null> {
-    if (!this.supabase || !sessionId || !fingerprint) return null;
-    try {
-      const { data, error } = await this.supabase
-        .from("form_schemas")
-        .select("*")
-        .eq("session_id", sessionId)
-        .eq("fingerprint", fingerprint)
-        .limit(1)
-        .maybeSingle();
-
-      if (error) {
-        console.error(
-          "[DB] form_schema by fingerprint query error:",
-          error.message
-        );
-        return null;
-      }
-      return (data as FormSchemaRow) || null;
-    } catch (err) {
-      console.error("[DB] form_schema by fingerprint exception:", err);
-      return null;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // PREPARE SESSION - Called by Crawler after training
-  // ─────────────────────────────────────────────────────────
-
-  async prepareSession(
-    siteId: string,
-    siteMap: SiteMap,
-    sessionId?: string
-  ): Promise<boolean> {
+  async prepareSession(siteId: string, siteMap: SiteMap, sessionId?: string): Promise<boolean> {
     if (!this.isReady || !this.browser) {
       console.error("[PREPARE] Browser not ready");
       return false;
@@ -402,24 +363,18 @@ class HotSessionManager {
     const startTime = Date.now();
     console.log(`[PREPARE] Site: ${siteId}`);
     console.log(`[PREPARE] URL: ${siteMap.url}`);
-    console.log(
-      `[PREPARE] Buttons: ${siteMap.buttons?.length || 0}, Forms: ${siteMap.forms?.length || 0}, Prices: ${siteMap.prices?.length || 0}`
-    );
+    console.log(`[PREPARE] Buttons: ${siteMap.buttons?.length || 0}, Forms: ${siteMap.forms?.length || 0}, Prices: ${siteMap.prices?.length || 0}`);
 
     try {
-      // Close old session if exists
       await this.closeSession(siteId);
 
-      // Check session limit
       if (this.sessions.size >= this.MAX_SESSIONS) {
         this.evictOldestSession();
       }
 
-      // Create new context and page
       const context = await this.browser.newContext({
         viewport: { width: 1366, height: 768 },
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
         locale: "bg-BG",
         timezoneId: "Europe/Sofia",
         ignoreHTTPSErrors: true,
@@ -427,23 +382,15 @@ class HotSessionManager {
 
       const page = await context.newPage();
 
-      // Navigate to site
       let url = siteMap.url;
       if (!url.startsWith("http")) url = "https://" + url;
 
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      });
-
-      // Wait a bit for JS to load
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(1500);
 
-      // Load form_schemas from DB (non-blocking for session creation)
       const dbSessionId = sessionId || siteId;
       const formSchemas = await this.loadFormSchemas(dbSessionId);
 
-      // Save session
       this.sessions.set(siteId, {
         page,
         context,
@@ -455,19 +402,13 @@ class HotSessionManager {
       });
 
       const elapsed = Date.now() - startTime;
-      console.log(
-        `[PREPARE] ✓ Session ready in ${elapsed}ms (${formSchemas.length} form schemas)`
-      );
+      console.log(`[PREPARE] ✓ Session ready in ${elapsed}ms (${formSchemas.length} form schemas)`);
       return true;
     } catch (error) {
       console.error(`[PREPARE] ✗ Failed:`, error);
       return false;
     }
   }
-
-  // ─────────────────────────────────────────────────────────
-  // REFRESH form_schemas from DB (call when agent needs latest)
-  // ─────────────────────────────────────────────────────────
 
   async refreshFormSchemas(siteId: string): Promise<FormSchemaRow[]> {
     const session = this.sessions.get(siteId);
@@ -480,7 +421,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // EXECUTE - Main action method (called by neo-agent-core)
+  // EXECUTE (legacy compatible, NOT keyword-driven)
   // ─────────────────────────────────────────────────────────
 
   async execute(
@@ -491,23 +432,15 @@ class HotSessionManager {
     observation?: Record<string, unknown>;
     form_schemas?: FormSchemaRow[];
   }> {
-    const { site_id, session_id, keywords, data } = request;
+    const { site_id, session_id, data } = request;
     let session = this.sessions.get(site_id);
 
     if (!session) {
       console.log(`[EXECUTE] No session for ${site_id}`);
-      return {
-        success: false,
-        message: "Няма активна сесия. Моля, изчакайте зареждане.",
-      };
+      return { success: false, message: "Няма активна сесия. Моля, изчакайте зареждане." };
     }
 
-    // If caller provides session_id and we have no schemas yet — load them
-    if (
-      session_id &&
-      session.sessionId !== session_id &&
-      session.formSchemas.length === 0
-    ) {
+    if (session_id && session.sessionId !== session_id && session.formSchemas.length === 0) {
       session.sessionId = session_id;
       session.formSchemas = await this.loadFormSchemas(session_id);
     }
@@ -516,117 +449,51 @@ class HotSessionManager {
     session.lastActivity = Date.now();
 
     console.log(`[EXECUTE] Site: ${site_id}`);
-    console.log(`[EXECUTE] Keywords: ${keywords.slice(0, 5).join(", ")}`);
     console.log(`[EXECUTE] FormSchemas: ${session.formSchemas.length}`);
-    if (data) console.log(`[EXECUTE] Data:`, data);
+    if (data) console.log(`[EXECUTE] Data keys:`, Object.keys(data));
 
     try {
-      // Check if page is still valid
       try {
         await session.page.evaluate(() => true);
       } catch {
         console.log(`[EXECUTE] Page closed, recreating...`);
         await this.prepareSession(site_id, session.siteMap, session.sessionId || undefined);
         session = this.sessions.get(site_id)!;
-        if (!session) {
-          return {
-            success: false,
-            message: "Грешка при възстановяване на сесията",
-          };
+        if (!session) return { success: false, message: "Грешка при възстановяване на сесията" };
+      }
+
+      // ✅ Data-driven behavior:
+      // - If data exists and schemas exist -> fill best schema
+      // - Else -> return forms if available
+      // - Else -> observe
+      if (data && Object.keys(data).length > 0 && session.formSchemas.length > 0) {
+        const best = this.pickBestSchema(session.formSchemas, data);
+        if (best) {
+          if (best.kind === "wizard") {
+            const r = await this.fillWizard(session.page, best, data);
+            const elapsed = Date.now() - startTime;
+            console.log(`[EXECUTE] ✓ Done in ${elapsed}ms: ${r.message.slice(0, 60)}`);
+            return { success: true, ...r };
+          }
+          const r = await this.fillFormSchema(session.page, best, data, undefined, true);
+          const elapsed = Date.now() - startTime;
+          console.log(`[EXECUTE] ✓ Done in ${elapsed}ms: ${r.message.slice(0, 60)}`);
+          return { success: true, ...r };
         }
       }
 
-      // 1. MATCH ACTION from keywords (now considers form_schemas too)
-      const action = this.matchAction(
-        keywords,
-        session.siteMap,
-        session.formSchemas,
-        data
-      );
-      console.log(`[EXECUTE] Action: ${action.type}`);
-
-      // 2. EXECUTE ACTION
-      let result: {
-        message: string;
-        observation?: Record<string, unknown>;
-        form_schemas?: FormSchemaRow[];
-      };
-
-      switch (action.type) {
-        case "fill_form":
-          result = await this.fillForm(
-            session.page,
-            action.form!,
-            action.data!
-          );
-          break;
-
-        case "fill_form_schema":
-          result = await this.fillFormSchema(
-            session.page,
-            action.formSchema!,
-            action.data || {}
-          );
-          break;
-
-        case "fill_wizard":
-          result = await this.fillWizard(
-            session.page,
-            action.formSchema!,
-            action.data || {}
-          );
-          break;
-
-        case "click":
-          result = await this.clickButton(
-            session.page,
-            action.selector!,
-            action.buttonText
-          );
-          break;
-
-        case "return_prices":
-          result = {
-            message: this.formatPrices(session.siteMap.prices),
-            observation: { prices: session.siteMap.prices },
-          };
-          break;
-
-        case "return_contact":
-          result = await this.getContactInfo(session.page);
-          break;
-
-        case "return_forms":
-          result = {
-            message: this.describeFormSchemas(session.formSchemas),
-            form_schemas: session.formSchemas,
-          };
-          break;
-
-        case "navigate":
-          result = await this.navigateTo(session.page, action.url!);
-          break;
-
-        case "navigate_and_fill":
-          result = await this.navigateAndFillSchema(
-            session.page,
-            action.formSchema!,
-            action.data || {}
-          );
-          break;
-
-        case "observe":
-        default:
-          result = await this.observeCurrentState(session.page);
-          break;
+      if (session.formSchemas.length > 0) {
+        return {
+          success: true,
+          message: this.describeFormSchemas(session.formSchemas),
+          form_schemas: session.formSchemas,
+        };
       }
 
+      const obs = await this.observeCurrentState(session.page);
       const elapsed = Date.now() - startTime;
-      console.log(
-        `[EXECUTE] ✓ Done in ${elapsed}ms: ${result.message.slice(0, 50)}`
-      );
-
-      return { success: true, ...result };
+      console.log(`[EXECUTE] ✓ Done in ${elapsed}ms: ${obs.message.slice(0, 60)}`);
+      return { success: true, ...obs };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       console.error(`[EXECUTE] ✗ Error:`, errMsg);
@@ -634,78 +501,71 @@ class HotSessionManager {
     }
   }
 
+  // Score schema by how well it can accept provided data (no PATTERNS)
+  private pickBestSchema(schemas: FormSchemaRow[], data: Record<string, unknown>): FormSchemaRow | null {
+    const keys = new Set(Object.keys(data).map((k) => k.toLowerCase()));
+    let best: { schema: FormSchemaRow; score: number } | null = null;
+
+    for (const s of schemas) {
+      if (s.kind !== "form" && s.kind !== "wizard") continue;
+      const fields = s.schema.fields || [];
+      if (!fields.length) continue;
+
+      let score = 0;
+
+      for (const f of fields) {
+        const t = fieldText(f);
+
+        // direct key match
+        if (f.name && keys.has(f.name.toLowerCase())) score += 3;
+
+        // semantic match
+        if (looksLikeEmailField(f) && (keys.has("email") || /@/.test(String((data as any).email || "")))) score += 4;
+        if (looksLikePhoneField(f) && (keys.has("phone") || keys.has("telephone"))) score += 3;
+        if (looksLikeNameField(f) && (keys.has("name") || keys.has("full_name") || keys.has("first_name"))) score += 2;
+        if (looksLikeMessageField(f) && (keys.has("message") || keys.has("note") || keys.has("comment"))) score += 2;
+
+        if (looksLikeDateField(f) && (keys.has("check_in") || keys.has("check_out"))) score += 3;
+        if (looksLikeGuestsField(f) && keys.has("guests")) score += 2;
+
+        // required fields boost (schema completeness)
+        if (f.required && t.length) score += 0.2;
+      }
+
+      // slight preference for schemas with submit present (but not required)
+      if (s.schema.submit) score += 0.5;
+
+      if (!best || score > best.score) best = { schema: s, score };
+    }
+
+    return best ? best.schema : null;
+  }
+
   // ─────────────────────────────────────────────────────────
-  // FILL FORM SCHEMA — new: direct by id/fingerprint
+  // /fill-form (deterministic) by id/fingerprint
   // ─────────────────────────────────────────────────────────
 
   async executeFillForm(
     request: FillFormRequest
-  ): Promise<{
-    success: boolean;
-    message: string;
-    observation?: Record<string, unknown>;
-  }> {
-    const { site_id, session_id, form_id, fingerprint, kind, data, file, auto_submit } = request;
+  ): Promise<{ success: boolean; message: string; observation?: Record<string, unknown> }> {
+    const { site_id, session_id, form_id, fingerprint, kind, data, file, auto_submit, confirmed } = request;
 
     const session = this.sessions.get(site_id);
-    if (!session) {
-      return { success: false, message: "Няма активна сесия" };
+    if (!session) return { success: false, message: "Няма активна сесия" };
+
+    // ✅ prefer Gemini-confirmed sensitive data over raw STT
+    const mergedData = mergeConfirmedData(data || {}, confirmed as any);
+
+    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
+      session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
     }
 
-    // Find the target schema (prefer single-row DB fetch when possible)
-    let schema: FormSchemaRow | null = null;
+    let schema: FormSchemaRow | undefined;
 
-    // 1) Strongest key: form_id
-    if (form_id) {
-      schema = session.formSchemas.find((s) => s.id === form_id) || null;
-      if (!schema) {
-        schema = await this.loadFormSchemaById(form_id);
-        if (schema) {
-          // cache locally for this hot session (helps retries)
-          session.formSchemas = [
-            schema,
-            ...session.formSchemas.filter((s) => s.id !== schema!.id),
-          ];
-        }
-      }
-    }
-
-    // 2) Next best: fingerprint within a session
-    if (!schema && fingerprint) {
-      schema =
-        session.formSchemas.find((s) => s.fingerprint === fingerprint) || null;
-      if (!schema) {
-        const sid = session_id || session.sessionId;
-        if (sid) {
-          schema = await this.loadFormSchemaByFingerprint(sid, fingerprint);
-          if (schema) {
-            session.formSchemas = [
-              schema,
-              ...session.formSchemas.filter((s) => s.id !== schema!.id),
-            ];
-          }
-        }
-      }
-    }
-
-    // 3) If caller only provided kind, we need the list for the session
-    if (!schema) {
-      if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
-        session.formSchemas = await this.loadFormSchemas(
-          session_id || session.sessionId || site_id
-        );
-      }
-
-      if (kind) {
-        schema = session.formSchemas.find((s) => s.kind === kind) || null;
-      } else {
-        // Default: prefer wizard first
-        schema =
-          session.formSchemas.find(
-            (s) => s.kind === "wizard" || s.kind === "form"
-          ) || null;
-      }
-    }
+    if (form_id) schema = session.formSchemas.find((s) => s.id === form_id);
+    else if (fingerprint) schema = session.formSchemas.find((s) => s.fingerprint === fingerprint);
+    else if (kind) schema = session.formSchemas.find((s) => s.kind === kind);
+    else schema = session.formSchemas.find((s) => s.kind === "form" || s.kind === "wizard");
 
     if (!schema) {
       return {
@@ -714,50 +574,43 @@ class HotSessionManager {
       };
     }
 
-    console.log(
-      `[FILL-FORM] kind=${schema.kind} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`
-    );
-
+    console.log(`[FILL-FORM] kind=${schema.kind} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
     session.lastActivity = Date.now();
 
     try {
-      // Check if page is still valid
       try {
         await session.page.evaluate(() => true);
       } catch {
         await this.prepareSession(site_id, session.siteMap, session.sessionId || undefined);
         const newSession = this.sessions.get(site_id);
-        if (!newSession) {
-          return { success: false, message: "Грешка при възстановяване" };
-        }
+        if (!newSession) return { success: false, message: "Грешка при възстановяване" };
       }
 
       const currentSession = this.sessions.get(site_id)!;
 
-      // Navigate to form URL if different from current
       const formUrl = schema.url;
-      if (formUrl && !currentSession.page.url().includes(new URL(formUrl).pathname)) {
-        console.log(`[FILL-FORM] Navigating to form URL: ${formUrl}`);
-        await currentSession.page.goto(formUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 15000,
-        });
-        await currentSession.page.waitForTimeout(1000);
+      if (formUrl) {
+        try {
+          const current = new URL(currentSession.page.url());
+          const target = new URL(formUrl);
+          if (current.pathname !== target.pathname) {
+            console.log(`[FILL-FORM] Navigating to form URL: ${formUrl}`);
+            await currentSession.page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+            await currentSession.page.waitForTimeout(1000);
+          }
+        } catch {
+          console.log(`[FILL-FORM] Navigating to form URL (fallback): ${formUrl}`);
+          await currentSession.page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await currentSession.page.waitForTimeout(1000);
+        }
       }
 
-      // Fill based on kind
       let result: { message: string; observation?: Record<string, unknown> };
 
       if (schema.kind === "wizard") {
-        result = await this.fillWizard(currentSession.page, schema, data);
+        result = await this.fillWizard(currentSession.page, schema, mergedData);
       } else {
-        result = await this.fillFormSchema(
-          currentSession.page,
-          schema,
-          data,
-          file,
-          auto_submit !== false
-        );
+        result = await this.fillFormSchema(currentSession.page, schema, mergedData, file, auto_submit !== false);
       }
 
       return { success: true, ...result };
@@ -769,347 +622,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // LEGACY INTERACT - For backwards compatibility
-  // ─────────────────────────────────────────────────────────
-
-  async interact(
-    request: InteractRequest
-  ): Promise<{
-    success: boolean;
-    message: string;
-    observation?: Record<string, unknown>;
-    action_taken?: string;
-    logs: string[];
-  }> {
-    const logs: string[] = [];
-    const { site_url, user_message, session_id, booking_data } = request;
-
-    logs.push(`[LEGACY] Session: ${session_id}`);
-
-    // Check if we have a hot session
-    let session = this.sessions.get(session_id);
-
-    // If no hot session, create one on-the-fly (slower, but backwards compatible)
-    if (!session) {
-      logs.push(`[LEGACY] No hot session, creating...`);
-
-      if (!this.browser) {
-        return { success: false, message: "Worker не е готов", logs };
-      }
-
-      try {
-        const context = await this.browser.newContext({
-          viewport: { width: 1366, height: 768 },
-          userAgent:
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-          locale: "bg-BG",
-          timezoneId: "Europe/Sofia",
-          ignoreHTTPSErrors: true,
-        });
-
-        const page = await context.newPage();
-
-        let url = site_url;
-        if (url && !url.startsWith("http")) url = "https://" + url;
-
-        if (url) {
-          await page.goto(url, {
-            waitUntil: "domcontentloaded",
-            timeout: 20000,
-          });
-          await page.waitForTimeout(1500);
-        }
-
-        // Create minimal siteMap from page observation
-        const observation = await this.observeDOM(page);
-
-        const siteMap: SiteMap = {
-          site_id: session_id,
-          url: site_url,
-          buttons: observation.buttons.map((b) => ({
-            text: b.text,
-            selector: b.selector,
-            keywords: b.text.toLowerCase().split(/\s+/),
-            action_type: this.detectButtonType(b.text),
-          })),
-          forms: [],
-          prices: observation.prices.map((p) => ({ text: p, context: "" })),
-        };
-
-        // Load form_schemas from DB
-        const formSchemas = await this.loadFormSchemas(session_id);
-
-        session = {
-          page,
-          context,
-          siteMap,
-          sessionId: session_id,
-          formSchemas,
-          lastActivity: Date.now(),
-          currentUrl: page.url(),
-        };
-
-        this.sessions.set(session_id, session);
-        logs.push(
-          `[LEGACY] Session created (${formSchemas.length} form schemas from DB)`
-        );
-      } catch (error) {
-        logs.push(`[LEGACY] Failed to create session: ${error}`);
-        return {
-          success: false,
-          message: "Грешка при свързване със сайта",
-          logs,
-        };
-      }
-    }
-
-    // Extract keywords from message
-    const keywords = user_message
-      .toLowerCase()
-      .replace(/[,.!?;:()[\]{}""'']/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 2);
-
-    // Execute using new system
-    const result = await this.execute({
-      site_id: session_id,
-      session_id: session_id,
-      keywords,
-      data: booking_data as Record<string, unknown> | undefined,
-    });
-
-    logs.push(`[LEGACY] Result: ${result.success ? "success" : "failed"}`);
-
-    return {
-      success: result.success,
-      message: result.message,
-      observation: result.observation,
-      action_taken: result.success ? result.message : undefined,
-      logs,
-    };
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // ACTION MATCHING — now considers form_schemas
-  // ─────────────────────────────────────────────────────────
-
-  private matchAction(
-    keywords: string[],
-    siteMap: SiteMap,
-    formSchemas: FormSchemaRow[],
-    data?: Record<string, unknown>
-  ): {
-    type:
-      | "fill_form"
-      | "fill_form_schema"
-      | "fill_wizard"
-      | "click"
-      | "return_prices"
-      | "return_contact"
-      | "return_forms"
-      | "navigate"
-      | "navigate_and_fill"
-      | "observe";
-    form?: SiteMapForm;
-    formSchema?: FormSchemaRow;
-    selector?: string;
-    buttonText?: string;
-    url?: string;
-    data?: Record<string, unknown>;
-  } {
-    const joined = keywords.join(" ").toLowerCase();
-
-    // 0. FORM KEYWORDS → return available forms info
-    const hasFormKeyword = PATTERNS.form.some((p) => joined.includes(p));
-
-    // 1. BOOKING - if has dates or booking keywords
-    const hasBookingKeyword = PATTERNS.booking.some((p) => joined.includes(p));
-    const hasDates = !!(data?.check_in || data?.check_out);
-
-    if (hasBookingKeyword || hasDates) {
-      // Try form_schemas first (richer data)
-      const bookingSchema = formSchemas.find((s) => {
-        if (s.kind === "booking_widget") return true;
-        if (s.kind !== "form" && s.kind !== "wizard") return false;
-        const fields = s.schema.fields || [];
-        return fields.some(
-          (f) =>
-            f.type === "date" ||
-            /date|дата|check.?in|настаняване|пристигане/i.test(
-              `${f.name} ${f.label} ${f.placeholder}`
-            )
-        );
-      });
-
-      if (bookingSchema) {
-        const isCurrentPage = this.isOnSamePage(bookingSchema.url);
-        if (bookingSchema.kind === "wizard") {
-          return {
-            type: isCurrentPage ? "fill_wizard" : "navigate_and_fill",
-            formSchema: bookingSchema,
-            data,
-          };
-        }
-        return {
-          type: isCurrentPage ? "fill_form_schema" : "navigate_and_fill",
-          formSchema: bookingSchema,
-          data,
-        };
-      }
-
-      // Fallback: SiteMap form
-      const form = siteMap.forms?.find((f) =>
-        f.fields?.some(
-          (field) =>
-            field.type === "date" ||
-            PATTERNS.check_in.some((k) => field.keywords?.includes(k)) ||
-            PATTERNS.check_out.some((k) => field.keywords?.includes(k))
-        )
-      );
-
-      if (form) {
-        return { type: "fill_form", form, data };
-      }
-
-      // Try booking button
-      const bookBtn = siteMap.buttons?.find(
-        (b) =>
-          b.action_type === "booking" ||
-          PATTERNS.booking.some((p) => b.text.toLowerCase().includes(p))
-      );
-
-      if (bookBtn) {
-        return {
-          type: "click",
-          selector: bookBtn.selector,
-          buttonText: bookBtn.text,
-        };
-      }
-    }
-
-    // 2. FORM/WIZARD - if asking about forms, consultations, offers
-    if (hasFormKeyword) {
-      // If we have form_schemas, return them so agent knows what's available
-      if (formSchemas.length > 0) {
-        // If there's data to fill → fill the first matching form
-        if (data && Object.keys(data).length > 0) {
-          const fillable = formSchemas.find(
-            (s) => s.kind === "form" || s.kind === "wizard"
-          );
-          if (fillable) {
-            return {
-              type:
-                fillable.kind === "wizard"
-                  ? "fill_wizard"
-                  : "fill_form_schema",
-              formSchema: fillable,
-              data,
-            };
-          }
-        }
-        return { type: "return_forms" };
-      }
-    }
-
-    // 3. PRICES
-    if (PATTERNS.prices.some((p) => joined.includes(p))) {
-      if (siteMap.prices && siteMap.prices.length > 0) {
-        return { type: "return_prices" };
-      }
-    }
-
-    // 4. CONTACT
-    if (PATTERNS.contact.some((p) => joined.includes(p))) {
-      // Check if there's a contact form in form_schemas
-      const contactSchema = formSchemas.find((s) => {
-        if (s.kind !== "form") return false;
-        const fields = s.schema.fields || [];
-        return fields.some((f) =>
-          /email|имейл|телефон|phone|name|име|message|съобщение/i.test(
-            `${f.name} ${f.label} ${f.type}`
-          )
-        );
-      });
-
-      if (contactSchema && data && Object.keys(data).length > 0) {
-        return { type: "fill_form_schema", formSchema: contactSchema, data };
-      }
-
-      const contactBtn = siteMap.buttons?.find(
-        (b) =>
-          b.action_type === "contact" ||
-          PATTERNS.contact.some((p) => b.text.toLowerCase().includes(p))
-      );
-      if (contactBtn) {
-        return {
-          type: "click",
-          selector: contactBtn.selector,
-          buttonText: contactBtn.text,
-        };
-      }
-      return { type: "return_contact" };
-    }
-
-    // 5. ROOMS
-    if (PATTERNS.rooms.some((p) => joined.includes(p))) {
-      const roomsBtn = siteMap.buttons?.find((b) =>
-        PATTERNS.rooms.some((p) => b.text.toLowerCase().includes(p))
-      );
-      if (roomsBtn) {
-        return {
-          type: "click",
-          selector: roomsBtn.selector,
-          buttonText: roomsBtn.text,
-        };
-      }
-    }
-
-    // 6. SEARCH/CHECK button
-    if (PATTERNS.search.some((p) => joined.includes(p))) {
-      const searchBtn = siteMap.buttons?.find(
-        (b) =>
-          b.action_type === "submit" ||
-          PATTERNS.search.some((p) => b.text.toLowerCase().includes(p))
-      );
-      if (searchBtn) {
-        return {
-          type: "click",
-          selector: searchBtn.selector,
-          buttonText: searchBtn.text,
-        };
-      }
-    }
-
-    // 7. Match specific button by keywords
-    if (siteMap.buttons) {
-      for (const btn of siteMap.buttons) {
-        const btnKeywords =
-          btn.keywords?.map((k) => k.toLowerCase()) || [];
-        if (
-          keywords.some((kw) => btnKeywords.includes(kw.toLowerCase()))
-        ) {
-          return {
-            type: "click",
-            selector: btn.selector,
-            buttonText: btn.text,
-          };
-        }
-      }
-    }
-
-    // Default: observe
-    return { type: "observe" };
-  }
-
-  // helper: rough check if schema URL is current page
-  private isOnSamePage(schemaUrl: string): boolean {
-    // We don't have access to current page URL here without async,
-    // so we return true (navigate_and_fill will check and skip nav if same)
-    return true;
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // FILL FORM SCHEMA — uses rich selector_candidates
+  // FILL FORM SCHEMA — robust submit even when schema.submit missing
   // ─────────────────────────────────────────────────────────
 
   private async fillFormSchema(
@@ -1122,12 +635,9 @@ class HotSessionManager {
     const fields = schema.schema.fields || [];
     const actions: string[] = [];
 
-    if (fields.length === 0) {
-      return { message: "Формата няма полета" };
-    }
+    if (fields.length === 0) return { message: "Формата няма полета" };
 
     for (const field of fields) {
-      // Find matching value from data
       const value = this.matchFieldValue(field, data);
       if (!value) continue;
 
@@ -1138,22 +648,14 @@ class HotSessionManager {
       }
     }
 
-    // Handle file upload
     if (file) {
       const uploaded = await this.uploadFile(page, fields, file);
-      if (uploaded) {
-        actions.push(`Файл: ${file.filename}`);
-      }
+      if (uploaded) actions.push(`Файл: ${file.filename}`);
     }
 
-    // Click submit
-    if (autoSubmit && schema.schema.submit && actions.length > 0) {
-      const clicked = await this.clickBySelector(
-        page,
-        schema.schema.submit.selector_candidates,
-        schema.schema.submit.text
-      );
-      if (clicked) {
+    if (autoSubmit && actions.length > 0) {
+      const submitted = await this.trySubmit(page, schema);
+      if (submitted) {
         actions.push("Изпратено");
         await page.waitForTimeout(1500);
       }
@@ -1162,16 +664,71 @@ class HotSessionManager {
     const observation = await this.quickObserve(page);
 
     return {
-      message:
-        actions.length > 0
-          ? `Попълних: ${actions.join(", ")}`
-          : "Не успях да попълня формата — не намерих съвпадащи полета",
+      message: actions.length > 0 ? `Попълних: ${actions.join(", ")}` : "Не успях да попълня формата — не намерих съвпадащи полета",
       observation,
     };
   }
 
+  private async trySubmit(page: Page, schema?: FormSchemaRow): Promise<boolean> {
+    // 1) schema submit candidates
+    if (schema?.schema.submit) {
+      const ok = await this.clickBySelector(page, schema.schema.submit.selector_candidates, schema.schema.submit.text);
+      if (ok) return true;
+    }
+
+    // 2) common submit buttons
+    const fallbackSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Изпрати")',
+      'button:has-text("Изпрат")',
+      'button:has-text("Прати")',
+      'button:has-text("Submit")',
+      'button:has-text("Send")',
+    ];
+
+    for (const sel of fallbackSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.click({ timeout: 3000 });
+        return true;
+      } catch {}
+    }
+
+    // 3) requestSubmit()
+    try {
+      const ok = await page.evaluate(() => {
+        const form = document.querySelector("form");
+        if (!form) return false;
+        const anyForm: any = form as any;
+        if (typeof anyForm.requestSubmit === "function") {
+          anyForm.requestSubmit();
+          return true;
+        }
+        (form as HTMLFormElement).submit();
+        return true;
+      });
+      if (ok) return true;
+    } catch {}
+
+    // 4) Enter on first visible field (last resort)
+    try {
+      const first = await page.$("input:not([type='hidden']):not([disabled]), textarea, select");
+      if (first) {
+        await first.click({ timeout: 1000 }).catch(() => {});
+        await page.keyboard.press("Enter").catch(() => {});
+        return true;
+      }
+    } catch {}
+
+    return false;
+  }
+
   // ─────────────────────────────────────────────────────────
-  // FILL WIZARD — multi-step form
+  // FILL WIZARD — multi-step + final submit attempt
   // ─────────────────────────────────────────────────────────
 
   private async fillWizard(
@@ -1185,22 +742,14 @@ class HotSessionManager {
     let stepsCompleted = 0;
 
     for (let step = 0; step < maxSteps; step++) {
-      // Find visible fields on current step
       const visibleFields = await this.getVisibleFormFields(page);
 
-      if (visibleFields.length === 0 && step > 0) {
-        // No more visible fields — we might be done
-        break;
-      }
-
-      // Try to fill visible fields
-      let filledInStep = 0;
+      if (visibleFields.length === 0 && step > 0) break;
 
       for (const field of fields) {
         const value = this.matchFieldValue(field, data);
         if (!value) continue;
 
-        // Check if field is visible right now
         const isVisible = await this.isFieldVisible(page, field);
         if (!isVisible) continue;
 
@@ -1208,48 +757,43 @@ class HotSessionManager {
         if (filled) {
           const label = field.label || field.name || field.type;
           actions.push(`${label}: ${value}`);
-          filledInStep++;
         }
       }
 
-      // Also try to fill by matching visible fields to data keys
+      // also try discovered fields
       for (const vf of visibleFields) {
         const matchedValue = this.matchVisibleFieldToData(vf, data);
         if (matchedValue && !actions.some((a) => a.includes(matchedValue))) {
           const filled = await this.fillSingleField(page, vf, matchedValue);
-          if (filled) {
-            actions.push(`${vf.label || vf.name}: ${matchedValue}`);
-            filledInStep++;
-          }
+          if (filled) actions.push(`${vf.label || vf.name}: ${matchedValue}`);
         }
       }
 
       stepsCompleted++;
 
-      // Try to click Next / Continue / Напред
+      // Next step
       const nextClicked = await this.clickNextStep(page);
-      if (!nextClicked) {
-        // No "next" button — maybe it's the last step or a submit
-        break;
-      }
+      if (!nextClicked) break;
 
-      // Wait for step transition
       await page.waitForTimeout(800);
     }
+
+    // Final submit attempt (important for wizards)
+    const submitted = await this.trySubmit(page, schema);
+    if (submitted) actions.push("Изпратено");
 
     const observation = await this.quickObserve(page);
 
     return {
-      message:
-        actions.length > 0
-          ? `Wizard (${stepsCompleted} стъпки): ${actions.join(", ")}`
-          : `Wizard: преминах ${stepsCompleted} стъпки, но не намерих полета за попълване`,
+      message: actions.length > 0
+        ? `Wizard (${stepsCompleted} стъпки): ${actions.join(", ")}`
+        : `Wizard: преминах ${stepsCompleted} стъпки, но не намерих полета за попълване`,
       observation,
     };
   }
 
   // ─────────────────────────────────────────────────────────
-  // NAVIGATE + FILL (when form is on different page)
+  // NAVIGATE + FILL
   // ─────────────────────────────────────────────────────────
 
   private async navigateAndFillSchema(
@@ -1266,24 +810,16 @@ class HotSessionManager {
         const targetPath = new URL(formUrl).pathname;
         if (currentPath !== targetPath) {
           console.log(`[NAV] ${currentPath} → ${targetPath}`);
-          await page.goto(formUrl, {
-            waitUntil: "domcontentloaded",
-            timeout: 15000,
-          });
+          await page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
           await page.waitForTimeout(1000);
         }
       } catch {
-        await page.goto(formUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 15000,
-        });
+        await page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
         await page.waitForTimeout(1000);
       }
     }
 
-    if (schema.kind === "wizard") {
-      return this.fillWizard(page, schema, data);
-    }
+    if (schema.kind === "wizard") return this.fillWizard(page, schema, data);
     return this.fillFormSchema(page, schema, data);
   }
 
@@ -1291,80 +827,40 @@ class HotSessionManager {
   // FIELD HELPERS
   // ─────────────────────────────────────────────────────────
 
-  private matchFieldValue(
-    field: FormSchemaField,
-    data: Record<string, unknown>
-  ): string | undefined {
-    // Direct match by field name
-    if (data[field.name] !== undefined) return String(data[field.name]);
+  private matchFieldValue(field: FormSchemaField, data: Record<string, unknown>): string | undefined {
+    // direct match by exact field name
+    if (field.name && data[field.name] !== undefined) return String(data[field.name]);
 
-    // Match by common patterns
-    const searchText =
-      `${field.name} ${field.label} ${field.placeholder} ${field.autocomplete || ""}`.toLowerCase();
+    // semantic mapping (generic, NOT site-specific)
+    if (looksLikeEmailField(field) && (data as any).email) return String((data as any).email);
+    if (looksLikePhoneField(field) && ((data as any).phone || (data as any).telephone))
+      return String((data as any).phone || (data as any).telephone);
 
-    // Check-in date
-    if (
-      PATTERNS.check_in.some((k) => searchText.includes(k)) ||
-      (field.type === "date" && /от|from|start|check.?in|настаняване/i.test(searchText))
-    ) {
-      if (data.check_in) return String(data.check_in);
+    if (looksLikeNameField(field) && ((data as any).name || (data as any).full_name || (data as any).first_name))
+      return String((data as any).name || (data as any).full_name || (data as any).first_name);
+
+    if (looksLikeMessageField(field) && ((data as any).message || (data as any).note || (data as any).comment))
+      return String((data as any).message || (data as any).note || (data as any).comment);
+
+    // booking-ish fields (still generic)
+    if (looksLikeDateField(field) && ((data as any).check_in || (data as any).check_out)) {
+      // if the field text hints "out"/departure choose check_out else check_in
+      const t = fieldText(field);
+      if (/out|departure|напуск|заминав/.test(t) && (data as any).check_out) return String((data as any).check_out);
+      if ((data as any).check_in) return String((data as any).check_in);
+      if ((data as any).check_out) return String((data as any).check_out);
     }
 
-    // Check-out date
-    if (
-      PATTERNS.check_out.some((k) => searchText.includes(k)) ||
-      (field.type === "date" && /до|to|end|check.?out|напускане/i.test(searchText))
-    ) {
-      if (data.check_out) return String(data.check_out);
-    }
-
-    // Guests
-    if (PATTERNS.guests.some((k) => searchText.includes(k))) {
-      if (data.guests) return String(data.guests);
-    }
-
-    // Name
-    if (/name|име|first.?name|last.?name|фамилия/i.test(searchText)) {
-      if (data.name) return String(data.name);
-      if (data.full_name) return String(data.full_name);
-      if (data.first_name) return String(data.first_name);
-    }
-
-    // Email
-    if (/email|имейл|e-mail|поща/i.test(searchText)) {
-      if (data.email) return String(data.email);
-    }
-
-    // Phone
-    if (/phone|телефон|тел|mobile|мобилен/i.test(searchText)) {
-      if (data.phone) return String(data.phone);
-      if (data.telephone) return String(data.telephone);
-    }
-
-    // Message
-    if (/message|съобщение|бележка|забележка|описание|note|comment/i.test(searchText)) {
-      if (data.message) return String(data.message);
-      if (data.note) return String(data.note);
-      if (data.comment) return String(data.comment);
-    }
+    if (looksLikeGuestsField(field) && (data as any).guests !== undefined) return String((data as any).guests);
 
     return undefined;
   }
 
-  private matchVisibleFieldToData(
-    field: FormSchemaField,
-    data: Record<string, unknown>
-  ): string | undefined {
-    // Same logic as matchFieldValue but for dynamically discovered fields
+  private matchVisibleFieldToData(field: FormSchemaField, data: Record<string, unknown>): string | undefined {
     return this.matchFieldValue(field, data);
   }
 
-  private async fillSingleField(
-    page: Page,
-    field: FormSchemaField,
-    value: string
-  ): Promise<boolean> {
-    // Try selector_candidates first (most reliable)
+  private async fillSingleField(page: Page, field: FormSchemaField, value: string): Promise<boolean> {
     const selectors = [
       ...(field.selector_candidates || []),
       field.name ? `[name="${field.name}"]` : "",
@@ -1376,7 +872,6 @@ class HotSessionManager {
         const el = await page.$(sel);
         if (!el) continue;
 
-        // Check visibility
         const visible = await el.isVisible().catch(() => false);
         if (!visible) continue;
 
@@ -1385,27 +880,21 @@ class HotSessionManager {
           return true;
         }
 
-        if (field.type === "file") {
-          // File inputs handled separately
-          continue;
-        }
+        if (field.type === "file") continue;
 
-        // Clear and fill
         await el.click({ timeout: 1000 }).catch(() => {});
         await page.fill(sel, value, { timeout: 2000 });
+
+        // blur (some sites validate on blur)
+        await page.keyboard.press("Tab").catch(() => {});
         return true;
-      } catch {
-        // Try next selector
-      }
+      } catch {}
     }
 
     return false;
   }
 
-  private async isFieldVisible(
-    page: Page,
-    field: FormSchemaField
-  ): Promise<boolean> {
+  private async isFieldVisible(page: Page, field: FormSchemaField): Promise<boolean> {
     const selectors = [
       ...(field.selector_candidates || []),
       field.name ? `[name="${field.name}"]` : "",
@@ -1415,7 +904,7 @@ class HotSessionManager {
       try {
         const el = await page.$(sel);
         if (el) {
-          const visible = await el.isVisible();
+          const visible = await el.isVisible().catch(() => false);
           if (visible) return true;
         }
       } catch {}
@@ -1423,9 +912,7 @@ class HotSessionManager {
     return false;
   }
 
-  private async getVisibleFormFields(
-    page: Page
-  ): Promise<FormSchemaField[]> {
+  private async getVisibleFormFields(page: Page): Promise<FormSchemaField[]> {
     try {
       return await page.evaluate(() => {
         const fields: any[] = [];
@@ -1437,13 +924,7 @@ class HotSessionManager {
           const el = input as HTMLInputElement;
           const rect = el.getBoundingClientRect();
           const style = window.getComputedStyle(el);
-          if (
-            rect.width <= 0 ||
-            rect.height <= 0 ||
-            style.display === "none" ||
-            style.visibility === "hidden"
-          )
-            return;
+          if (rect.width <= 0 || rect.height <= 0 || style.display === "none" || style.visibility === "hidden") return;
 
           const name = el.name || el.id || "";
           const label = (() => {
@@ -1458,12 +939,12 @@ class HotSessionManager {
 
           fields.push({
             tag: el.tagName.toLowerCase(),
-            type: el.type || el.tagName.toLowerCase(),
+            type: (el as any).type || el.tagName.toLowerCase(),
             name,
             label,
-            placeholder: el.placeholder || "",
-            required: el.required,
-            autocomplete: el.autocomplete || "",
+            placeholder: (el as any).placeholder || "",
+            required: (el as any).required || false,
+            autocomplete: (el as any).autocomplete || "",
             selector_candidates: [
               el.id ? `#${el.id}` : "",
               name ? `[name="${name}"]` : "",
@@ -1479,35 +960,33 @@ class HotSessionManager {
   }
 
   private async clickNextStep(page: Page): Promise<boolean> {
-    const nextPatterns = [
-      "text=/напред/i",
-      "text=/следваща/i",
-      "text=/next/i",
-      "text=/continue/i",
-      "text=/продълж/i",
-      "text=/стъпка/i",
+    const nextSelectors = [
       'button:has-text("Напред")',
       'button:has-text("Следваща")',
       'button:has-text("Next")',
       'button:has-text("Continue")',
       'button:has-text("Продължи")',
+      'a:has-text("Напред")',
+      'a:has-text("Next")',
       "[class*='next']",
       "[class*='step'] button",
+      "text=/напред/i",
+      "text=/следваща/i",
+      "text=/next/i",
+      "text=/continue/i",
+      "text=/продълж/i",
     ];
 
-    for (const sel of nextPatterns) {
+    for (const sel of nextSelectors) {
       try {
         const el = await page.$(sel);
-        if (el) {
-          const visible = await el.isVisible().catch(() => false);
-          if (visible) {
-            await el.click({ timeout: 2000 });
-            return true;
-          }
-        }
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.click({ timeout: 2000 });
+        return true;
       } catch {}
     }
-
     return false;
   }
 
@@ -1516,12 +995,9 @@ class HotSessionManager {
     fields: FormSchemaField[],
     file: NonNullable<FillFormRequest["file"]>
   ): Promise<boolean> {
-    // Find file input by field_name or first file input
     const fileFields = fields.filter((f) => f.type === "file");
-    const targetField =
-      fileFields.find((f) => f.name === file.field_name) || fileFields[0];
+    const targetField = fileFields.find((f) => f.name === file.field_name) || fileFields[0];
 
-    // Write base64 to temp file
     const tmpPath = `/tmp/upload_${Date.now()}_${file.filename}`;
 
     try {
@@ -1529,14 +1005,12 @@ class HotSessionManager {
       const fs = await import("fs");
       fs.writeFileSync(tmpPath, buffer);
 
-      // Find file input selector
       let selectors: string[] = [];
       if (targetField) {
         selectors = [...(targetField.selector_candidates || [])];
-        if (targetField.name)
-          selectors.push(`input[name="${targetField.name}"]`);
+        if (targetField.name) selectors.push(`input[name="${targetField.name}"]`);
       }
-      selectors.push('input[type="file"]'); // fallback
+      selectors.push('input[type="file"]');
 
       for (const sel of selectors) {
         try {
@@ -1544,8 +1018,6 @@ class HotSessionManager {
           if (el) {
             await (el as any).setInputFiles(tmpPath);
             console.log(`[UPLOAD] ✓ File set via ${sel}`);
-
-            // Cleanup
             try { fs.unlinkSync(tmpPath); } catch {}
             return true;
           }
@@ -1561,26 +1033,18 @@ class HotSessionManager {
     }
   }
 
-  private async clickBySelector(
-    page: Page,
-    candidates: string[],
-    text?: string
-  ): Promise<boolean> {
-    // Try selector candidates
+  private async clickBySelector(page: Page, candidates: string[], text?: string): Promise<boolean> {
     for (const sel of candidates || []) {
       try {
         const el = await page.$(sel);
-        if (el) {
-          const visible = await el.isVisible().catch(() => false);
-          if (visible) {
-            await el.click({ timeout: 3000 });
-            return true;
-          }
-        }
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.click({ timeout: 3000 });
+        return true;
       } catch {}
     }
 
-    // Fallback: text-based click
     if (text) {
       const textStrategies = [
         `text="${text}"`,
@@ -1600,7 +1064,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // DESCRIBE FORMS (for agent to understand what's available)
+  // DESCRIBE FORMS
   // ─────────────────────────────────────────────────────────
 
   private describeFormSchemas(schemas: FormSchemaRow[]): string {
@@ -1624,7 +1088,6 @@ class HotSessionManager {
       if (s.url) desc += ` @ ${s.url}`;
       if (fieldNames.length) desc += ` — полета: ${fieldNames.join(", ")}`;
       if (s.schema.submit?.text) desc += ` [${s.schema.submit.text}]`;
-
       return desc;
     });
 
@@ -1632,7 +1095,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // EXISTING ACTIONS (unchanged)
+  // EXISTING ACTIONS (kept, no breaking)
   // ─────────────────────────────────────────────────────────
 
   private async fillForm(
@@ -1641,76 +1104,45 @@ class HotSessionManager {
     data: Record<string, unknown>
   ): Promise<{ message: string; observation?: Record<string, unknown> }> {
     const actions: string[] = [];
-
-    if (!form.fields) {
-      return { message: "Формата няма полета" };
-    }
+    if (!form.fields) return { message: "Формата няма полета" };
 
     for (const field of form.fields) {
       let value: string | undefined;
 
-      // Match field to data by keywords
-      const fieldKeywords =
-        field.keywords?.map((k) => k.toLowerCase()) || [];
+      // legacy fallback: try direct by name keys
+      if ((data as any)[field.name] !== undefined) value = String((data as any)[field.name]);
 
-      if (
-        PATTERNS.check_in.some((k) => fieldKeywords.includes(k)) &&
-        data.check_in
-      ) {
-        value = String(data.check_in);
-      } else if (
-        PATTERNS.check_out.some((k) => fieldKeywords.includes(k)) &&
-        data.check_out
-      ) {
-        value = String(data.check_out);
-      } else if (
-        PATTERNS.guests.some((k) => fieldKeywords.includes(k)) &&
-        data.guests
-      ) {
-        value = String(data.guests);
-      }
+      if (!value) continue;
 
-      if (value) {
-        try {
-          // Try multiple selector strategies
-          const selectors = [
-            field.selector,
-            `[name="${field.name}"]`,
-            `#${field.name}`,
-          ].filter(Boolean);
+      try {
+        const selectors = [field.selector, `[name="${field.name}"]`, `#${field.name}`].filter(Boolean);
 
-          let filled = false;
-          for (const sel of selectors) {
-            try {
-              const el = await page.$(sel);
-              if (el) {
-                if (field.type === "select") {
-                  await page.selectOption(sel, value, { timeout: 2000 });
-                } else {
-                  await page.fill(sel, value, { timeout: 2000 });
-                }
-                filled = true;
-                break;
-              }
-            } catch {}
-          }
-
-          if (filled) {
-            const fieldLabel = field.name.replace(/[-_]/g, " ");
-            actions.push(`${fieldLabel}: ${value}`);
-          }
-        } catch (e) {
-          console.log(`[FILL] Could not fill ${field.name}:`, e);
+        let filled = false;
+        for (const sel of selectors) {
+          try {
+            const el = await page.$(sel);
+            if (!el) continue;
+            if (field.type === "select") await page.selectOption(sel, value, { timeout: 2000 });
+            else await page.fill(sel, value, { timeout: 2000 });
+            filled = true;
+            break;
+          } catch {}
         }
+
+        if (filled) {
+          const fieldLabel = field.name.replace(/[-_]/g, " ");
+          actions.push(`${fieldLabel}: ${value}`);
+        }
+      } catch (e) {
+        console.log(`[FILL] Could not fill ${field.name}:`, e);
       }
     }
 
-    // Click submit button
     if (form.submit_button && actions.length > 0) {
       try {
         await page.click(form.submit_button, { timeout: 3000 });
         await page.waitForTimeout(1500);
-        actions.push("Търсене");
+        actions.push("Изпратено");
       } catch (e) {
         console.log(`[FILL] Could not click submit:`, e);
       }
@@ -1719,10 +1151,7 @@ class HotSessionManager {
     const observation = await this.quickObserve(page);
 
     return {
-      message:
-        actions.length > 0
-          ? `Попълних: ${actions.join(", ")}`
-          : "Не успях да попълня формата",
+      message: actions.length > 0 ? `Попълних: ${actions.join(", ")}` : "Не успях да попълня формата",
       observation,
     };
   }
@@ -1735,19 +1164,9 @@ class HotSessionManager {
     try {
       const strategies = [
         async () => await page.click(selector, { timeout: 2000 }),
-        async () =>
-          buttonText &&
-          (await page.click(`text="${buttonText}"`, { timeout: 2000 })),
-        async () =>
-          buttonText &&
-          (await page.click(`button:has-text("${buttonText}")`, {
-            timeout: 2000,
-          })),
-        async () =>
-          buttonText &&
-          (await page.click(`a:has-text("${buttonText}")`, {
-            timeout: 2000,
-          })),
+        async () => buttonText && (await page.click(`text="${buttonText}"`, { timeout: 2000 })),
+        async () => buttonText && (await page.click(`button:has-text("${buttonText}")`, { timeout: 2000 })),
+        async () => buttonText && (await page.click(`a:has-text("${buttonText}")`, { timeout: 2000 })),
       ];
 
       for (const strategy of strategies) {
@@ -1755,10 +1174,7 @@ class HotSessionManager {
           await strategy();
           await page.waitForTimeout(1000);
           const observation = await this.quickObserve(page);
-          return {
-            message: buttonText ? `Кликнах "${buttonText}"` : "Кликнах",
-            observation,
-          };
+          return { message: buttonText ? `Кликнах "${buttonText}"` : "Кликнах", observation };
         } catch {}
       }
 
@@ -1770,18 +1186,11 @@ class HotSessionManager {
 
   private formatPrices(prices: SiteMap["prices"]): string {
     if (!prices || prices.length === 0) return "Не намерих цени на сайта";
-
-    const formatted = prices
-      .slice(0, 5)
-      .map((p) => (p.context ? `${p.context}: ${p.text}` : p.text))
-      .join("; ");
-
+    const formatted = prices.slice(0, 5).map((p) => (p.context ? `${p.context}: ${p.text}` : p.text)).join("; ");
     return `Цени: ${formatted}`;
   }
 
-  private async getContactInfo(
-    page: Page
-  ): Promise<{ message: string }> {
+  private async getContactInfo(page: Page): Promise<{ message: string }> {
     try {
       const contact = await page.evaluate(() => {
         const text = document.body.innerText;
@@ -1801,7 +1210,6 @@ class HotSessionManager {
         }
 
         const email = text.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0];
-
         return { phone, email };
       });
 
@@ -1810,28 +1218,16 @@ class HotSessionManager {
       if (contact.email) parts.push(`Email: ${contact.email}`);
 
       return {
-        message:
-          parts.length > 0
-            ? parts.join(". ")
-            : "Не намерих контактна информация на тази страница",
+        message: parts.length > 0 ? parts.join(". ") : "Не намерих контактна информация на тази страница",
       };
     } catch {
       return { message: "Не успях да извлека контактите" };
     }
   }
 
-  private async navigateTo(
-    page: Page,
-    url: string
-  ): Promise<{
-    message: string;
-    observation?: Record<string, unknown>;
-  }> {
+  private async navigateTo(page: Page, url: string): Promise<{ message: string; observation?: Record<string, unknown> }> {
     try {
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 10000,
-      });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 10000 });
       await page.waitForTimeout(1000);
       const observation = await this.quickObserve(page);
       return { message: `Отворих ${url}`, observation };
@@ -1840,49 +1236,28 @@ class HotSessionManager {
     }
   }
 
-  private async observeCurrentState(
-    page: Page
-  ): Promise<{
-    message: string;
-    observation?: Record<string, unknown>;
-  }> {
+  private async observeCurrentState(page: Page): Promise<{ message: string; observation?: Record<string, unknown> }> {
     const observation = await this.quickObserve(page);
-
     let message = `Страница: "${observation.title}"`;
 
-    if (observation.hasAvailability) {
-      message += ". Виждам информация за наличност.";
-    }
-
-    if (
-      observation.prices &&
-      (observation.prices as string[]).length > 0
-    ) {
+    if (observation.hasAvailability) message += ". Виждам информация за наличност.";
+    if (observation.prices && (observation.prices as string[]).length > 0) {
       message += `. Цени: ${(observation.prices as string[]).slice(0, 3).join(", ")}`;
     }
 
     return { message, observation };
   }
 
-  private async quickObserve(
-    page: Page
-  ): Promise<Record<string, unknown>> {
+  private async quickObserve(page: Page): Promise<Record<string, unknown>> {
     try {
       return await page.evaluate(() => {
         const text = document.body.innerText.slice(0, 1000);
 
-        // Extract prices
-        const priceMatches = [
-          ...text.matchAll(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€)/gi),
-        ];
+        const priceMatches = [...text.matchAll(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€)/gi)];
         const prices = priceMatches.map((m) => m[0]).slice(0, 5);
 
-        // Check for availability indicators
-        const hasAvailability = /налични|свободни|available|в наличност/i.test(
-          text
-        );
-        const noAvailability =
-          /няма налични|sold out|unavailable|заети/i.test(text);
+        const hasAvailability = /налични|свободни|available|в наличност/i.test(text);
+        const noAvailability = /няма налични|sold out|unavailable|заети/i.test(text);
 
         return {
           url: window.location.href,
@@ -1898,57 +1273,38 @@ class HotSessionManager {
     }
   }
 
-  // Legacy DOM observation for backwards compatibility
-  private async observeDOM(
-    page: Page
-  ): Promise<{
-    buttons: Array<{ text: string; selector: string }>;
-    prices: string[];
-  }> {
+  private async observeDOM(page: Page): Promise<{ buttons: Array<{ text: string; selector: string }>; prices: string[] }> {
     try {
       return await page.evaluate(() => {
         const isVisible = (el: Element): boolean => {
           const rect = el.getBoundingClientRect();
           const style = window.getComputedStyle(el);
-          return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.display !== "none" &&
-            style.visibility !== "hidden"
-          );
+          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
         };
 
         const getSelector = (el: Element, idx: number): string => {
-          if (el.id) return `#${el.id}`;
-          if (el.className && typeof el.className === "string") {
-            const cls = el.className.trim().split(/\s+/)[0];
-            if (cls && !cls.includes(":")) return `.${cls}`;
-          }
+          if ((el as any).id) return `#${(el as any).id}`;
+          const cls = (el as any).className && typeof (el as any).className === "string"
+            ? (el as any).className.trim().split(/\s+/)[0]
+            : "";
+          if (cls && !cls.includes(":")) return `.${cls}`;
           return `${el.tagName.toLowerCase()}:nth-of-type(${idx + 1})`;
         };
 
         const buttons = Array.from(
-          document.querySelectorAll(
-            "button, a[href], [role='button'], input[type='submit'], .btn"
-          )
+          document.querySelectorAll("button, a[href], [role='button'], input[type='submit'], .btn")
         )
           .filter(isVisible)
           .slice(0, 25)
           .map((el, i) => ({
-            text: (
-              el.textContent?.trim() ||
-              (el as HTMLInputElement).value ||
-              ""
-            ).slice(0, 80),
+            text: ((el.textContent?.trim() || (el as HTMLInputElement).value || "") as string).slice(0, 80),
             selector: getSelector(el, i),
           }))
           .filter((b) => b.text.length > 0);
 
         const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$)/gi;
         const bodyText = document.body.innerText;
-        const prices = [...bodyText.matchAll(priceRegex)]
-          .map((m) => m[0])
-          .slice(0, 10);
+        const prices = [...bodyText.matchAll(priceRegex)].map((m) => m[0]).slice(0, 10);
 
         return { buttons, prices };
       });
@@ -1957,14 +1313,11 @@ class HotSessionManager {
     }
   }
 
-  private detectButtonType(
-    text: string
-  ): SiteMapButton["action_type"] {
+  private detectButtonType(text: string): SiteMapButton["action_type"] {
     const lower = text.toLowerCase();
     if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
     if (/контакт|contact|свържи/i.test(lower)) return "contact";
-    if (/търси|search|провери|check|submit|изпрати/i.test(lower))
-      return "submit";
+    if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
     return "other";
   }
 
@@ -1995,18 +1348,14 @@ class HotSessionManager {
       }
     }
 
-    if (cleaned > 0) {
-      console.log(`[CLEANUP] Closed ${cleaned} inactive sessions`);
-    }
+    if (cleaned > 0) console.log(`[CLEANUP] Closed ${cleaned} inactive sessions`);
   }
 
   private evictOldestSession(): void {
     let oldest: { id: string; time: number } | null = null;
 
     for (const [id, session] of this.sessions) {
-      if (!oldest || session.lastActivity < oldest.time) {
-        oldest = { id, time: session.lastActivity };
-      }
+      if (!oldest || session.lastActivity < oldest.time) oldest = { id, time: session.lastActivity };
     }
 
     if (oldest) {
@@ -2038,19 +1387,21 @@ class HotSessionManager {
 
   async shutdown(): Promise<void> {
     console.log("[SHUTDOWN] Closing all sessions...");
-    for (const [id] of this.sessions) {
-      await this.closeSession(id);
-    }
-    if (this.browser) {
-      await this.browser.close();
-    }
+    for (const [id] of this.sessions) await this.closeSession(id);
+    if (this.browser) await this.browser.close();
     console.log("[SHUTDOWN] Done");
+  }
+
+  // expose private for /forms endpoint fallback
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public __unsafeLoadFormSchemasForApi(sessionId: string): Promise<FormSchemaRow[]> {
+    return this.loadFormSchemas(sessionId);
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 // EXPRESS SERVER
-// ═══════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────
 
 async function main() {
   const manager = new HotSessionManager();
@@ -2061,7 +1412,6 @@ async function main() {
   // Auth middleware
   app.use((req, res, next) => {
     if (req.path === "/" || req.path === "/health") return next();
-
     const token = req.headers.authorization?.replace("Bearer ", "");
     if (token !== WORKER_SECRET) {
       console.log(`[AUTH] Rejected request to ${req.path}`);
@@ -2070,17 +1420,15 @@ async function main() {
     next();
   });
 
-  // ── Root ──
   app.get("/", (_, res) => {
     res.json({
       name: "NEO Worker",
-      version: "5.0.0",
-      type: "hot-session+db",
+      version: "5.1.0",
+      type: "hot-session+db+deterministic",
       status: "running",
     });
   });
 
-  // ── Health ──
   app.get("/health", (_, res) => {
     res.json({
       status: "ok",
@@ -2088,148 +1436,184 @@ async function main() {
     });
   });
 
-  // ── Prepare session (from crawler) ──
   app.post("/prepare-session", async (req: Request, res: Response) => {
     const { site_id, site_map, session_id } = req.body;
     if (!site_id || !site_map) {
-      return res.json({
-        success: false,
-        error: "Missing site_id or site_map",
-      });
+      return res.json({ success: false, error: "Missing site_id or site_map" });
     }
 
-    const success = await manager.prepareSession(
-      site_id,
-      site_map,
-      session_id
-    );
+    const success = await manager.prepareSession(site_id, site_map, session_id);
     res.json({ success, session_ready: success });
   });
 
-  // ── Execute action (from neo-agent-core) ──
+  // legacy compatible
   app.post("/execute", async (req: Request, res: Response) => {
     const { site_id, session_id, keywords, data } = req.body;
     if (!site_id || !Array.isArray(keywords)) {
       return res.json({ success: false, message: "Invalid request" });
     }
 
-    const result = await manager.execute({
-      site_id,
-      session_id,
-      keywords,
-      data,
-    });
+    const result = await manager.execute({ site_id, session_id, keywords, data });
     res.json(result);
   });
 
-  // ── NEW: Fill specific form by id/fingerprint ──
+  // deterministic form fill
   app.post("/fill-form", async (req: Request, res: Response) => {
     const body = req.body as FillFormRequest;
     if (!body.site_id || !body.data) {
-      return res.json({
-        success: false,
-        message: "Missing site_id or data",
-      });
+      return res.json({ success: false, message: "Missing site_id or data" });
     }
 
     const result = await manager.executeFillForm(body);
     res.json(result);
   });
 
-  // ── NEW: Get form_schemas for a session ──
+  // get schemas
   app.get("/forms/:sessionId", async (req: Request, res: Response) => {
     const { sessionId } = req.params;
 
-    // Try to find in active sessions
-    for (const [, session] of (manager as any).sessions as Map<
-      string,
-      HotSession
-    >) {
+    // Try cache
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const [, session] of (manager as any).sessions as Map<string, HotSession>) {
       if (session.sessionId === sessionId) {
-        return res.json({
-          success: true,
-          forms: session.formSchemas,
-          source: "cache",
-        });
+        return res.json({ success: true, forms: session.formSchemas, source: "cache" });
       }
     }
 
-    // Fallback: load from DB directly
-    const schemas = await (manager as any).loadFormSchemas(sessionId);
-    res.json({
-      success: true,
-      forms: schemas,
-      source: "db",
-    });
+    const schemas = await manager.__unsafeLoadFormSchemasForApi(sessionId);
+    res.json({ success: true, forms: schemas, source: "db" });
   });
 
-  // ── NEW: Refresh form_schemas for active session ──
   app.post("/refresh-forms", async (req: Request, res: Response) => {
     const { site_id } = req.body;
-    if (!site_id) {
-      return res.json({ success: false, error: "Missing site_id" });
-    }
+    if (!site_id) return res.json({ success: false, error: "Missing site_id" });
 
     const schemas = await manager.refreshFormSchemas(site_id);
+    res.json({ success: true, count: schemas.length, forms: schemas });
+  });
+
+  app.post("/close-session", async (req: Request, res: Response) => {
+    if (req.body.site_id) await manager.closeSession(req.body.site_id);
+    res.json({ success: true });
+  });
+
+  // legacy: interact
+  app.post("/interact", async (req: Request, res: Response) => {
+    const request = req.body as InteractRequest;
+    if (!request.site_url || !request.user_message || !request.session_id) {
+      return res.json({ success: false, message: "Missing fields", logs: [] });
+    }
+
+    // minimal legacy behavior: create a session if missing, then /execute data-driven
+    const logs: string[] = [];
+    logs.push(`[LEGACY] Session: ${request.session_id}`);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sessionsMap = (manager as any).sessions as Map<string, HotSession>;
+    let session = sessionsMap.get(request.session_id);
+
+    if (!session) {
+      logs.push(`[LEGACY] No hot session, creating...`);
+      // fallback: create minimal session
+      // (kept from old logic but simplified)
+      // This block intentionally mirrors the old behavior without keyword decisions.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const browser = (manager as any).browser as Browser | null;
+        if (!browser) {
+          return res.json({ success: false, message: "Worker не е готов", logs });
+        }
+
+        const context = await browser.newContext({
+          viewport: { width: 1366, height: 768 },
+          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+          locale: "bg-BG",
+          timezoneId: "Europe/Sofia",
+          ignoreHTTPSErrors: true,
+        });
+
+        const page = await context.newPage();
+
+        let url = request.site_url;
+        if (url && !url.startsWith("http")) url = "https://" + url;
+
+        if (url) {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await page.waitForTimeout(1500);
+        }
+
+        const observation = await (manager as any).observeDOM(page);
+
+        const siteMap: SiteMap = {
+          site_id: request.session_id,
+          url: request.site_url,
+          buttons: observation.buttons.map((b: any) => ({
+            text: b.text,
+            selector: b.selector,
+            keywords: (b.text || "").toLowerCase().split(/\s+/),
+            action_type: (manager as any).detectButtonType(b.text),
+          })),
+          forms: [],
+          prices: (observation.prices || []).map((p: string) => ({ text: p, context: "" })),
+        };
+
+        const formSchemas = await manager.__unsafeLoadFormSchemasForApi(request.session_id);
+
+        session = {
+          page,
+          context,
+          siteMap,
+          sessionId: request.session_id,
+          formSchemas,
+          lastActivity: Date.now(),
+          currentUrl: page.url(),
+        };
+
+        sessionsMap.set(request.session_id, session);
+        logs.push(`[LEGACY] Session created (${formSchemas.length} form schemas from DB)`);
+      } catch (error) {
+        logs.push(`[LEGACY] Failed to create session: ${error}`);
+        return res.json({ success: false, message: "Грешка при свързване със сайта", logs });
+      }
+    }
+
+    const result = await manager.execute({
+      site_id: request.session_id,
+      session_id: request.session_id,
+      keywords: [], // ignored
+      data: request.booking_data as any,
+    });
+
+    logs.push(`[LEGACY] Result: ${result.success ? "success" : "failed"}`);
+
     res.json({
-      success: true,
-      count: schemas.length,
-      forms: schemas,
+      success: result.success,
+      message: result.message,
+      observation: result.observation,
+      action_taken: result.success ? result.message : undefined,
+      logs,
     });
   });
 
-  // ── Close session ──
-  app.post("/close-session", async (req: Request, res: Response) => {
-    if (req.body.site_id) {
-      await manager.closeSession(req.body.site_id);
-    }
-    res.json({ success: true });
-  });
-
-  // ── Legacy: interact ──
-  app.post("/interact", async (req: Request, res: Response) => {
-    const request = req.body as InteractRequest;
-    if (
-      !request.site_url ||
-      !request.user_message ||
-      !request.session_id
-    ) {
-      return res.json({
-        success: false,
-        message: "Missing fields",
-        logs: [],
-      });
-    }
-
-    const result = await manager.interact(request);
-    res.json(result);
-  });
-
-  // ── Legacy: close ──
   app.post("/close", async (req: Request, res: Response) => {
-    if (req.body.session_id) {
-      await manager.closeSession(req.body.session_id);
-    }
+    if (req.body.session_id) await manager.closeSession(req.body.session_id);
     res.json({ success: true });
   });
 
-  // 🚀 START SERVER FIRST
+  // START SERVER FIRST
   app.listen(PORT, () => {
-    console.log(`\n🚀 NEO Worker v5.0 (Hot Sessions + DB)`);
+    console.log(`\n🚀 NEO Worker v5.1 (Deterministic DB Forms)`);
     console.log(`   Port: ${PORT}`);
     console.log(`   DB: ${SUPABASE_URL ? "configured" : "not configured"}`);
     console.log(`   Ready: ${manager.getStatus().ready}\n`);
   });
 
-  // 🔥 START BROWSER ASYNC (НЕ блокира boot)
+  // Start browser async
   manager
     .start()
     .then(() => console.log("[BOOT] HotSessionManager ready"))
-    .catch((err) => {
-      console.error("[BOOT] HotSessionManager failed:", err);
-    });
+    .catch((err) => console.error("[BOOT] HotSessionManager failed:", err));
 
-  // Graceful shutdown
   process.on("SIGTERM", async () => {
     console.log("\n[SIGTERM] Shutting down...");
     await manager.shutdown();
