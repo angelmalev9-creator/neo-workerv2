@@ -641,6 +641,7 @@ class HotSessionManager {
         note: "Wizard has no payload yet. Ask user for required fields shown above.",
       };
       return { ok: false, message: "Wizard: трябват данни за да започна (липсва payload).", observation: obs };
+    }
 
     let didInteract = false;
 
