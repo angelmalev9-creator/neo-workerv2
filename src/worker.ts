@@ -602,7 +602,7 @@ class HotSessionManager {
         `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
       );
 
-      // 1) Fill visible fields based on semantics (name/email/phone/message/age/etc.)
+      // 1) Fill visible fields based on semantics (name/email/phone/message/age
       let filled = 0;
       for (const f of scanned.fields) {
         const v = this.matchWizardFieldValue(f, data);
@@ -618,21 +618,23 @@ class HotSessionManager {
           filled++;
           actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
         }
-      if (filled > 0) didInteract = true;
       }
+      if (filled > 0) didInteract = true;
 
       // 2) Handle choice buttons (e.g. Пол: Мъж/Жена)
       const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
       if (gender && scanned.choices.length) {
         const wanted = gender.toLowerCase();
-        const pick = scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
+        const pick =
+          scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
           scanned.choices.find((c) => c.text.toLowerCase().includes(wanted));
         if (pick) {
           const clicked = await this.safeClick(page, pick.selector);
           console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
-          if (clicked) actions.push(`Пол: ${pick.text}`);
-        }
-          if (clicked) didInteract = true;
+          if (clicked) {
+            actions.push(`Пол: ${pick.text}`);
+            didInteract = true;
+          }
         }
       }
 
