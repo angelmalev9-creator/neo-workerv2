@@ -652,23 +652,41 @@ class HotSessionManager {
   }
 
   private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<boolean> {
-    const selectors = [
-      ...(f.selector_candidates || []),
-      f.name ? `[name="${f.name}"]` : "",
-      f.name ? `#${f.name}` : "",
-    ].filter(Boolean);
+  const selectors = [
+    ...(f.selector_candidates || []),
+    f.name ? `[name="${f.name}"]` : "",
+    f.name ? `#${f.name}` : "",
+  ].filter(Boolean);
 
-    for (const sel of selectors) {
-      try {
-        const el = await page.$(sel);
-        if (!el) continue;
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
+      if (!el) continue;
 
-        const visible = await el.isVisible().catch(() => false);
-        if (!visible) continue;
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible && f.tag !== "select") continue;
 
-        await el.scrollIntoViewIfNeeded().catch(() => {});
-        await el.click({ timeout: 1200 }).catch(() => {});
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 1200 }).catch(() => {});
 
+      // SMART SELECT
+      if (f.tag === "select" || f.type === "select") {
+        const ok = await this.smartSelectOption(page, sel, value);
+        return ok;
+      }
+
+      if (f.type === "file") continue;
+
+      await page.fill(sel, value, { timeout: 3000 });
+      await page.keyboard.press("Tab").catch(() => {});
+      await page.waitForTimeout(100).catch(() => {});
+      return true;
+
+    } catch {}
+  }
+
+  return false;
+}
         // select
         if (f.tag === "select" || f.type === "select") {
           await page.selectOption(sel, value, { timeout: 2500 });
