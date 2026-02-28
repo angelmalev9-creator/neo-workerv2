@@ -1,1094 +1,1480 @@
-import { useState, useRef, useCallback, useEffect } from "react";
-
-interface Message {
-  role: "user" | "assistant";
-  content: string;
-}
-
-interface UseGeminiVoiceProps {
-  onMessage?: (message: Message) => void;
-  onError?: (error: string) => void;
-  onSpeakingChange?: (speaking: boolean) => void;
-  onListeningChange?: (listening: boolean) => void;
-  onTranscript?: (transcript: string, isFinal: boolean, role: "user" | "assistant") => void;
-}
-
-type SessionData = {
-  apiKey: string;
-  model: string;
-  systemInstruction: string;
-};
-
-interface DgSTTState {
-  ws: WebSocket | null;
-  isReady: boolean;
-}
-
-const MAX_SYSTEM_INSTRUCTION_CHARS = 200000;
-const AUDIO_SAMPLE_RATE_OUT = 24000;
-const AUDIO_SAMPLE_RATE_IN = 16000;
-
-const ECHO_GUARD_MS = 120;
-const ANTI_BARGE_IN_MS = 400;
-const MIN_BARGE_IN_CHARS = 3;
-const MIN_BARGE_IN_WORDS = 1;
-const BARGE_IN_COMMANDS = ["стоп", "спри", "изчакай", "чакай", "момент", "секунда"];
-
-// We keep this low for responsiveness; Deepgram "utterance_end_ms" stays >= 1000 for stability.
-const UTTERANCE_DEBOUNCE_MS = 120;
-
-// Greeting retry if first turn is dropped / audio pipeline not yet stable
-const GREETING_RETRY_MS = 1500;
-
-const clampInstruction = (text: string, maxChars: number) => {
-  const t = String(text || "").trim();
-  if (t.length <= maxChars) return t;
-  const head = t.slice(0, Math.floor(maxChars * 0.7));
-  const tail = t.slice(-Math.floor(maxChars * 0.25));
-  return `${head}\n\n[...СЪКРАТЕНО...]\n\n${tail}`;
-};
-
-function resampleTo16k(inputData: Float32Array, inputSampleRate: number): Float32Array {
-  if (inputSampleRate === AUDIO_SAMPLE_RATE_IN) return new Float32Array(inputData);
-  const ratio = inputSampleRate / AUDIO_SAMPLE_RATE_IN;
-  const outputLength = Math.floor(inputData.length / ratio);
-  const output = new Float32Array(outputLength);
-  for (let i = 0; i < outputLength; i++) {
-    const srcIndex = i * ratio;
-    const srcIndexFloor = Math.floor(srcIndex);
-    const srcIndexCeil = Math.min(srcIndexFloor + 1, inputData.length - 1);
-    const fraction = srcIndex - srcIndexFloor;
-    output[i] = inputData[srcIndexFloor] * (1 - fraction) + inputData[srcIndexCeil] * fraction;
-  }
-  return output;
-}
-
-function float32ToInt16Buffer(float32Array: Float32Array): ArrayBuffer {
-  const int16Array = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return int16Array.buffer;
-}
-
-function normalizeBgText(s: string): string {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s@._+-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function shouldAllowBargeIn(text: string): boolean {
-  const norm = normalizeBgText(text);
-  if (!norm) return false;
-  if (BARGE_IN_COMMANDS.some((w) => norm.includes(w))) return true;
-  if (norm.length < MIN_BARGE_IN_CHARS) return false;
-  const words = norm.split(" ").filter(Boolean);
-  if (words.length < MIN_BARGE_IN_WORDS) return false;
-  return true;
-}
-
-// Fast, stable string hash for prompt key (not crypto)
-function hash32(s: string): string {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
-}
-
 /**
- * CONTACT NORMALIZATION (deterministic)
- * Goal: get fast + correct email/phone from noisy BG speech/STT.
+ * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
+ *
+ * This revision adds:
+ * - Deterministic debug logs for payload -> field match -> selector fill -> submit -> validation
+ * - PII-safe logging (no raw email/phone/message content)
  */
 
-const DIGIT_WORDS: Record<string, string> = {
-  "нула": "0",
-  "едно": "1",
-  "една": "1",
-  "две": "2",
-  "три": "3",
-  "четири": "4",
-  "пет": "5",
-  "шест": "6",
-  "седем": "7",
-  "осем": "8",
-  "девет": "9",
-  // English variants often appear in STT for digits
-  "zero": "0",
-  "one": "1",
-  "two": "2",
-  "three": "3",
-  "four": "4",
-  "five": "5",
-  "six": "6",
-  "seven": "7",
-  "eight": "8",
-  "nine": "9",
+import express, { Request, Response } from "express";
+import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
+
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const WORKER_SECRET = (process.env.NEO_WORKER_SECRET || "change-me-in-production").trim();
+
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_SERVICE_KEY =
+  (process.env.NEO_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    "").trim();
+
+type JsonObj = Record<string, unknown>;
+
+interface SiteMap {
+  site_id: string;
+  url: string;
+  buttons: any[];
+  forms: any[];
+  prices: any[];
+}
+
+interface FormSchemaField {
+  tag: string;
+  type: string;
+  name: string;
+  label: string;
+  placeholder: string;
+  required: boolean;
+  autocomplete: string;
+  aria_label?: string;
+  aria_describedby?: string;
+  selector_candidates: string[];
+}
+
+type WizardScannedField = {
+  tag: "input" | "textarea" | "select";
+  type: string;
+  name: string;
+  id: string;
+  label: string;
+  placeholder: string;
+  aria_label: string;
+  required: boolean;
+  selector: string; // best-effort unique-ish CSS selector
 };
 
-function normalizeEmailSpeech(raw: string): string {
-  let s = String(raw || "").trim().toLowerCase();
+type WizardChoiceButton = {
+  text: string;
+  selector: string;
+};
 
-  // Common BG “spelling” tokens
-  s = s
-    .replace(/\bмаймунско\b|\bмаймунка\b|\bat\b/g, "@")
-    .replace(/\bточка\b|\bдот\b|\bdot\b/g, ".")
-    .replace(/\bтире\b|\bdash\b/g, "-")
-    .replace(/\bдолна\s+черта\b|\bunderscore\b/g, "_");
+interface FormSchemaSubmit {
+  text: string;
+  selector_candidates: string[];
+}
 
-  // Remove spaces/commas between email characters
-  s = s.replace(/[,\s]+/g, "");
+interface FormSchemaRow {
+  id: string;
+  session_id: string;
+  url: string;
+  domain: string;
+  kind: "form" | "wizard" | "booking_widget" | "availability";
+  fingerprint: string;
+  schema: {
+    fields?: FormSchemaField[];
+    submit?: FormSchemaSubmit | null;
+    action?: string;
+    method?: string;
+    step_indicators?: string[];
+    src?: string;
+    vendor?: string;
+  };
+  dom_snapshot: string | null;
+}
 
-  // Fix “gmail com” or “gmail. com”
-  s = s.replace(/gmail\.?com/g, "gmail.com").replace(/abv\.?bg/g, "abv.bg");
+interface HotSession {
+  page: Page;
+  context: BrowserContext;
+  siteMap: SiteMap;
+  sessionId: string | null;
+  formSchemas: FormSchemaRow[];
+  lastActivity: number;
+  currentUrl: string;
+}
 
+interface FillFormRequest {
+  site_id: string;
+  session_id?: string;
+  form_id?: string;
+  fingerprint?: string;
+  kind?: string;
+  data: Record<string, string>;
+  confirmed?: {
+    name?: string;
+    email?: string;
+    phone?: string;
+    message?: string;
+    [k: string]: string | undefined;
+  };
+  file?: {
+    field_name: string;
+    base64: string;
+    filename: string;
+    mime_type: string;
+  };
+  auto_submit?: boolean;
+}
+
+interface ExecuteRequest {
+  site_id: string;
+  session_id?: string;
+  keywords: string[];
+  data?: Record<string, unknown>;
+}
+
+// ───────────────────────────────────────────────────────────────
+// Logging helpers (PII-safe)
+// ───────────────────────────────────────────────────────────────
+
+function safeKeys(obj: unknown): string[] {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.keys(obj as Record<string, unknown>);
+}
+
+function maskEmail(e: string): string {
+  const s = (e || "").trim();
+  const at = s.indexOf("@");
+  if (at <= 1) return "***";
+  const head = s.slice(0, 1);
+  const domain = at >= 0 ? s.slice(at) : "";
+  return `${head}***${domain}`;
+}
+
+function maskPhone(p: string): string {
+  const s = (p || "").replace(/[^\d+]/g, "");
+  if (s.length <= 4) return "***";
+  return `${s.slice(0, 2)}***${s.slice(-2)}`;
+}
+
+function summarizeValue(key: string, v: unknown): string {
+  const s = String(v ?? "");
+  const k = key.toLowerCase();
+  if (k.includes("email")) return maskEmail(s);
+  if (k.includes("phone") || k.includes("tel")) return maskPhone(s);
+  if (k.includes("message") || k.includes("note") || k.includes("comment")) return `len=${s.length}`;
+  if (s.length > 24) return `len=${s.length}`;
   return s;
 }
 
-function extractEmail(text: string): string | null {
-  const norm = normalizeEmailSpeech(text);
-  const m = norm.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
-  return m ? m[0] : null;
+function createSupabase(): SupabaseClient | null {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+  try {
+    return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  } catch {
+    return null;
+  }
 }
 
-function normalizePhoneSpeech(raw: string): string {
-  let s = String(raw || "").toLowerCase();
+// ───────────────────────────────────────────────────────────────
+// Normalization + confirmed merge
+// ───────────────────────────────────────────────────────────────
 
-  // Replace digit words
-  for (const [w, d] of Object.entries(DIGIT_WORDS)) {
-    s = s.replace(new RegExp(`\\b${w}\\b`, "g"), d);
+function normalizeEmail(input: unknown): string {
+  const raw = (typeof input === "string" ? input : "").trim().toLowerCase();
+  if (!raw) return "";
+  let s = raw.replace(/\s+/g, "");
+  s = s.replace(/\(at\)|\[at\]/g, "@").replace(/\(dot\)|\[dot\]/g, ".");
+  s = s.replace(/( at | at)/g, "@").replace(/( dot | dot)/g, ".");
+  s = s.replace(/,/g, ".").replace(/[;:]+$/g, "");
+  const parts = s.split("@");
+  if (parts.length > 2) s = parts[0] + "@" + parts.slice(1).join("");
+  return s;
+}
+
+function normalizePhone(input: unknown): string {
+  let s = (typeof input === "string" ? input : "").trim();
+  if (!s) return "";
+  s = s.replace(/[^\d+]/g, "");
+  if (s.startsWith("00")) s = "+" + s.slice(2);
+  return s;
+}
+
+function mergeConfirmedData(
+  data: Record<string, unknown>,
+  confirmed?: Record<string, unknown>
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...(data || {}) };
+  if (confirmed && typeof confirmed === "object") {
+    for (const [k, v] of Object.entries(confirmed)) merged[k] = v;
+  }
+  if (merged.email) merged.email = normalizeEmail(merged.email);
+  if (merged.phone) merged.phone = normalizePhone(merged.phone);
+  if (!merged.email && (merged as any).e_mail) merged.email = normalizeEmail((merged as any).e_mail);
+  if (!merged.phone && (merged as any).telephone) merged.phone = normalizePhone((merged as any).telephone);
+  return merged;
+}
+
+// ───────────────────────────────────────────────────────────────
+// Generic field semantics
+// ───────────────────────────────────────────────────────────────
+
+function fieldText(f: FormSchemaField): string {
+  return `${f.name || ""} ${f.label || ""} ${f.placeholder || ""} ${f.autocomplete || ""} ${f.aria_label || ""}`.toLowerCase();
+}
+function isEmailField(f: FormSchemaField): boolean {
+  const t = fieldText(f);
+  return f.type === "email" || /e-?mail|email|имейл|поща/.test(t);
+}
+function isPhoneField(f: FormSchemaField): boolean {
+  const t = fieldText(f);
+  return f.type === "tel" || /phone|tel|телефон|мобил|gsm/.test(t);
+}
+function isNameField(f: FormSchemaField): boolean {
+  const t = fieldText(f);
+  return /name|име|first|last|fullname|фамил/.test(t);
+}
+function isMessageField(f: FormSchemaField): boolean {
+  const t = fieldText(f);
+  return f.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t);
+}
+
+// ───────────────────────────────────────────────────────────────
+// HotSessionManager
+// ───────────────────────────────────────────────────────────────
+
+class HotSessionManager {
+  private browser: Browser | null = null;
+  private supabase: SupabaseClient | null = null;
+  private sessions: Map<string, HotSession> = new Map();
+  private isReady = false;
+
+  private readonly MAX_SESSIONS = 50;
+  private readonly SESSION_TIMEOUT = 30 * 60 * 1000;
+  private readonly CLEANUP_INTERVAL = 5 * 60 * 1000;
+
+  async start(): Promise<void> {
+    this.browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    });
+
+    this.supabase = createSupabase();
+    this.isReady = true;
+
+    setInterval(() => this.cleanupSessions(), this.CLEANUP_INTERVAL);
+    console.log("[WORKER] ✓ Ready");
+    console.log(`[WORKER] DB: ${this.supabase ? "connected" : "not configured"}`);
   }
 
-  // Keep + and digits; remove separators
-  s = s.replace(/[^\d+]/g, "");
-
-  // Convert 00359 -> +359
-  if (s.startsWith("00359")) s = "+359" + s.slice(5);
-
-  // If user says "359..." without plus and it's long, accept as +359
-  if (!s.startsWith("+") && s.startsWith("359") && s.length >= 11) s = "+" + s;
-
-  return s;
-}
-
-function extractPhone(text: string): string | null {
-  const norm = normalizePhoneSpeech(text);
-
-  // BG mobile patterns: 08xxxxxxxx or +3598xxxxxxxx
-  if (/^08\d{8,9}$/.test(norm)) return norm;
-  if (/^\+3598\d{8,9}$/.test(norm)) return norm;
-
-  // Generic: accept 9-15 digits (international), but avoid tiny junk
-  const digitsOnly = norm.replace(/[^\d]/g, "");
-  if (digitsOnly.length >= 9 && digitsOnly.length <= 15) return norm;
-
-  return null;
-}
-
-function isValidEmail(email: string): boolean {
-  return /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email.trim());
-}
-
-function isValidPhone(phone: string): boolean {
-  const p = phone.trim();
-  if (/^08\d{8,9}$/.test(p)) return true;
-  if (/^\+3598\d{8,9}$/.test(p)) return true;
-  const digits = p.replace(/[^\d]/g, "");
-  return digits.length >= 9 && digits.length <= 15;
-}
-
-type ContactState = {
-  name?: string;
-  email?: string;
-  phone?: string;
-};
-
-export const useGeminiVoice = ({
-  onMessage,
-  onError,
-  onSpeakingChange,
-  onListeningChange,
-  onTranscript,
-}: UseGeminiVoiceProps = {}) => {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [isPrepared, setIsPrepared] = useState(false);
-  const [isPreparing, setIsPreparing] = useState(false);
-
-  // ★ Ref mirrors — guards must read refs (never stale), state is for UI only
-  const isPreparedRef = useRef(false);
-  const isPreparingRef = useRef(false);
-  const isConnectedRef = useRef(false);
-  const isConnectingRef = useRef(false);
-
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const audioQueueRef = useRef<Float32Array[]>([]);
-  const isPlayingRef = useRef(false);
-  const isProcessingQueueRef = useRef(false);
-  const sessionDataRef = useRef<SessionData | null>(null);
-  const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const connectMutexRef = useRef(false);
-  const companyNameRef = useRef<string>("");
-  const silenceWatchdogRef = useRef<number | null>(null);
-  const silenceNudgeSentRef = useRef(false);
-  const silenceNudgeCountRef = useRef(0);
-  const gainRef = useRef<GainNode | null>(null);
-  const nextPlayTimeRef = useRef<number>(0);
-  const scheduledSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const actualSampleRateRef = useRef<number>(48000);
-  const greetingSentRef = useRef(false);
-  const greetingRetryTimerRef = useRef<number | null>(null);
-  const firstAssistantAudioSeenRef = useRef(false);
-  const firstAssistantTextSeenRef = useRef(false);
-
-  const speakEndRef = useRef<number>(0);
-  const speakStartRef = useRef<number>(0);
-  const recentUtterancesRef = useRef<Array<{ text: string; ts: number }>>([]);
-  const dgKeepAliveRef = useRef<number | null>(null);
-  const currentResponseTextRef = useRef("");
-  const dgSTTRef = useRef<DgSTTState>({ ws: null, isReady: false });
-  const utteranceBufferRef = useRef<string[]>([]);
-  const utteranceDebounceRef = useRef<number | null>(null);
-
-  // Track what context we prepared for (sessionId/companyName/systemPrompt)
-  const preparedKeyRef = useRef<string>("");
-
-  // ✅ Last known good contact values (deterministic guard before actions)
-  const contactRef = useRef<ContactState>({});
-
-  const updateSpeaking = useCallback(
-    (speaking: boolean) => {
-      setIsSpeaking(speaking);
-      onSpeakingChange?.(speaking);
-      if (speaking) speakStartRef.current = Date.now();
-      else speakEndRef.current = Date.now();
-    },
-    [onSpeakingChange],
-  );
-
-  const updateListening = useCallback(
-    (listening: boolean) => {
-      setIsListening(listening);
-      onListeningChange?.(listening);
-    },
-    [onListeningChange],
-  );
-
-  const clearSilenceWatchdog = useCallback(() => {
-    if (silenceWatchdogRef.current) {
-      window.clearTimeout(silenceWatchdogRef.current);
-      silenceWatchdogRef.current = null;
-    }
-  }, []);
-
-  const sendToGemini = useCallback((text: string) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(
-      JSON.stringify({
-        client_content: {
-          turns: [{ role: "user", parts: [{ text }] }],
-          turn_complete: true,
-        },
-      }),
-    );
-  }, []);
-
-  const sendGreetingToGemini = useCallback(() => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    currentResponseTextRef.current = "";
-    ws.send(
-      JSON.stringify({
-        client_content: {
-          turns: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: `SYSTEM: Нов входящ разговор. Кажи поздрав и попитай с какво можеш да помогнеш. Ти си НЕО от ${companyNameRef.current}. Максимум 2 изречения.`,
-                },
-              ],
-            },
-          ],
-          turn_complete: true,
-        },
-      }),
-    );
-  }, []);
-
-  const startSilenceWatchdog = useCallback(() => {
-    clearSilenceWatchdog();
-    silenceWatchdogRef.current = window.setTimeout(() => {
-      if (isPlayingRef.current) return;
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-      if (silenceNudgeCountRef.current >= 1) return;
-      if (silenceNudgeSentRef.current) return;
-      silenceNudgeSentRef.current = true;
-      silenceNudgeCountRef.current += 1;
-      sendToGemini("Все още ли сте на линия?");
-    }, 25000);
-  }, [clearSilenceWatchdog, sendToGemini]);
-
-  const handleUtteranceRef = useRef<(text: string) => void>(() => {});
-
-  const connectSTT = useCallback(() => {
-    const dgApiKey = import.meta.env.VITE_DEEPGRAM_API_KEY as string | undefined;
-    if (!dgApiKey || dgApiKey.trim() === "" || dgApiKey === "undefined") {
-      onError?.("Липсва DEEPGRAM_API_KEY");
-      return;
-    }
-    let cleanKey = dgApiKey.trim().replace(/^["']|["']$/g, "");
-    cleanKey = cleanKey.replace(/^Bearer\s+/i, "").trim();
-
-    const params = new URLSearchParams({
-      model: "nova-2",
-      language: "bg",
-      encoding: "linear16",
-      sample_rate: "16000",
-      punctuate: "true",
-      interim_results: "true",
-      smart_format: "true",
-      // ✅ Numerals helps a lot with "08, 77, 0..."
-      numerals: "true",
-      // Keep stable; don't go too aggressive here
-      endpointing: "300",
-      utterance_end_ms: "1000",
-      vad_events: "true",
-    });
-
-    console.log("[STT] Connecting Nova-2 bg...");
-    const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params.toString()}`, ["token", cleanKey]);
-    const stt = dgSTTRef.current;
-    stt.ws = ws;
-    stt.isReady = false;
-
-    ws.onopen = () => {
-      console.log("[STT] ✅ Connected");
-      stt.isReady = true;
-      if (dgKeepAliveRef.current) clearInterval(dgKeepAliveRef.current);
-      dgKeepAliveRef.current = window.setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "KeepAlive" }));
-      }, 8000);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data?.type === "SpeechStarted") return;
-        if (data?.type === "UtteranceEnd") return;
-        const alt = data?.channel?.alternatives?.[0];
-        if (!alt) return;
-        const transcript = (alt.transcript || "").trim();
-        if (!transcript) return;
-
-        if (!data.is_final) {
-          onTranscript?.(transcript, false, "user");
-          return;
-        }
-
-        utteranceBufferRef.current.push(transcript);
-        onTranscript?.(utteranceBufferRef.current.join(" "), true, "user");
-
-        if (utteranceDebounceRef.current) {
-          window.clearTimeout(utteranceDebounceRef.current);
-        }
-        utteranceDebounceRef.current = window.setTimeout(() => {
-          utteranceDebounceRef.current = null;
-          const fullText = utteranceBufferRef.current.join(" ").trim();
-          utteranceBufferRef.current = [];
-          if (fullText) handleUtteranceRef.current(fullText);
-        }, UTTERANCE_DEBOUNCE_MS);
-      } catch (e) {
-        console.error("[STT] parse err", e);
-      }
-    };
-
-    ws.onerror = (e) => {
-      console.error("[STT] error", e);
-      onError?.("Deepgram STT грешка");
-    };
-    ws.onclose = (ev) => {
-      console.log("[STT] Closed:", ev.code, ev.reason);
-      stt.isReady = false;
-      if (dgKeepAliveRef.current) {
-        clearInterval(dgKeepAliveRef.current);
-        dgKeepAliveRef.current = null;
-      }
-    };
-  }, [onError, onTranscript]);
-
-  const handleUserUtterance = useCallback(
-    (text: string) => {
-      if (!text.trim()) return;
-
-      // Guards vs echo / barge-in noise
-      if (Date.now() - speakEndRef.current < ECHO_GUARD_MS) return;
-      if (isPlayingRef.current && Date.now() - speakStartRef.current < ANTI_BARGE_IN_MS) return;
-      if (isPlayingRef.current && !shouldAllowBargeIn(text)) return;
-
-      // Duplicate guard
-      const now = Date.now();
-      const recent = recentUtterancesRef.current.filter((u) => now - u.ts < 2000);
-      recentUtterancesRef.current = recent;
-      const normalized = text.trim().toLowerCase();
-      if (recent.some((u) => u.text === normalized)) return;
-      recentUtterancesRef.current.push({ text: normalized, ts: now });
-
-      clearSilenceWatchdog();
-      silenceNudgeSentRef.current = false;
-
-      // Stop TTS on barge-in
-      if (isPlayingRef.current) {
-        scheduledSourcesRef.current.forEach((s) => {
-          try {
-            s.stop();
-          } catch {}
-        });
-        scheduledSourcesRef.current = [];
-        if (activeSourceRef.current) {
-          try {
-            activeSourceRef.current.stop();
-          } catch {}
-          activeSourceRef.current = null;
-        }
-        audioQueueRef.current = [];
-        isProcessingQueueRef.current = false;
-        isPlayingRef.current = false;
-        nextPlayTimeRef.current = 0;
-        updateSpeaking(false);
-      }
-
-      // Emit user message
-      onMessage?.({ role: "user", content: text });
-      onTranscript?.(text, true, "user");
-
-      // Deterministic contact extraction (fast + accurate)
-      const email = extractEmail(text);
-      const phone = extractPhone(text);
-
-      if (email && isValidEmail(email)) {
-        contactRef.current.email = email;
-      }
-      if (phone && isValidPhone(phone)) {
-        contactRef.current.phone = phone;
-      }
-
-      console.log("[VOICE] → Gemini:", text.substring(0, 60));
-      currentResponseTextRef.current = "";
-
-      // Send to Gemini with a deterministic hint block (NO extra roundtrips)
-      const contactHintParts: string[] = [];
-      if (contactRef.current.email) contactHintParts.push(`email=${contactRef.current.email}`);
-      if (contactRef.current.phone) contactHintParts.push(`phone=${contactRef.current.phone}`);
-
-      const hint =
-        contactHintParts.length > 0
-          ? `\n\n[CONTACT_PARSED ${contactHintParts.join(" ")}]\nПравило: използвай само тези стойности за имейл/телефон. Ако липсва, поискай го пак.`
-          : "";
-
-      sendToGemini(`${text}${hint}`);
-    },
-    [clearSilenceWatchdog, updateSpeaking, onMessage, onTranscript, sendToGemini],
-  );
-
-  useEffect(() => {
-    handleUtteranceRef.current = handleUserUtterance;
-  }, [handleUserUtterance]);
-
-  const processAudioQueue = useCallback(async () => {
-    if (isProcessingQueueRef.current || audioQueueRef.current.length === 0 || !audioContextRef.current) return;
-    isProcessingQueueRef.current = true;
-    isPlayingRef.current = true;
-    updateSpeaking(true);
-    updateListening(false);
-
-    const ctx = audioContextRef.current;
-    if (!gainRef.current) {
-      gainRef.current = ctx.createGain();
-      gainRef.current.gain.value = 1.3;
-      gainRef.current.connect(ctx.destination);
-    }
-    if (nextPlayTimeRef.current < ctx.currentTime) nextPlayTimeRef.current = ctx.currentTime + 0.005;
-
-    while (audioQueueRef.current.length > 0) {
-      const audioData = audioQueueRef.current.shift();
-      if (!audioData) continue;
-      const buffer = ctx.createBuffer(1, audioData.length, AUDIO_SAMPLE_RATE_OUT);
-      buffer.getChannelData(0).set(audioData);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = 1.0;
-      activeSourceRef.current = source;
-      source.connect(gainRef.current!);
-      source.start(nextPlayTimeRef.current);
-      scheduledSourcesRef.current.push(source);
-      nextPlayTimeRef.current += buffer.duration / 1.0;
-
-      source.onended = () => {
-        const idx = scheduledSourcesRef.current.indexOf(source);
-        if (idx > -1) scheduledSourcesRef.current.splice(idx, 1);
-        if (scheduledSourcesRef.current.length === 0 && audioQueueRef.current.length === 0) {
-          isPlayingRef.current = false;
-          updateSpeaking(false);
-          updateListening(true);
-          startSilenceWatchdog();
-        }
+  getStatus() {
+    const sessionDetails: Record<string, { url: string; schemas: number; age_sec: number }> = {};
+    for (const [id, s] of this.sessions) {
+      sessionDetails[id] = {
+        url: s.currentUrl,
+        schemas: s.formSchemas.length,
+        age_sec: Math.round((Date.now() - s.lastActivity) / 1000),
       };
     }
-    isProcessingQueueRef.current = false;
-  }, [updateSpeaking, updateListening, startSilenceWatchdog]);
-
-  const playAudioChunk = useCallback(
-    (base64Audio: string) => {
-      if (!audioContextRef.current) return;
-      try {
-        const binaryString = atob(base64Audio);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-        const int16Array = new Int16Array(bytes.buffer);
-        const float32Array = new Float32Array(int16Array.length);
-        for (let i = 0; i < int16Array.length; i++) float32Array[i] = int16Array[i] / 32768;
-        audioQueueRef.current.push(float32Array);
-        firstAssistantAudioSeenRef.current = true;
-        processAudioQueue();
-      } catch {}
-    },
-    [processAudioQueue],
-  );
-
-  const startAudioCapture = useCallback(() => {
-    if (!streamRef.current || !audioContextRef.current) return;
-    const ctx = audioContextRef.current;
-    const track = streamRef.current.getAudioTracks()[0];
-    if (!track) return;
-    track.enabled = true;
-
-    if (processorRef.current) {
-      try {
-        processorRef.current.disconnect();
-      } catch {}
-      processorRef.current = null;
-    }
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.disconnect();
-      } catch {}
-      sourceRef.current = null;
-    }
-    if (ctx.state === "suspended") ctx.resume();
-
-    actualSampleRateRef.current = ctx.sampleRate;
-    const source = ctx.createMediaStreamSource(new MediaStream([track]));
-    sourceRef.current = source;
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    processorRef.current = processor;
-
-    processor.onaudioprocess = (e) => {
-      if (Date.now() - speakEndRef.current < ECHO_GUARD_MS) return;
-      const stt = dgSTTRef.current;
-      if (!stt.ws || stt.ws.readyState !== WebSocket.OPEN || !stt.isReady) return;
-      const inputData = e.inputBuffer?.getChannelData(0);
-      if (!inputData) return;
-      try {
-        stt.ws.send(float32ToInt16Buffer(resampleTo16k(inputData, actualSampleRateRef.current)));
-      } catch {}
+    return {
+      ready: this.isReady,
+      db: !!this.supabase,
+      sessions: this.sessions.size,
+      maxSessions: this.MAX_SESSIONS,
+      sessionDetails,
+      uptime_sec: Math.floor(process.uptime()),
     };
+  }
 
-    source.connect(processor);
-    processor.connect(ctx.destination);
-    updateListening(true);
-    console.log("[MIC] ✅ Capturing (always-on)");
-  }, [updateListening]);
-
-  const resetPreparedSession = useCallback(() => {
-    sessionDataRef.current = null;
-    preparedKeyRef.current = "";
-    isPreparedRef.current = false;
-    setIsPrepared(false);
-    greetingSentRef.current = false;
-    currentResponseTextRef.current = "";
-    firstAssistantAudioSeenRef.current = false;
-    firstAssistantTextSeenRef.current = false;
-    if (greetingRetryTimerRef.current) {
-      window.clearTimeout(greetingRetryTimerRef.current);
-      greetingRetryTimerRef.current = null;
+  private evictOldestSession(): void {
+    let oldest: { id: string; t: number } | null = null;
+    for (const [id, s] of this.sessions) {
+      if (!oldest || s.lastActivity < oldest.t) oldest = { id, t: s.lastActivity };
     }
-  }, []);
+    if (oldest) void this.closeSession(oldest.id);
+  }
 
-  const prepareSession = useCallback(
-    async (systemPrompt: string, companyName: string, sessionId?: string) => {
-      const key = `${sessionId || ""}::${companyName || ""}::${hash32(systemPrompt || "")}`;
+  private cleanupSessions(): void {
+    const now = Date.now();
+    for (const [id, s] of this.sessions) {
+      if (now - s.lastActivity > this.SESSION_TIMEOUT) void this.closeSession(id);
+    }
+  }
 
-      if (isPreparingRef.current) return;
-      if (isPreparedRef.current && sessionDataRef.current && preparedKeyRef.current === key) return;
+  async closeSession(siteId: string): Promise<void> {
+    const s = this.sessions.get(siteId);
+    if (!s) return;
+    try { await s.page.close(); } catch {}
+    try { await s.context.close(); } catch {}
+    this.sessions.delete(siteId);
+    console.log(`[SESSION] Closed ${siteId}`);
+  }
 
-      if (preparedKeyRef.current && preparedKeyRef.current !== key) {
-        console.log("[SESSION] 🔄 Context changed → reset prepared session");
-        resetPreparedSession();
+  private async loadFormSchemas(sessionId: string): Promise<FormSchemaRow[]> {
+    if (!this.supabase || !sessionId) return [];
+    try {
+      const { data, error } = await this.supabase
+        .from("form_schemas")
+        .select("*")
+        .eq("session_id", sessionId)
+        .limit(50);
+
+      if (error) {
+        console.error("[DB] form_schemas error:", error.message);
+        return [];
       }
+      const rows = (data || []) as FormSchemaRow[];
+      console.log(`[DB] Loaded ${rows.length} form_schemas for session ${sessionId.slice(0, 8)}…`);
+      return rows;
+    } catch (e) {
+      console.error("[DB] loadFormSchemas exception:", e);
+      return [];
+    }
+  }
 
-      isPreparingRef.current = true;
-      setIsPreparing(true);
-      companyNameRef.current = companyName;
+  async prepareSession(siteId: string, siteMap: SiteMap, sessionId?: string): Promise<boolean> {
+    if (!this.isReady || !this.browser) return false;
 
-      try {
-        const anonKey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string) || "";
-        const response = await fetch("https://onufuxczpqlxxkgyltlz.supabase.co/functions/v1/gemini-session", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            apikey: anonKey,
-            Authorization: `Bearer ${anonKey}`,
-          },
-          body: JSON.stringify({
-            systemPrompt,
-            companyName,
-            sessionId,
-          }),
-        });
+    const start = Date.now();
+    console.log(`[PREPARE] Site: ${siteId}`);
+    console.log(`[PREPARE] URL: ${siteMap.url}`);
+    console.log(`[PREPARE] Buttons: ${siteMap.buttons?.length || 0}, Forms: ${siteMap.forms?.length || 0}, Prices: ${siteMap.prices?.length || 0}`);
 
-        if (!response.ok) throw new Error("Session prep failed");
-        const data = await response.json();
-        if (!data?.success) throw new Error(data?.error || "Session failed");
+    try {
+      await this.closeSession(siteId);
 
-        sessionDataRef.current = {
-          apiKey: data.apiKey,
-          model: data.model,
-          systemInstruction: clampInstruction(data.systemInstruction || "", MAX_SYSTEM_INSTRUCTION_CHARS),
-        };
+      if (this.sessions.size >= this.MAX_SESSIONS) this.evictOldestSession();
 
-        preparedKeyRef.current = key;
+      const context = await this.browser.newContext({
+        viewport: { width: 1366, height: 768 },
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+        locale: "bg-BG",
+        timezoneId: "Europe/Sofia",
+        ignoreHTTPSErrors: true,
+      });
+
+      const page = await context.newPage();
+
+      let url = siteMap.url;
+      if (url && !url.startsWith("http")) url = "https://" + url;
+
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await page.waitForTimeout(1200);
+
+      const dbSessionId = sessionId || siteId;
+      const schemas = await this.loadFormSchemas(dbSessionId);
+
+      this.sessions.set(siteId, {
+        page,
+        context,
+        siteMap,
+        sessionId: dbSessionId,
+        formSchemas: schemas,
+        lastActivity: Date.now(),
+        currentUrl: page.url(),
+      });
+
+      console.log(`[PREPARE] ✓ Session ready in ${Date.now() - start}ms (${schemas.length} form schemas)`);
+      return true;
+    } catch (e) {
+      console.error("[PREPARE] Failed:", e);
+      return false;
+    }
+  }
+
+  async refreshFormSchemas(siteId: string): Promise<FormSchemaRow[]> {
+    const s = this.sessions.get(siteId);
+    if (!s) return [];
+    const dbSessionId = s.sessionId || siteId;
+    const schemas = await this.loadFormSchemas(dbSessionId);
+    s.formSchemas = schemas;
+    return schemas;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // /fill-form
+  // ─────────────────────────────────────────────────────────
+
+  async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
+    const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
+    const autoSubmit = request.auto_submit !== false;
+
+    const session = this.sessions.get(site_id);
+    if (!session) return { success: false, message: "Няма активна сесия" };
+
+    session.lastActivity = Date.now();
+
+    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
+      session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
+    }
+
+    let schema: FormSchemaRow | undefined;
+    if (form_id) schema = session.formSchemas.find(s => s.id === form_id);
+    else if (fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
+    else if (kind) schema = session.formSchemas.find(s => s.kind === kind);
+    else schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
+
+    if (!schema) {
+      return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
+    }
+
+    console.log(`[FILL-FORM] kind=${schema.kind} form_id=${schema.id} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
+
+    const merged = mergeConfirmedData(data || {}, confirmed as any);
+
+    // PII-safe payload summary
+    const mergedKeys = Object.keys(merged);
+    const mergedPreview = mergedKeys.slice(0, 12).map(k => `${k}=${summarizeValue(k, (merged as any)[k])}`);
+    console.log(`[FILL-FORM][PAYLOAD] keys=${mergedKeys.join(",")} preview=${mergedPreview.join(" | ")}`);
+
+    await this.ensureOnSchemaUrl(session.page, schema.url);
+
+    let result: { ok: boolean; message: string; observation?: JsonObj };
+    if (schema.kind === "wizard") {
+      result = await this.fillWizard(session.page, schema, merged, autoSubmit);
+    } else {
+      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit);
+    }
+
+    return { success: !!result.ok, message: result.message, observation: result.observation };
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // /execute (legacy)
+  // ─────────────────────────────────────────────────────────
+
+  async execute(req: ExecuteRequest): Promise<{ success: boolean; message: string; observation?: JsonObj; form_schemas?: FormSchemaRow[] }> {
+    const { site_id, session_id, data } = req;
+    const session = this.sessions.get(site_id);
+    if (!session) return { success: false, message: "Няма активна сесия. Моля, изчакайте зареждане." };
+
+    session.lastActivity = Date.now();
+
+    if (session_id && session.sessionId !== session_id && session.formSchemas.length === 0) {
+      session.sessionId = session_id;
+      session.formSchemas = await this.loadFormSchemas(session_id);
+    }
+
+    if (data && Object.keys(data).length > 0 && session.formSchemas.length > 0) {
+      const best = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
+      if (best) {
+        await this.ensureOnSchemaUrl(session.page, best.url);
+        const r = await this.fillFormSchema(session.page, best, data, undefined, true);
+        return { success: !!r.ok, message: r.message, observation: r.observation };
+      }
+    }
+
+    if (session.formSchemas.length > 0) {
+      return { success: true, message: `Налични форми: ${session.formSchemas.length}`, form_schemas: session.formSchemas };
+    }
+
+    const obs = await this.quickObserve(session.page);
+    return { success: true, message: `Страница: "${String(obs.title || "")}"`, observation: obs };
+  }
+
+  private async ensureOnSchemaUrl(page: Page, schemaUrl?: string) {
+    if (!schemaUrl) return;
+    try {
+      const cur = new URL(page.url());
+      const target = new URL(schemaUrl);
+      if (cur.pathname === target.pathname) return;
+    } catch {}
+
+    try {
+      console.log(`[NAV] goto ${schemaUrl}`);
+      await page.goto(schemaUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await page.waitForTimeout(900);
+    } catch (e) {
+      console.log("[NAV] goto failed:", e);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Filling logic
+  // ─────────────────────────────────────────────────────────
+
+  private matchFieldValue(field: FormSchemaField, data: Record<string, unknown>): string | undefined {
+    if (field.name && data[field.name] !== undefined) return String(data[field.name]);
+
+    if (isEmailField(field) && (data as any).email) return String((data as any).email);
+    if (isPhoneField(field) && ((data as any).phone || (data as any).telephone)) return String((data as any).phone || (data as any).telephone);
+    if (isNameField(field) && ((data as any).name || (data as any).full_name || (data as any).first_name)) return String((data as any).name || (data as any).full_name || (data as any).first_name);
+    if (isMessageField(field) && ((data as any).message || (data as any).note || (data as any).comment)) return String((data as any).message || (data as any).note || (data as any).comment);
+
+    return undefined;
+  }
+
+  private async fillFormSchema(
+    page: Page,
+    schema: FormSchemaRow,
+    data: Record<string, unknown>,
+    file?: FillFormRequest["file"],
+    autoSubmit = true
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    const fields = schema.schema.fields || [];
+    const actions: string[] = [];
+    const filledSelectors: string[] = [];
+
+    console.log(`[FILL-FORM][SCHEMA] submitText="${schema.schema.submit?.text || ""}" submitCandidates=${(schema.schema.submit?.selector_candidates || []).length}`);
+
+    let matchedCount = 0;
+
+    for (const f of fields) {
+      const v = this.matchFieldValue(f, data);
+
+      console.log(
+        `[FIELD] name="${f.name}" label="${f.label}" tag=${f.tag} type=${f.type} required=${!!f.required} matched=${v !== undefined ? "yes" : "no"}`
+      );
+
+      if (v === undefined) continue;
+      matchedCount++;
+
+      const usedSel = await this.fillSingleField(page, f, String(v));
+      if (usedSel) {
+        filledSelectors.push(usedSel);
+        actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
+      } else {
+        actions.push(`${f.label || f.name || f.placeholder || f.type}: (не успях)`);
+      }
+    }
+
+    if (matchedCount === 0) {
+      console.log("[FILL-FORM][NO_MATCHED_FIELDS] payload keys:", Object.keys(data));
+    }
+
+    if (file) {
+      const up = await this.uploadFile(page, fields, file);
+      if (up) actions.push(`Файл: ${file.filename}`);
+    }
+
+    const submitInfo: JsonObj = {};
+    let submitClicked = false;
+    if (autoSubmit) {
+      console.log("[SUBMIT] attempting...");
+      const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
+      submitInfo.submit_attempted = submit.attempted;
+      submitInfo.submit_method = submit.method;
+      submitInfo.submit_clicked = submit.clicked;
+      submitInfo.submit_debug = submit.debug;
+
+      submitClicked = !!submit.clicked;
+
+      const invalid = await this.getInvalidFields(page);
+      submitInfo.invalid_fields = invalid;
+
+      console.log(`[SUBMIT] clicked=${submit.clicked} method=${submit.method} invalid=${invalid.join(",") || "none"}`);
+
+      if (submit.clicked) actions.push("Кликнах Изпрати");
+      else actions.push("Не намерих submit бутон за клик");
+
+      if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
+    }
+
+    const obs = await this.quickObserve(page);
+    obs.submit = submitInfo;
+
+    return {
+      ok: autoSubmit ? submitClicked : true,
+      message: actions.length ? `Попълних: ${actions.join(", ")}` : "Не успях да попълня полета",
+      observation: obs,
+    };
+  }
+
+  private async fillWizard(
+    page: Page,
+    schema: FormSchemaRow,
+    data: Record<string, unknown>,
+    autoSubmit = true
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    // Универсален multi-step wizard:
+    // - На всяка стъпка: сканира видимите полета, попълва, клика Next/Напред или Submit/Изпрати,
+    //   изчаква DOM промяна, повтаря до успех или лимит.
+
+    const actions: string[] = [];
+    const maxSteps = 8;
+
+    const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
+    if (!hasAnyData) {
+      const obs = await this.quickObserve(page);
+      (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
+      return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
+    }
+
+    let didInteract = false;
+
+    console.log(`[WIZARD] start url=${page.url()}`);
+
+    for (let step = 1; step <= maxSteps; step++) {
+      const beforeSig = await this.getWizardDomSignature(page);
+      const scanned = await this.scanWizardStep(page);
+
+      console.log(
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
+      );
+
+      // 1) Fill visible fields based on semantics (name/email/phone/message/age
+      let filled = 0;
+      for (const f of scanned.fields) {
+        const v = this.matchWizardFieldValue(f, data);
+        const matched = v !== undefined && String(v).trim().length > 0;
 
         console.log(
-          "[SESSION] ✅ Ready, model:",
-          data.model,
-          "| instruction:",
-          sessionDataRef.current.systemInstruction.length,
-          "chars | key:",
-          key,
+          `[WIZARD][FIELD] tag=${f.tag} type=${f.type} name="${f.name}" label="${f.label}" required=${f.required} matched=${matched ? "yes" : "no"}`
         );
-        isPreparedRef.current = true;
-        setIsPrepared(true);
-      } catch (e) {
-        onError?.(e instanceof Error ? e.message : "Prepare failed");
-      } finally {
-        isPreparingRef.current = false;
-        setIsPreparing(false);
+
+        if (!matched) continue;
+        const ok = await this.fillWizardField(page, f, String(v));
+        if (ok) {
+          filled++;
+          actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
+        }
       }
-    },
-    [onError, resetPreparedSession],
-  );
+      if (filled > 0) didInteract = true;
 
-  const preWarmMicrophone = useCallback(async () => {
-    if (streamRef.current) return;
+      // 2) Handle choice buttons (e.g. Пол: Мъж/Жена)
+      const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
+      if (gender && scanned.choices.length) {
+        const wanted = gender.toLowerCase();
+        const pick =
+          scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
+          scanned.choices.find((c) => c.text.toLowerCase().includes(wanted));
+        if (pick) {
+          const clicked = await this.safeClick(page, pick.selector);
+          console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
+          if (clicked) {
+            actions.push(`Пол: ${pick.text}`);
+            didInteract = true;
+          }
+        }
+      }
+
+      // Early success detection (some wizards auto-advance)
+      if (didInteract && await this.detectWizardSuccess(page)) {
+        const obs = await this.quickObserve(page);
+        console.log(`[WIZARD] success detected at step=${step}`);
+        return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
+      }
+
+      // 3) Decide Next vs Submit
+      const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
+      console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
+
+      if (clicked.clicked) {
+        didInteract = true;
+        actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
+        await this.waitForWizardStepChange(page, beforeSig);
+
+        if (await this.detectWizardSuccess(page)) {
+          const obs = await this.quickObserve(page);
+          console.log(`[WIZARD] success detected after click at step=${step}`);
+          return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
+        }
+
+        // continue to next step
+        continue;
+      }
+
+      // 4) No buttons found. If we filled something but no navigation, bail with debug.
+      const invalid = await this.getInvalidFields(page);
+      if (invalid.length) {
+        actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
+      }
+
+      const obs = await this.quickObserve(page);
+      (obs as any).wizard = {
+        step,
+        filled,
+        invalid_fields: invalid,
+        note: "No next/submit button detected",
+      };
+
+      return {
+        ok: false,
+        message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон",
+        observation: obs,
+      };
+    }
+
+    const obs = await this.quickObserve(page);
+    (obs as any).wizard = { note: "maxSteps reached" };
+    return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: прекалено много стъпки", observation: obs };
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Wizard helpers
+  // ─────────────────────────────────────────────────────────
+
+  private wizardFieldText(f: WizardScannedField): string {
+    return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
+  }
+
+  private matchWizardFieldValue(field: WizardScannedField, data: Record<string, unknown>): string | undefined {
+    // 1) direct by name/id
+    if (field.name && data[field.name] !== undefined) return String(data[field.name]);
+    if (field.id && data[field.id] !== undefined) return String(data[field.id]);
+
+    const t = this.wizardFieldText(field);
+
+    // 2) common semantics
+    if (field.type === "email" || /e-?mail|email|имейл|поща/.test(t)) {
+      const v = (data as any).email || (data as any).e_mail;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (field.type === "tel" || /phone|tel|телефон|мобил|gsm/.test(t)) {
+      const v = (data as any).phone || (data as any).telephone || (data as any).tel;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (/name|име|first|last|fullname|фамил/.test(t)) {
+      const v = (data as any).name || (data as any).full_name || (data as any).first_name;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (field.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t)) {
+      const v = (data as any).message || (data as any).note || (data as any).comment;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (/age|възраст/.test(t)) {
+      const v = (data as any).age || (data as any).years || (data as any).възраст;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    // 3) fallback: try any key that appears in label (deterministic)
+    for (const k of Object.keys(data || {})) {
+      if (!k) continue;
+      const kk = k.toLowerCase();
+      if (kk.length < 3) continue;
+      if (t.includes(kk) && (data as any)[k] !== undefined) return String((data as any)[k]);
+    }
+
+    return undefined;
+  }
+
+  private async fillWizardField(page: Page, f: WizardScannedField, value: string): Promise<boolean> {
+    const sel = f.selector;
+    const valSummary = summarizeValue(f.name || f.type, value);
+    console.log(`[WIZARD][FILL] selector=${sel} value=${valSummary}`);
+
     try {
-      streamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      const el = await page.$(sel);
+      if (!el) return false;
+
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) return false;
+
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 1200 }).catch(() => {});
+
+      if (f.tag === "select" || f.type === "select") {
+        return await this.smartSelectOption(page, sel, String(value));
+      }
+
+      // Some wizards use type=number but accept text fill.
+      await page.fill(sel, String(value), { timeout: 3000 });
+      await page.keyboard.press("Tab").catch(() => {});
+      await page.waitForTimeout(80).catch(() => {});
+      return true;
+    } catch (e) {
+      console.log(`[WIZARD][FILL][FAIL] selector=${sel}`, e);
+      return false;
+    }
+  }
+
+  private async safeClick(page: Page, selector: string): Promise<boolean> {
+    try {
+      const el = await page.$(selector);
+      if (!el) return false;
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) return false;
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 2500, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async clickWizardNextOrSubmit(
+    page: Page,
+    autoSubmit: boolean
+  ): Promise<{ clicked: boolean; kind: "next" | "submit" | "none"; text: string }>
+  {
+    // Prefer NEXT first if exists.
+    const nextTexts = ["Напред", "Следва", "Продължи", "Next", "Continue", ">", "→"];
+    const submitTexts = ["Изпрати", "Завърши", "Готово", "Submit", "Send", "Finish", "Потвърди"];
+
+    const clickedNext = await this.clickWizardButtonByTexts(page, nextTexts);
+    if (clickedNext.clicked) return { clicked: true, kind: "next", text: clickedNext.text };
+
+    if (!autoSubmit) return { clicked: false, kind: "none", text: "" };
+
+    const clickedSubmit = await this.clickWizardButtonByTexts(page, submitTexts, true);
+    if (clickedSubmit.clicked) return { clicked: true, kind: "submit", text: clickedSubmit.text };
+
+    // Fallback: any visible submit button
+    try {
+      const ok = await page.evaluate(() => {
+        const btn = document.querySelector('button[type="submit"], input[type="submit"]') as any;
+        if (!btn) return false;
+        const r = btn.getBoundingClientRect();
+        const visible = r.width > 0 && r.height > 0;
+        if (!visible) return false;
+        btn.click();
+        return true;
       });
+      if (ok) return { clicked: true, kind: "submit", text: "type=submit" };
     } catch {}
-  }, []);
 
-  const disconnect = useCallback(() => {
-    clearSilenceWatchdog();
-    silenceNudgeSentRef.current = false;
-    silenceNudgeCountRef.current = 0;
+    return { clicked: false, kind: "none", text: "" };
+  }
 
-    if (greetingRetryTimerRef.current) {
-      window.clearTimeout(greetingRetryTimerRef.current);
-      greetingRetryTimerRef.current = null;
-    }
+  private async clickWizardButtonByTexts(
+    page: Page,
+    texts: string[],
+    allowSubmitInputs = false
+  ): Promise<{ clicked: boolean; text: string }>
+  {
+    for (const t of texts) {
+      const text = (t || "").trim();
+      if (!text) continue;
 
-    if (dgKeepAliveRef.current) {
-      clearInterval(dgKeepAliveRef.current);
-      dgKeepAliveRef.current = null;
-    }
+      // Try buttons / links with has-text
+      const candidates = [
+        `button:has-text("${text}")`,
+        `a:has-text("${text}")`,
+      ];
+      if (allowSubmitInputs) candidates.push(`input[type="submit"][value*="${text}"]`);
 
-    const stt = dgSTTRef.current;
-    if (stt.ws) {
-      try {
-        stt.ws.close();
-      } catch {}
-      stt.ws = null;
-    }
-    stt.isReady = false;
+      for (const sel of candidates) {
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          const visible = await el.isVisible().catch(() => false);
+          if (!visible) continue;
 
-    connectMutexRef.current = false;
-    greetingSentRef.current = false;
+          // Avoid disabled
+          const disabled = await el.evaluate((n: any) => !!n.disabled).catch(() => false);
+          if (disabled) continue;
 
-    isPreparedRef.current = false;
-    setIsPrepared(false);
-
-    if (processorRef.current) {
-      try {
-        processorRef.current.disconnect();
-      } catch {}
-      processorRef.current = null;
-    }
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.disconnect();
-      } catch {}
-      sourceRef.current = null;
-    }
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch {}
-      wsRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try {
-        audioContextRef.current.close();
-      } catch {}
-      audioContextRef.current = null;
-    }
-    if (gainRef.current) {
-      try {
-        gainRef.current.disconnect();
-      } catch {}
-      gainRef.current = null;
-    }
-    scheduledSourcesRef.current.forEach((s) => {
-      try {
-        s.stop();
-      } catch {}
-    });
-    scheduledSourcesRef.current = [];
-    if (activeSourceRef.current) {
-      try {
-        activeSourceRef.current.stop();
-      } catch {}
-      activeSourceRef.current = null;
-    }
-    audioQueueRef.current = [];
-    isProcessingQueueRef.current = false;
-    isPlayingRef.current = false;
-    nextPlayTimeRef.current = 0;
-
-    isConnectedRef.current = false;
-    isConnectingRef.current = false;
-    setIsConnected(false);
-    setIsConnecting(false);
-    setIsSpeaking(false);
-    setIsListening(false);
-  }, [clearSilenceWatchdog]);
-
-  // ✅ FE → Edge proxy (no secrets in FE)
-  // ✅ NEW: guard action if email/phone invalid or missing
-  const maybeExecuteActionFromGemini = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed.startsWith("{")) return false;
-
-      try {
-        const parsed = JSON.parse(trimmed);
-
-        if (parsed?.type !== "action_request") return false;
-        if (parsed?.action !== "submit_form") return false;
-
-        // HARD GATE: require valid contact before sending to worker
-        const email = contactRef.current.email;
-        const phone = contactRef.current.phone;
-
-        // If worker payload contains fields, try to validate those too
-        const payloadEmail: string | undefined =
-          parsed?.payload?.email || parsed?.fields?.email || parsed?.form_data?.email || undefined;
-        const payloadPhone: string | undefined =
-          parsed?.payload?.phone || parsed?.fields?.phone || parsed?.form_data?.phone || undefined;
-
-        const finalEmail = payloadEmail && isValidEmail(payloadEmail) ? payloadEmail : email;
-        const finalPhone = payloadPhone && isValidPhone(payloadPhone) ? payloadPhone : phone;
-
-        if (!finalEmail || !isValidEmail(finalEmail)) {
-          onMessage?.({
-            role: "assistant",
-            content: "Имейлът не е валиден. Кажете го пак (например: name маймунско gmail точка com).",
-          });
-          return true;
+          await el.scrollIntoViewIfNeeded().catch(() => {});
+          await el.click({ timeout: 2500, force: true });
+          return { clicked: true, text };
+        } catch {
+          // keep trying
         }
-        if (!finalPhone || !isValidPhone(finalPhone)) {
-          onMessage?.({
-            role: "assistant",
-            content: "Телефонът не е валиден. Кажете целия номер наведнъж (например: 08 77 00 00 88).",
-          });
-          return true;
+      }
+    }
+    return { clicked: false, text: "" };
+  }
+
+  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[] }> {
+    return await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const style = window.getComputedStyle(el as any);
+        if (!style) return false;
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        const r = (el as any).getBoundingClientRect?.();
+        if (!r) return false;
+        return r.width > 0 && r.height > 0;
+      };
+
+      const cssEscape = (s: string) => {
+        try {
+          // @ts-ignore
+          return CSS.escape(s);
+        } catch {
+          return s.replace(/[^a-zA-Z0-9_-]/g, "\\$");
         }
+      };
 
-        const anonKey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string) || "";
-        if (!anonKey) {
-          onError?.("Липсва VITE_SUPABASE_PUBLISHABLE_KEY");
-          return true;
+      const getSelector = (el: Element): string => {
+        const any = el as any;
+        const id = any.id ? String(any.id) : "";
+        if (id) return `#${cssEscape(id)}`;
+        const name = any.name ? String(any.name) : "";
+        const tag = el.tagName.toLowerCase();
+        if (name) return `${tag}[name="${name.replace(/\"/g, "")}"]`;
+        const aria = any.getAttribute?.("aria-label") || "";
+        if (aria) return `${tag}[aria-label="${aria.replace(/\"/g, "")}"]`;
+
+        // fallback: build a short nth-of-type path (deterministic)
+        let cur: Element | null = el;
+        const parts: string[] = [];
+        let depth = 0;
+        while (cur && depth < 5) {
+          const t = cur.tagName.toLowerCase();
+          const par = cur.parentElement as Element | null;
+          if (!par) break;
+          const siblings = Array.from(par.children as unknown as Element[]).filter((c: Element) => c.tagName === cur!.tagName);
+          const idx = siblings.indexOf(cur) + 1;
+          parts.unshift(`${t}:nth-of-type(${idx})`);
+          cur = par;
+          depth++;
+          if (t === "form" || t === "main") break;
         }
+        return parts.length ? parts.join(" > ") : el.tagName.toLowerCase();
+      };
 
-        // Inject normalized contacts into payload when possible (deterministic)
-        if (!parsed.payload) parsed.payload = {};
-        if (!parsed.payload.email) parsed.payload.email = finalEmail;
-        if (!parsed.payload.phone) parsed.payload.phone = finalPhone;
+      const getLabel = (el: Element) => {
+        const any = el as any;
+        const id = any.id ? String(any.id) : "";
+        if (id) {
+          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
+          if (lab && lab.textContent) return lab.textContent.trim();
+        }
+        // nearest label wrapper
+        let p: Element | null = el;
+        for (let i = 0; i < 4; i++) {
+          if (!p) break;
+          const lab = p.querySelector?.("label") as HTMLElement | null;
+          if (lab && lab.textContent) return lab.textContent.trim();
+          p = p.parentElement;
+        }
+        // aria-labelledby
+        const labelledby = any.getAttribute?.("aria-labelledby") || "";
+        if (labelledby) {
+          const t = labelledby
+            .split(/\s+/)
+            .map((id: string) => document.getElementById(id)?.textContent?.trim() || "")
+            .filter(Boolean)
+            .join(" ");
+          if (t) return t;
+        }
+        return "";
+      };
 
-        const proxyUrl = "https://onufuxczpqlxxkgyltlz.supabase.co/functions/v1/neo-worker-proxy";
-        console.log("[ACTION] → neo-worker-proxy:", parsed);
-
-        const res = await fetch(proxyUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            apikey: anonKey,
-            Authorization: `Bearer ${anonKey}`,
-          },
-          body: JSON.stringify(parsed),
+      const inputs = Array.from(document.querySelectorAll("input, textarea, select"));
+      const fields = inputs
+        .filter((el) => {
+          const any = el as any;
+          if (!isVisible(el)) return false;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "input") {
+            const type = (any.type || "").toLowerCase();
+            if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+          }
+          if (any.disabled) return false;
+          if (any.getAttribute?.("aria-hidden") === "true") return false;
+          return true;
+        })
+        .slice(0, 40)
+        .map((el) => {
+          const any = el as any;
+          const tag = el.tagName.toLowerCase() as any;
+          const type = (any.type || (tag === "select" ? "select" : tag)).toLowerCase();
+          return {
+            tag,
+            type,
+            name: any.name ? String(any.name) : "",
+            id: any.id ? String(any.id) : "",
+            label: getLabel(el),
+            placeholder: any.placeholder ? String(any.placeholder) : "",
+            aria_label: any.getAttribute?.("aria-label") ? String(any.getAttribute("aria-label")) : "",
+            required: !!any.required,
+            selector: getSelector(el),
+          };
         });
 
-        const result = await res.json().catch(() => ({}));
-        console.log("[PROXY RESULT]:", result);
+      // Common wizard choice buttons like "Мъж" / "Жена"
+      const btns = Array.from(document.querySelectorAll("button, [role='button']"))
+        .filter((el) => isVisible(el))
+        .map((el) => {
+          const t = (el.textContent || "").trim();
+          return { text: t, selector: getSelector(el) };
+        })
+        .filter((b) => ["мъж", "жена"].includes((b.text || "").trim().toLowerCase()))
+        .slice(0, 6);
 
-        if (result?.success) {
-          onMessage?.({
-            role: "assistant",
-            content: "Готово — подадох запитването през формата.",
-          });
-        } else {
-          onMessage?.({
-            role: "assistant",
-            content: "Не успях да подам запитването през формата. Кажете ми дали да опитам пак.",
-          });
+      return { fields, choices: btns };
+    });
+  }
+
+  private async getWizardDomSignature(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const title = document.title || "";
+        const h1 = (document.querySelector("h1")?.textContent || "").trim();
+        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+          .filter((el: any) => {
+            const r = (el as any).getBoundingClientRect?.();
+            if (!r) return false;
+            const style = window.getComputedStyle(el as any);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            return r.width > 0 && r.height > 0;
+          })
+          .slice(0, 25)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+          .join("|");
+        return `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
+      });
+    } catch {
+      return `sig:${Date.now()}`;
+    }
+  }
+
+  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
+    // Wait for DOM signature to change, but don't hang forever.
+    try {
+      await page.waitForFunction(
+        (sig: string) => {
+          const title = document.title || "";
+          const h1 = (document.querySelector("h1")?.textContent || "").trim();
+          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+            .filter((el: any) => {
+              const r = (el as any).getBoundingClientRect?.();
+              if (!r) return false;
+              const style = window.getComputedStyle(el as any);
+              if (style.display === "none" || style.visibility === "hidden") return false;
+              return r.width > 0 && r.height > 0;
+            })
+            .slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+            .join("|");
+          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
+          return cur !== sig;
+        },
+        beforeSig,
+        { timeout: 9000 }
+      );
+    } catch {
+      // fallback
+      await page.waitForTimeout(900).catch(() => {});
+    }
+  }
+
+  private async detectWizardSuccess(page: Page): Promise<boolean> {
+    try {
+      return await page.evaluate(() => {
+        const txt = (document.body?.innerText || "").toLowerCase();
+        // Keep it simple & language-agnostic
+        const hits = ["благодар", "успеш", "изпрат", "thank you", "success", "submitted"];
+        return hits.some((h) => txt.includes(h));
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Returns selector that worked, else null.
+   * Adds detailed selector attempt logs.
+   */
+  private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
+    const selectors = [
+      ...(f.selector_candidates || []),
+      f.name ? `[name="${f.name}"]` : "",
+      f.name ? `#${f.name}` : "",
+    ].filter(Boolean);
+
+    const valSummary = summarizeValue(f.name || f.type, value);
+    console.log(`[FILL] target="${f.label || f.name}" value=${valSummary} candidates=${selectors.length}`);
+
+    for (const sel of selectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) {
+          console.log(`[FILL][MISS] ${sel}`);
+          continue;
         }
 
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible && f.tag !== "select" && f.type !== "select") {
+          console.log(`[FILL][HIDDEN] ${sel}`);
+          continue;
+        }
+
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 1200 }).catch(() => {});
+
+        if (f.tag === "select" || f.type === "select") {
+          const ok = await this.smartSelectOption(page, sel, String(value));
+          console.log(`[FILL][SELECT] ${sel} ok=${ok}`);
+          if (ok) return sel;
+          continue;
+        }
+
+        if (f.type === "file") continue;
+
+        await page.fill(sel, String(value), { timeout: 3000 });
+        await page.keyboard.press("Tab").catch(() => {});
+        await page.waitForTimeout(100).catch(() => {});
+        console.log(`[FILL][OK] ${sel}`);
+        return sel;
+      } catch (e) {
+        console.log(`[FILL][FAIL] ${sel}`, e);
+      }
+    }
+
+    console.log(`[FILL][GIVEUP] target="${f.label || f.name}"`);
+    return null;
+  }
+
+  private async smartSelectOption(page: Page, selectSelector: string, desired: string): Promise<boolean> {
+    const wanted = (desired || "").trim().toLowerCase();
+
+    const options = await page.evaluate<
+      { value: string; label: string }[],
+      { sel: string }
+    >(({ sel }: { sel: string }) => {
+      const el = document.querySelector(sel) as HTMLSelectElement | null;
+      if (!el) return [];
+      return Array.from(el.options).map((o: HTMLOptionElement) => ({
+        value: (o.value || "").toString(),
+        label: (o.textContent || "").trim()
+      }));
+    }, { sel: selectSelector });
+
+    console.log(`[SELECT] selector=${selectSelector} desired="${desired}" options=${options.length}`);
+    for (const o of options.slice(0, 20)) {
+      console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
+    }
+
+    let picked =
+      options.find((o: { value: string; label: string }) => o.value.trim().toLowerCase() === wanted) ||
+      options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase() === wanted) ||
+      (wanted ? options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
+      options.find((o: { value: string; label: string }) => (o.value || "").trim() !== "");
+
+    if (!picked) return false;
+
+    const ok = await page.evaluate<boolean, { sel: string; v: string }>(
+      ({ sel, v }: { sel: string; v: string }) => {
+        const el = document.querySelector(sel) as HTMLSelectElement | null;
+        if (!el) return false;
+        el.value = v;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      },
+      { sel: selectSelector, v: picked.value }
+    );
+
+    console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
+    return ok;
+  }
+
+  private async uploadFile(
+    page: Page,
+    fields: FormSchemaField[],
+    file: NonNullable<FillFormRequest["file"]>
+  ): Promise<boolean> {
+    const fs = await import("fs");
+    const tmpPath = `/tmp/upload_${Date.now()}_${file.filename}`;
+
+    try {
+      const buffer = Buffer.from(file.base64, "base64");
+      fs.writeFileSync(tmpPath, buffer);
+
+      const fileFields = fields.filter(f => f.type === "file" || f.tag === "input");
+      const target = fileFields.find(f => f.name === file.field_name) || fileFields[0];
+
+      const selectors: string[] = [];
+      if (target) {
+        selectors.push(...(target.selector_candidates || []));
+        if (target.name) selectors.push(`input[name="${target.name}"]`);
+      }
+      selectors.push('input[type="file"]');
+
+      for (const sel of selectors) {
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          await (el as any).setInputFiles(tmpPath);
+          try { fs.unlinkSync(tmpPath); } catch {}
+          return true;
+        } catch {}
+      }
+
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return false;
+    } catch {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return false;
+    }
+  }
+
+  private async clickBySelectors(page: Page, selectors: string[], debug: string[]): Promise<boolean> {
+    for (const sel of selectors) {
+      if (!sel) continue;
+      try {
+        const el = await page.$(sel);
+        if (!el) { debug.push(`miss:${sel}`); continue; }
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) { debug.push(`hidden:${sel}`); continue; }
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 3000, force: true });
+        debug.push(`clicked:${sel}`);
         return true;
       } catch {
-        return false;
+        debug.push(`fail:${sel}`);
       }
-    },
-    [onError, onMessage],
-  );
+    }
+    return false;
+  }
 
-  const connect = useCallback(
-    async (systemPrompt: string, companyName: string, sessionId?: string) => {
-      const key = `${sessionId || ""}::${companyName || ""}::${hash32(systemPrompt || "")}`;
+  private async clickByTextHeuristic(page: Page, text: string, debug: string[]): Promise<boolean> {
+    const t = (text || "").trim();
+    if (!t) return false;
 
-      if (isConnectedRef.current && preparedKeyRef.current && preparedKeyRef.current !== key) {
-        console.log("[CONNECT] 🔄 Context changed while connected → reconnect WS");
-        disconnect();
-      }
+    const candidates = [
+      `button:has-text("${t}")`,
+      `a:has-text("${t}")`,
+      `input[type="submit"][value*="${t}"]`,
+      `text="${t}"`,
+    ];
 
-      if (connectMutexRef.current || isConnectedRef.current || isConnectingRef.current) return;
-      connectMutexRef.current = true;
-      isConnectingRef.current = true;
-      setIsConnecting(true);
-
+    for (const sel of candidates) {
       try {
-        await prepareSession(systemPrompt, companyName, sessionId);
-
-        if (!streamRef.current) {
-          streamRef.current = await navigator.mediaDevices.getUserMedia({
-            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          });
-        }
-
-        audioContextRef.current = new AudioContext();
-        if (audioContextRef.current.state === "suspended") await audioContextRef.current.resume();
-
-        const session = sessionDataRef.current;
-        if (!session) throw new Error("No session");
-
-        const isLive001 = session.model.includes("2.0-flash-live");
-        const isNativeAudioPreview = session.model.includes("native-audio");
-        const apiVersion = isLive001 || isNativeAudioPreview ? "v1alpha" : "v1beta";
-        console.log("[CONNECT] Gemini WS, model:", session.model, "api:", apiVersion);
-
-        const ws = new WebSocket(
-          `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?key=${session.apiKey}`,
-        );
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          const setupPayload: any = {
-            setup: {
-              model: `models/${session.model}`,
-              generation_config: {
-                response_modalities: ["AUDIO"],
-                temperature: 0.4,
-                max_output_tokens: 2048,
-                speech_config: {
-                  voice_config: { prebuilt_voice_config: { voice_name: "Puck" } },
-                },
-                thinking_config: { thinking_budget: 0 },
-              },
-              system_instruction: { parts: [{ text: session.systemInstruction }] },
-            },
-          };
-
-          const isNativeAudio = session.model.includes("native-audio");
-          if (isNativeAudio) setupPayload.setup.output_audio_transcription = {};
-
-          ws.send(JSON.stringify(setupPayload));
-          console.log("[GEMINI] Setup sent — thinking=OFF, voice=Puck");
-        };
-
-        ws.onmessage = async (event) => {
-          const data = JSON.parse(event.data instanceof Blob ? await event.data.text() : event.data);
-
-          if (data?.setupComplete || data?.setup_complete) {
-            console.log("[GEMINI] ✅ Ready — LLM + Voice, zero thinking");
-            isConnectedRef.current = true;
-            isConnectingRef.current = false;
-            setIsConnected(true);
-            setIsConnecting(false);
-
-            startAudioCapture();
-            connectSTT();
-
-            if (!greetingSentRef.current) {
-              greetingSentRef.current = true;
-              firstAssistantAudioSeenRef.current = false;
-              firstAssistantTextSeenRef.current = false;
-
-              // send once now
-              sendGreetingToGemini();
-
-              // and retry once if nothing comes out (dropped first turn)
-              if (greetingRetryTimerRef.current) window.clearTimeout(greetingRetryTimerRef.current);
-              greetingRetryTimerRef.current = window.setTimeout(() => {
-                greetingRetryTimerRef.current = null;
-                if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-                if (firstAssistantAudioSeenRef.current || firstAssistantTextSeenRef.current) return;
-                console.log("[GREET] retry");
-                sendGreetingToGemini();
-              }, GREETING_RETRY_MS);
-            }
-          }
-
-          const content = data?.serverContent || data?.server_content;
-          if (!content) return;
-
-          const modelTurn = content.modelTurn || content.model_turn;
-          if (modelTurn?.parts) {
-            for (const part of modelTurn.parts) {
-              if (part.inlineData?.data) {
-                clearSilenceWatchdog();
-                playAudioChunk(part.inlineData.data);
-              }
-            }
-          }
-
-          const transcription =
-            content.outputTranscription ||
-            content.output_transcription ||
-            content.outputAudioTranscription ||
-            content.output_audio_transcription;
-
-          if (transcription?.text) {
-            const txt = transcription.text.trim();
-            if (txt && !txt.startsWith("**") && !txt.includes(">>>") && !txt.includes("<<<")) {
-              firstAssistantTextSeenRef.current = true;
-
-              if (currentResponseTextRef.current && !currentResponseTextRef.current.endsWith(" ")) {
-                currentResponseTextRef.current += " ";
-              }
-              currentResponseTextRef.current += txt;
-              onTranscript?.(currentResponseTextRef.current, false, "assistant");
-            }
-          }
-
-          if (content.turnComplete || content.turn_complete) {
-            const responseText = currentResponseTextRef.current.trim();
-
-            if (responseText) {
-              const handled = await maybeExecuteActionFromGemini(responseText);
-
-              if (!handled) {
-                onMessage?.({ role: "assistant", content: responseText });
-                onTranscript?.(responseText, true, "assistant");
-              }
-            }
-
-            currentResponseTextRef.current = "";
-          }
-        };
-
-        ws.onerror = () => {
-          connectMutexRef.current = false;
-          disconnect();
-        };
-        ws.onclose = (ev) => {
-          console.log("[GEMINI] Closed:", ev.code, ev.reason);
-          connectMutexRef.current = false;
-          isConnectedRef.current = false;
-          setIsConnected(false);
-        };
-      } catch (e) {
-        connectMutexRef.current = false;
-        isConnectingRef.current = false;
-        setIsConnecting(false);
-        onError?.(e instanceof Error ? e.message : "Connection failed");
-        disconnect();
+        await page.click(sel, { timeout: 2500, force: true });
+        debug.push(`clicked_text:${sel}`);
+        return true;
+      } catch {
+        debug.push(`fail_text:${sel}`);
       }
-    },
-    [
-      prepareSession,
-      disconnect,
-      onError,
-      onMessage,
-      onTranscript,
-      startAudioCapture,
-      connectSTT,
-      playAudioChunk,
-      clearSilenceWatchdog,
-      maybeExecuteActionFromGemini,
-      sendGreetingToGemini,
-    ],
-  );
+    }
+    return false;
+  }
 
-  const sendText = useCallback((text: string) => handleUserUtterance(text), [handleUserUtterance]);
+  private async clickSubmitWithinClosestForm(page: Page, anchorSelector: string, debug: string[]): Promise<boolean> {
+    const ok = await page.evaluate<boolean, { sel: string }>(
+      ({ sel }: { sel: string }) => {
+        const anchor = document.querySelector(sel) as HTMLElement | null;
+        if (!anchor) return false;
+        const form = anchor.closest("form") as HTMLFormElement | null;
+        if (!form) return false;
 
-  useEffect(() => () => disconnect(), [disconnect]);
+        const btn =
+          (form.querySelector('button[type="submit"]') as HTMLElement | null) ||
+          (form.querySelector('input[type="submit"]') as HTMLElement | null);
 
-  useEffect(() => {
-    const resume = async () => {
-      if (audioContextRef.current?.state === "suspended") await audioContextRef.current.resume();
-    };
-    const events = ["touchstart", "touchend", "click", "keydown"];
-    events.forEach((e) => document.addEventListener(e, resume, { passive: true }));
-    return () => events.forEach((e) => document.removeEventListener(e, resume));
-  }, []);
+        if (btn) { btn.click(); return true; }
 
-  return {
-    isConnected,
-    isConnecting,
-    isSpeaking,
-    isListening,
-    connect,
-    disconnect,
-    prepareSession,
-    preWarmMicrophone,
-    sendText,
-    interrupt: () => {
-      scheduledSourcesRef.current.forEach((s) => {
-        try {
-          s.stop();
-        } catch {}
+        const anyForm: any = form as any;
+        if (typeof anyForm.requestSubmit === "function") {
+          anyForm.requestSubmit();
+          return true;
+        }
+        form.submit();
+        return true;
+      },
+      { sel: anchorSelector }
+    );
+
+    debug.push(ok ? `closest_form:ok:${anchorSelector}` : `closest_form:miss:${anchorSelector}`);
+    return ok;
+  }
+
+  private async getInvalidFields(page: Page): Promise<string[]> {
+    const invalid = await page
+      .evaluate<string[]>(() => {
+        const els = Array.from(document.querySelectorAll("input:invalid, textarea:invalid, select:invalid")) as any[];
+        return els.slice(0, 20).map(el => el.name || el.id || el.getAttribute("aria-label") || el.tagName.toLowerCase());
+      })
+      .catch(() => []);
+    return Array.isArray(invalid) ? invalid : [];
+  }
+
+  private async trySubmitUniversal(
+    page: Page,
+    schema?: FormSchemaRow,
+    filledSelectors: string[] = []
+  ): Promise<{ attempted: boolean; clicked: boolean; method: string; debug: string[] }> {
+    const debug: string[] = [];
+    const attempted = true;
+
+    // 0) closest form
+    for (const a of filledSelectors.slice(0, 3)) {
+      const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
+      if (ok) {
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "closest_form", debug };
+      }
+    }
+
+    // 1) schema selectors
+    const schemaSelectors = schema?.schema.submit?.selector_candidates || [];
+    if (schemaSelectors.length) {
+      const ok = await this.clickBySelectors(page, schemaSelectors, debug);
+      if (ok) {
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "schema.selector_candidates", debug };
+      }
+    }
+
+    // 2) schema text
+    const submitText = (schema?.schema.submit?.text || "").trim();
+    if (submitText) {
+      const ok = await this.clickByTextHeuristic(page, submitText, debug);
+      if (ok) {
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "schema.text", debug };
+      }
+    }
+
+    // 3) universal
+    const universalSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Изпрати")',
+      'button:has-text("Submit")',
+      'button:has-text("Send")',
+    ];
+    {
+      const ok = await this.clickBySelectors(page, universalSelectors, debug);
+      if (ok) {
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "universal_selectors", debug };
+      }
+    }
+
+    // 4) requestSubmit
+    try {
+      const ok = await page.evaluate<boolean>(() => {
+        const form = document.querySelector("form") as any;
+        if (!form) return false;
+        if (typeof form.requestSubmit === "function") { form.requestSubmit(); return true; }
+        form.submit(); return true;
       });
-      scheduledSourcesRef.current = [];
-      audioQueueRef.current = [];
-      isProcessingQueueRef.current = false;
-      isPlayingRef.current = false;
-      nextPlayTimeRef.current = 0;
-      updateSpeaking(false);
-    },
-  };
-};
+
+      if (ok) {
+        debug.push("requestSubmit()");
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "requestSubmit", debug };
+      }
+    } catch {
+      debug.push("fail_requestSubmit()");
+    }
+
+    return { attempted, clicked: false, method: "none", debug };
+  }
+
+  private async quickObserve(page: Page): Promise<JsonObj> {
+    try {
+      return await page.evaluate(() => {
+        const text = (document.body?.innerText || "").slice(0, 1200);
+        return {
+          url: window.location.href,
+          title: document.title,
+          snippet: text.slice(0, 300).replace(/\s+/g, " "),
+        };
+      });
+    } catch {
+      return { url: "", title: "", snippet: "" };
+    }
+  }
+
+  async loadSchemasForApi(sessionId: string): Promise<FormSchemaRow[]> {
+    return this.loadFormSchemas(sessionId);
+  }
+
+  getSessionByDbSessionId(dbSessionId: string): HotSession | null {
+    for (const [, s] of this.sessions) {
+      if (s.sessionId === dbSessionId) return s;
+    }
+    return null;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────
+// Server
+// ───────────────────────────────────────────────────────────────
+
+async function main() {
+  const manager = new HotSessionManager();
+
+  const app = express();
+  app.use(express.json({ limit: "12mb" }));
+
+  app.use((req, res, next) => {
+    if (req.path === "/" || req.path === "/health") return next();
+    const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
+    if (token !== WORKER_SECRET) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+    next();
+  });
+
+  app.get("/", (_, res) => {
+    res.json({ name: "NEO Worker", version: "6.0.2-logs", mode: "schema-first" });
+  });
+
+  app.get("/health", (_, res) => {
+    res.json({ status: "ok", ...manager.getStatus() });
+  });
+
+  app.post("/prepare-session", async (req: Request, res: Response) => {
+    const { site_id, site_map, session_id } = req.body || {};
+    if (!site_id || !site_map) return res.json({ success: false, error: "Missing site_id/site_map" });
+
+    const ok = await manager.prepareSession(String(site_id), site_map as SiteMap, session_id ? String(session_id) : undefined);
+    res.json({ success: ok, session_ready: ok });
+  });
+
+  app.post("/fill-form", async (req: Request, res: Response) => {
+    const body = req.body as FillFormRequest;
+    if (!body?.site_id || !body?.data) {
+      return res.json({ success: false, message: "Missing site_id/data" });
+    }
+
+    // PII-safe request summary
+    const dataKeys = safeKeys(body.data);
+    const confKeys = safeKeys(body.confirmed);
+    console.log(`[HTTP][/fill-form] site_id=${body.site_id} session_id=${body.session_id || ""} form_id=${body.form_id || ""} fingerprint=${(body.fingerprint || "").slice(0, 12)} kind=${body.kind || ""} auto_submit=${body.auto_submit !== false}`);
+    console.log(`[HTTP][/fill-form] data_keys=${dataKeys.join(",")} confirmed_keys=${confKeys.join(",")}`);
+
+    const r = await manager.executeFillForm(body);
+    res.json(r);
+  });
+
+  app.post("/execute", async (req: Request, res: Response) => {
+    const { site_id, session_id, keywords, data } = req.body || {};
+    if (!site_id || !Array.isArray(keywords)) return res.json({ success: false, message: "Invalid request" });
+
+    const r = await manager.execute({
+      site_id: String(site_id),
+      session_id: session_id ? String(session_id) : undefined,
+      keywords,
+      data: (data || undefined) as any,
+    });
+    res.json(r);
+  });
+
+  app.get("/forms/:sessionId", async (req: Request, res: Response) => {
+    const sessionId = String(req.params.sessionId || "");
+    if (!sessionId) return res.json({ success: false, error: "Missing sessionId" });
+
+    const cached = manager.getSessionByDbSessionId(sessionId);
+    if (cached) return res.json({ success: true, source: "cache", forms: cached.formSchemas });
+
+    const forms = await manager.loadSchemasForApi(sessionId);
+    res.json({ success: true, source: "db", forms });
+  });
+
+  app.post("/refresh-forms", async (req: Request, res: Response) => {
+    const { site_id } = req.body || {};
+    if (!site_id) return res.json({ success: false, error: "Missing site_id" });
+
+    const forms = await manager.refreshFormSchemas(String(site_id));
+    res.json({ success: true, count: forms.length, forms });
+  });
+
+  app.post("/close-session", async (req: Request, res: Response) => {
+    const { site_id } = req.body || {};
+    if (site_id) await manager.closeSession(String(site_id));
+    res.json({ success: true });
+  });
+
+  app.listen(PORT, () => {
+    console.log(`🚀 NEO Worker v6.0.2-logs listening on :${PORT}`);
+  });
+
+  await manager.start();
+
+  process.on("SIGTERM", async () => {
+    console.log("[SIGTERM] closing...");
+    process.exit(0);
+  });
+  process.on("SIGINT", async () => {
+    console.log("[SIGINT] closing...");
+    process.exit(0);
+  });
+}
+
+main().catch((e) => {
+  console.error("Fatal:", e);
+  process.exit(1);
+});
