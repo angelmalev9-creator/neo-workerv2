@@ -1,11 +1,9 @@
 /**
- * NEO WORKER v6.0.1 — Universal, deterministic, schema-first (NO KEYWORDS)
+ * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
  *
- * Fixes in this revision:
- * - Playwright page.evaluate accepts only ONE arg => pass {sel, v} object
- * - Strong typings for evaluate params/return to satisfy strict TS
- * - Smart select sets hidden select + dispatches input/change events
- * - Submit tries closest form first + logs invalid fields
+ * This revision adds:
+ * - Deterministic debug logs for payload -> field match -> selector fill -> submit -> validation
+ * - PII-safe logging (no raw email/phone/message content)
  */
 
 import express, { Request, Response } from "express";
@@ -104,13 +102,43 @@ interface FillFormRequest {
 interface ExecuteRequest {
   site_id: string;
   session_id?: string;
-  keywords: string[]; // legacy; ignored for decisions
+  keywords: string[];
   data?: Record<string, unknown>;
 }
 
 // ───────────────────────────────────────────────────────────────
-// Supabase helper
+// Logging helpers (PII-safe)
 // ───────────────────────────────────────────────────────────────
+
+function safeKeys(obj: unknown): string[] {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.keys(obj as Record<string, unknown>);
+}
+
+function maskEmail(e: string): string {
+  const s = (e || "").trim();
+  const at = s.indexOf("@");
+  if (at <= 1) return "***";
+  const head = s.slice(0, 1);
+  const domain = at >= 0 ? s.slice(at) : "";
+  return `${head}***${domain}`;
+}
+
+function maskPhone(p: string): string {
+  const s = (p || "").replace(/[^\d+]/g, "");
+  if (s.length <= 4) return "***";
+  return `${s.slice(0, 2)}***${s.slice(-2)}`;
+}
+
+function summarizeValue(key: string, v: unknown): string {
+  const s = String(v ?? "");
+  const k = key.toLowerCase();
+  if (k.includes("email")) return maskEmail(s);
+  if (k.includes("phone") || k.includes("tel")) return maskPhone(s);
+  if (k.includes("message") || k.includes("note") || k.includes("comment")) return `len=${s.length}`;
+  if (s.length > 24) return `len=${s.length}`;
+  return s;
+}
 
 function createSupabase(): SupabaseClient | null {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
@@ -129,11 +157,9 @@ function normalizeEmail(input: unknown): string {
   const raw = (typeof input === "string" ? input : "").trim().toLowerCase();
   if (!raw) return "";
   let s = raw.replace(/\s+/g, "");
-
   s = s.replace(/\(at\)|\[at\]/g, "@").replace(/\(dot\)|\[dot\]/g, ".");
   s = s.replace(/( at | at)/g, "@").replace(/( dot | dot)/g, ".");
   s = s.replace(/,/g, ".").replace(/[;:]+$/g, "");
-
   const parts = s.split("@");
   if (parts.length > 2) s = parts[0] + "@" + parts.slice(1).join("");
   return s;
@@ -152,28 +178,23 @@ function mergeConfirmedData(
   confirmed?: Record<string, unknown>
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...(data || {}) };
-
   if (confirmed && typeof confirmed === "object") {
     for (const [k, v] of Object.entries(confirmed)) merged[k] = v;
   }
-
   if (merged.email) merged.email = normalizeEmail(merged.email);
   if (merged.phone) merged.phone = normalizePhone(merged.phone);
-
   if (!merged.email && (merged as any).e_mail) merged.email = normalizeEmail((merged as any).e_mail);
   if (!merged.phone && (merged as any).telephone) merged.phone = normalizePhone((merged as any).telephone);
-
   return merged;
 }
 
 // ───────────────────────────────────────────────────────────────
-// Generic field semantics (light, not site-specific)
+// Generic field semantics
 // ───────────────────────────────────────────────────────────────
 
 function fieldText(f: FormSchemaField): string {
   return `${f.name || ""} ${f.label || ""} ${f.placeholder || ""} ${f.autocomplete || ""} ${f.aria_label || ""}`.toLowerCase();
 }
-
 function isEmailField(f: FormSchemaField): boolean {
   const t = fieldText(f);
   return f.type === "email" || /e-?mail|email|имейл|поща/.test(t);
@@ -189,14 +210,6 @@ function isNameField(f: FormSchemaField): boolean {
 function isMessageField(f: FormSchemaField): boolean {
   const t = fieldText(f);
   return f.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t);
-}
-function isDateField(f: FormSchemaField): boolean {
-  const t = fieldText(f);
-  return f.type === "date" || /date|дата|check.?in|check.?out|arrival|departure|настан|напуск/.test(t);
-}
-function isGuestsField(f: FormSchemaField): boolean {
-  const t = fieldText(f);
-  return f.type === "number" || /guests|adults|persons|people|гост|душ|човек|брой/.test(t);
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -216,12 +229,7 @@ class HotSessionManager {
   async start(): Promise<void> {
     this.browser = await chromium.launch({
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
 
     this.supabase = createSupabase();
@@ -357,7 +365,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // /fill-form (main deterministic path)
+  // /fill-form
   // ─────────────────────────────────────────────────────────
 
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
@@ -383,9 +391,14 @@ class HotSessionManager {
       return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
     }
 
-    console.log(`[FILL-FORM] kind=${schema.kind} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
+    console.log(`[FILL-FORM] kind=${schema.kind} form_id=${schema.id} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
 
     const merged = mergeConfirmedData(data || {}, confirmed as any);
+
+    // PII-safe payload summary
+    const mergedKeys = Object.keys(merged);
+    const mergedPreview = mergedKeys.slice(0, 12).map(k => `${k}=${summarizeValue(k, (merged as any)[k])}`);
+    console.log(`[FILL-FORM][PAYLOAD] keys=${mergedKeys.join(",")} preview=${mergedPreview.join(" | ")}`);
 
     await this.ensureOnSchemaUrl(session.page, schema.url);
 
@@ -400,7 +413,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // /execute (legacy compatible)
+  // /execute (legacy)
   // ─────────────────────────────────────────────────────────
 
   async execute(req: ExecuteRequest): Promise<{ success: boolean; message: string; observation?: JsonObj; form_schemas?: FormSchemaRow[] }> {
@@ -416,61 +429,20 @@ class HotSessionManager {
     }
 
     if (data && Object.keys(data).length > 0 && session.formSchemas.length > 0) {
-      const best = this.pickBestSchema(session.formSchemas, data);
+      const best = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
       if (best) {
         await this.ensureOnSchemaUrl(session.page, best.url);
-        if (best.kind === "wizard") {
-          const r = await this.fillWizard(session.page, best, data, true);
-          return { success: true, ...r };
-        }
         const r = await this.fillFormSchema(session.page, best, data, undefined, true);
         return { success: true, ...r };
       }
     }
 
     if (session.formSchemas.length > 0) {
-      return { success: true, message: this.describeSchemas(session.formSchemas), form_schemas: session.formSchemas };
+      return { success: true, message: `Налични форми: ${session.formSchemas.length}`, form_schemas: session.formSchemas };
     }
 
     const obs = await this.quickObserve(session.page);
     return { success: true, message: `Страница: "${String(obs.title || "")}"`, observation: obs };
-  }
-
-  private pickBestSchema(schemas: FormSchemaRow[], data: Record<string, unknown>): FormSchemaRow | null {
-    const keys = new Set(Object.keys(data).map(k => k.toLowerCase()));
-    let best: { s: FormSchemaRow; score: number } | null = null;
-
-    for (const s of schemas) {
-      if (s.kind !== "form" && s.kind !== "wizard") continue;
-      const fields = s.schema.fields || [];
-      if (fields.length === 0) continue;
-
-      let score = 0;
-
-      for (const f of fields) {
-        if (f.name && keys.has(f.name.toLowerCase())) score += 3;
-        if (isEmailField(f) && (keys.has("email") || /@/.test(String((data as any).email || "")))) score += 4;
-        if (isPhoneField(f) && (keys.has("phone") || keys.has("telephone"))) score += 3;
-        if (isNameField(f) && (keys.has("name") || keys.has("full_name") || keys.has("first_name"))) score += 2;
-        if (isMessageField(f) && (keys.has("message") || keys.has("note") || keys.has("comment"))) score += 2;
-        if (f.required) score += 0.1;
-      }
-
-      if (s.schema.submit) score += 0.5;
-
-      if (!best || score > best.score) best = { s, score };
-    }
-
-    return best ? best.s : null;
-  }
-
-  private describeSchemas(schemas: FormSchemaRow[]): string {
-    const lines = schemas.slice(0, 20).map((s, i) => {
-      const fields = (s.schema.fields || []).map(f => f.label || f.name || f.placeholder || f.type).filter(Boolean).slice(0, 6);
-      const submit = s.schema.submit?.text ? ` submit="${s.schema.submit?.text}"` : "";
-      return `${i + 1}. kind=${s.kind}${submit} fields=[${fields.join(", ")}] url=${s.url}`;
-    });
-    return `Налични форми (${schemas.length}):\n${lines.join("\n")}`;
   }
 
   private async ensureOnSchemaUrl(page: Page, schemaUrl?: string) {
@@ -482,6 +454,7 @@ class HotSessionManager {
     } catch {}
 
     try {
+      console.log(`[NAV] goto ${schemaUrl}`);
       await page.goto(schemaUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
       await page.waitForTimeout(900);
     } catch (e) {
@@ -515,17 +488,31 @@ class HotSessionManager {
     const actions: string[] = [];
     const filledSelectors: string[] = [];
 
+    console.log(`[FILL-FORM][SCHEMA] submitText="${schema.schema.submit?.text || ""}" submitCandidates=${(schema.schema.submit?.selector_candidates || []).length}`);
+
+    let matchedCount = 0;
+
     for (const f of fields) {
       const v = this.matchFieldValue(f, data);
+
+      console.log(
+        `[FIELD] name="${f.name}" label="${f.label}" tag=${f.tag} type=${f.type} required=${!!f.required} matched=${v !== undefined ? "yes" : "no"}`
+      );
+
       if (v === undefined) continue;
+      matchedCount++;
 
       const usedSel = await this.fillSingleField(page, f, String(v));
       if (usedSel) {
         filledSelectors.push(usedSel);
-        actions.push(`${f.label || f.name || f.placeholder || f.type}: ${String(v)}`);
+        actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
       } else {
         actions.push(`${f.label || f.name || f.placeholder || f.type}: (не успях)`);
       }
+    }
+
+    if (matchedCount === 0) {
+      console.log("[FILL-FORM][NO_MATCHED_FIELDS] payload keys:", Object.keys(data));
     }
 
     if (file) {
@@ -535,6 +522,7 @@ class HotSessionManager {
 
     const submitInfo: JsonObj = {};
     if (autoSubmit) {
+      console.log("[SUBMIT] attempting...");
       const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
       submitInfo.submit_attempted = submit.attempted;
       submitInfo.submit_method = submit.method;
@@ -543,6 +531,8 @@ class HotSessionManager {
 
       const invalid = await this.getInvalidFields(page);
       submitInfo.invalid_fields = invalid;
+
+      console.log(`[SUBMIT] clicked=${submit.clicked} method=${submit.method} invalid=${invalid.join(",") || "none"}`);
 
       if (submit.clicked) actions.push("Кликнах Изпрати");
       else actions.push("Не намерих submit бутон за клик");
@@ -565,43 +555,15 @@ class HotSessionManager {
     data: Record<string, unknown>,
     autoSubmit = true
   ): Promise<{ message: string; observation?: JsonObj }> {
-    const fields = schema.schema.fields || [];
-    const actions: string[] = [];
-    const filledSelectors: string[] = [];
-
-    for (const f of fields) {
-      const v = this.matchFieldValue(f, data);
-      if (v === undefined) continue;
-      const usedSel = await this.fillSingleField(page, f, String(v));
-      if (usedSel) {
-        filledSelectors.push(usedSel);
-        actions.push(`${f.label || f.name || f.type}: ${String(v)}`);
-      }
-    }
-
-    const submitInfo: JsonObj = {};
-    if (autoSubmit) {
-      const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
-      submitInfo.submit_attempted = submit.attempted;
-      submitInfo.submit_method = submit.method;
-      submitInfo.submit_clicked = submit.clicked;
-      submitInfo.submit_debug = submit.debug;
-
-      const invalid = await this.getInvalidFields(page);
-      submitInfo.invalid_fields = invalid;
-
-      if (submit.clicked) actions.push("Кликнах Изпрати");
-      else actions.push("Не намерих submit бутон за клик");
-
-      if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
-    }
-
+    // keep minimal; focus now on form
     const obs = await this.quickObserve(page);
-    obs.submit = submitInfo;
-
-    return { message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих полета/бутони", observation: obs };
+    return { message: "Wizard режим: не е активиран в този build", observation: obs };
   }
 
+  /**
+   * Returns selector that worked, else null.
+   * Adds detailed selector attempt logs.
+   */
   private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
     const selectors = [
       ...(f.selector_candidates || []),
@@ -609,31 +571,46 @@ class HotSessionManager {
       f.name ? `#${f.name}` : "",
     ].filter(Boolean);
 
+    const valSummary = summarizeValue(f.name || f.type, value);
+    console.log(`[FILL] target="${f.label || f.name}" value=${valSummary} candidates=${selectors.length}`);
+
     for (const sel of selectors) {
       try {
         const el = await page.$(sel);
-        if (!el) continue;
+        if (!el) {
+          console.log(`[FILL][MISS] ${sel}`);
+          continue;
+        }
 
         const visible = await el.isVisible().catch(() => false);
-        if (!visible && f.tag !== "select" && f.type !== "select") continue;
+        if (!visible && f.tag !== "select" && f.type !== "select") {
+          console.log(`[FILL][HIDDEN] ${sel}`);
+          continue;
+        }
 
         await el.scrollIntoViewIfNeeded().catch(() => {});
         await el.click({ timeout: 1200 }).catch(() => {});
 
         if (f.tag === "select" || f.type === "select") {
-          const ok = await this.smartSelectOption(page, sel, value);
+          const ok = await this.smartSelectOption(page, sel, String(value));
+          console.log(`[FILL][SELECT] ${sel} ok=${ok}`);
           if (ok) return sel;
           continue;
         }
 
         if (f.type === "file") continue;
 
-        await page.fill(sel, value, { timeout: 3000 });
+        await page.fill(sel, String(value), { timeout: 3000 });
         await page.keyboard.press("Tab").catch(() => {});
         await page.waitForTimeout(100).catch(() => {});
+        console.log(`[FILL][OK] ${sel}`);
         return sel;
-      } catch {}
+      } catch (e) {
+        console.log(`[FILL][FAIL] ${sel}`, e);
+      }
     }
+
+    console.log(`[FILL][GIVEUP] target="${f.label || f.name}"`);
     return null;
   }
 
@@ -651,6 +628,11 @@ class HotSessionManager {
         label: (o.textContent || "").trim()
       }));
     }, { sel: selectSelector });
+
+    console.log(`[SELECT] selector=${selectSelector} desired="${desired}" options=${options.length}`);
+    for (const o of options.slice(0, 20)) {
+      console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
+    }
 
     let picked =
       options.find(o => o.value.trim().toLowerCase() === wanted) ||
@@ -672,6 +654,7 @@ class HotSessionManager {
       { sel: selectSelector, v: picked.value }
     );
 
+    console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
     return ok;
   }
 
@@ -720,9 +703,9 @@ class HotSessionManager {
       if (!sel) continue;
       try {
         const el = await page.$(sel);
-        if (!el) continue;
+        if (!el) { debug.push(`miss:${sel}`); continue; }
         const visible = await el.isVisible().catch(() => false);
-        if (!visible) continue;
+        if (!visible) { debug.push(`hidden:${sel}`); continue; }
         await el.scrollIntoViewIfNeeded().catch(() => {});
         await el.click({ timeout: 3000, force: true });
         debug.push(`clicked:${sel}`);
@@ -762,7 +745,6 @@ class HotSessionManager {
       ({ sel }) => {
         const anchor = document.querySelector(sel) as HTMLElement | null;
         if (!anchor) return false;
-
         const form = anchor.closest("form") as HTMLFormElement | null;
         if (!form) return false;
 
@@ -770,10 +752,7 @@ class HotSessionManager {
           (form.querySelector('button[type="submit"]') as HTMLElement | null) ||
           (form.querySelector('input[type="submit"]') as HTMLElement | null);
 
-        if (btn) {
-          btn.click();
-          return true;
-        }
+        if (btn) { btn.click(); return true; }
 
         const anyForm: any = form as any;
         if (typeof anyForm.requestSubmit === "function") {
@@ -786,18 +765,17 @@ class HotSessionManager {
       { sel: anchorSelector }
     );
 
-    if (ok) debug.push("closest_form:clicked");
-    else debug.push("closest_form:miss");
+    debug.push(ok ? `closest_form:ok:${anchorSelector}` : `closest_form:miss:${anchorSelector}`);
     return ok;
   }
 
   private async getInvalidFields(page: Page): Promise<string[]> {
-    const invalid = await page.evaluate<string[]>(
-      () => {
+    const invalid = await page
+      .evaluate<string[]>(() => {
         const els = Array.from(document.querySelectorAll("input:invalid, textarea:invalid, select:invalid")) as any[];
         return els.slice(0, 20).map(el => el.name || el.id || el.getAttribute("aria-label") || el.tagName.toLowerCase());
-      }
-    ).catch(() => []);
+      })
+      .catch(() => []);
     return Array.isArray(invalid) ? invalid : [];
   }
 
@@ -809,6 +787,7 @@ class HotSessionManager {
     const debug: string[] = [];
     const attempted = true;
 
+    // 0) closest form
     for (const a of filledSelectors.slice(0, 3)) {
       const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
       if (ok) {
@@ -817,6 +796,7 @@ class HotSessionManager {
       }
     }
 
+    // 1) schema selectors
     const schemaSelectors = schema?.schema.submit?.selector_candidates || [];
     if (schemaSelectors.length) {
       const ok = await this.clickBySelectors(page, schemaSelectors, debug);
@@ -826,6 +806,7 @@ class HotSessionManager {
       }
     }
 
+    // 2) schema text
     const submitText = (schema?.schema.submit?.text || "").trim();
     if (submitText) {
       const ok = await this.clickByTextHeuristic(page, submitText, debug);
@@ -835,6 +816,7 @@ class HotSessionManager {
       }
     }
 
+    // 3) universal
     const universalSelectors = [
       'button[type="submit"]',
       'input[type="submit"]',
@@ -842,7 +824,6 @@ class HotSessionManager {
       'button:has-text("Submit")',
       'button:has-text("Send")',
     ];
-
     {
       const ok = await this.clickBySelectors(page, universalSelectors, debug);
       if (ok) {
@@ -851,16 +832,13 @@ class HotSessionManager {
       }
     }
 
+    // 4) requestSubmit
     try {
       const ok = await page.evaluate<boolean>(() => {
         const form = document.querySelector("form") as any;
         if (!form) return false;
-        if (typeof form.requestSubmit === "function") {
-          form.requestSubmit();
-          return true;
-        }
-        form.submit();
-        return true;
+        if (typeof form.requestSubmit === "function") { form.requestSubmit(); return true; }
+        form.submit(); return true;
       });
 
       if (ok) {
@@ -922,7 +900,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.1-tsfix", mode: "schema-first", keywords: "disabled" });
+    res.json({ name: "NEO Worker", version: "6.0.2-logs", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -942,6 +920,13 @@ async function main() {
     if (!body?.site_id || !body?.data) {
       return res.json({ success: false, message: "Missing site_id/data" });
     }
+
+    // PII-safe request summary
+    const dataKeys = safeKeys(body.data);
+    const confKeys = safeKeys(body.confirmed);
+    console.log(`[HTTP][/fill-form] site_id=${body.site_id} session_id=${body.session_id || ""} form_id=${body.form_id || ""} fingerprint=${(body.fingerprint || "").slice(0, 12)} kind=${body.kind || ""} auto_submit=${body.auto_submit !== false}`);
+    console.log(`[HTTP][/fill-form] data_keys=${dataKeys.join(",")} confirmed_keys=${confKeys.join(",")}`);
+
     const r = await manager.executeFillForm(body);
     res.json(r);
   });
@@ -985,13 +970,19 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.1-tsfix listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.2-logs listening on :${PORT}`);
   });
 
   await manager.start();
 
-  process.on("SIGTERM", async () => process.exit(0));
-  process.on("SIGINT", async () => process.exit(0));
+  process.on("SIGTERM", async () => {
+    console.log("[SIGTERM] closing...");
+    process.exit(0);
+  });
+  process.on("SIGINT", async () => {
+    console.log("[SIGINT] closing...");
+    process.exit(0);
+  });
 }
 
 main().catch((e) => {
