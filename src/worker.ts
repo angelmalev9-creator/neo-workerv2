@@ -627,10 +627,20 @@ class HotSessionManager {
 
     const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
     if (!hasAnyData) {
+      // Payload is empty. Don't "fail submit" — return the live required fields/options
+      // so the caller (Gemini) can ask the user naturally what to provide next.
+      const scanned = await this.scanWizardStep(page);
+      const next = this.buildNextPayloadFromScan(scanned.fields, data || {});
       const obs = await this.quickObserve(page);
-      (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
-      return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
-    }
+      (obs as any).needs_input = true;
+      (obs as any).wizard_next = {
+        step: 1,
+        missing_required: next.missing_required,
+        fields: next.fields,
+        choices: scanned.choices,
+        note: "Wizard has no payload yet. Ask user for required fields shown above.",
+      };
+      return { ok: false, message: "Wizard: трябват данни за да започна (липсва payload).", observation: obs };
 
     let didInteract = false;
 
@@ -649,6 +659,7 @@ class HotSessionManager {
       const next = this.buildNextPayloadFromScan(scanned.fields, data);
       if (next.missing_required.length > 0) {
         const obs = await this.quickObserve(page);
+        (obs as any).needs_input = true;
         (obs as any).wizard_next = {
           step,
           missing_required: next.missing_required,
