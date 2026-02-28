@@ -100,14 +100,10 @@ interface FillFormRequest {
   form_id?: string;
   fingerprint?: string;
   kind?: string;
-  data: Record<string, string>;
-  confirmed?: {
-    name?: string;
-    email?: string;
-    phone?: string;
-    message?: string;
-    [k: string]: string | undefined;
-  };
+  // Incoming payload can contain non-string values (numbers, booleans, null)
+  // We normalize to strings when filling.
+  data: Record<string, unknown>;
+  confirmed?: Record<string, unknown>;
   file?: {
     field_name: string;
     base64: string;
@@ -115,6 +111,8 @@ interface FillFormRequest {
     mime_type: string;
   };
   auto_submit?: boolean;
+  // When true, never "guess" a select option; only safe matches.
+  strict_select?: boolean;
 }
 
 interface ExecuteRequest {
@@ -741,7 +739,7 @@ class HotSessionManager {
     return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
   }
 
-  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[] }, data: Record<string, string>) {
+  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[] }, data: Record<string, unknown>) {
     const missing_required: Array<{
       label: string;
       type: string;
@@ -778,13 +776,15 @@ class HotSessionManager {
     return { missing_required, fields, choices: scanned.choices };
   }
 
-  private matchWizardDataForField(f: WizardScannedField, data: Record<string, string>): { key: string; value: string } | null {
+  private matchWizardDataForField(f: WizardScannedField, data: Record<string, unknown>): { key: string; value: string } | null {
     const txt = this.wizardFieldText(f);
 
     const pickByKeys = (keys: string[]) => {
       for (const k of keys) {
         const v = (data as any)[k];
-        if (typeof v === "string" && v.trim()) return { key: k, value: v.trim() };
+        if (v === null || v === undefined) continue;
+        const s = typeof v === "string" ? v : String(v);
+        if (s.trim()) return { key: k, value: s.trim() };
       }
       return null;
     };
@@ -812,7 +812,9 @@ class HotSessionManager {
       if (!key) continue;
       if (txt.includes(key)) {
         const v = (data as any)[k];
-        if (typeof v === "string" && v.trim()) return { key: k, value: v.trim() };
+        if (v === null || v === undefined) continue;
+        const s = typeof v === "string" ? v : String(v);
+        if (s.trim()) return { key: k, value: s.trim() };
       }
     }
 
