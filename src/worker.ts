@@ -549,16 +549,28 @@ class HotSessionManager {
   ): Promise<{ message: string; observation?: JsonObj }> {
     const fields = schema.schema.fields || [];
     const actions: string[] = [];
-    const filledCount: number[] = [0];
+    const filledSelectors: string[] = [];
+
+    // Debug: schema fields
+    console.log(`[FILL-FORM][SCHEMA] fields=${fields.length}`);
+    for (const f of fields) {
+      console.log(
+        `[FILL-FORM][FIELD] required=${!!f.required} tag=${f.tag} type=${f.type} name="${f.name}" label="${f.label}" placeholder="${f.placeholder}" candidates=${(f.selector_candidates || []).length}`
+      );
+    }
 
     for (const f of fields) {
       const v = this.matchFieldValue(f, data);
-      if (!v) continue;
+      if (v === undefined) continue;
 
-      const ok = await this.fillSingleField(page, f, v);
-      if (ok) {
-        filledCount[0] += 1;
-        actions.push(`${f.label || f.name || f.placeholder || f.type}: ${v}`);
+      console.log(`[FILL-FORM][MATCH] field="${f.label || f.name}" value="${String(v)}"`);
+
+      const usedSel = await this.fillSingleField(page, f, String(v));
+      if (usedSel) {
+        filledSelectors.push(usedSel);
+        actions.push(`${f.label || f.name || f.placeholder || f.type}: ${String(v)}`);
+      } else {
+        actions.push(`${f.label || f.name || f.placeholder || f.type}: (не успях)`); // keep visibility in logs
       }
     }
 
@@ -569,14 +581,19 @@ class HotSessionManager {
 
     const submitInfo: JsonObj = {};
     if (autoSubmit) {
-      const submit = await this.trySubmitUniversal(page, schema);
+      const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
       submitInfo.submit_attempted = submit.attempted;
       submitInfo.submit_method = submit.method;
       submitInfo.submit_clicked = submit.clicked;
       submitInfo.submit_debug = submit.debug;
 
+      const invalid = await this.getInvalidFields(page);
+      submitInfo.invalid_fields = invalid;
+
       if (submit.clicked) actions.push("Кликнах Изпрати");
       else actions.push("Не намерих submit бутон за клик");
+
+      if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
     }
 
     const obs = await this.quickObserve(page);
@@ -598,16 +615,21 @@ class HotSessionManager {
     const actions: string[] = [];
     const maxSteps = 8;
 
+    const filledSelectors: string[] = [];
+
     for (let step = 0; step < maxSteps; step++) {
-      // fill visible fields only
       for (const f of fields) {
         const v = this.matchFieldValue(f, data);
-        if (!v) continue;
+        if (v === undefined) continue;
+
         const visible = await this.isFieldVisible(page, f);
         if (!visible) continue;
 
-        const ok = await this.fillSingleField(page, f, v);
-        if (ok) actions.push(`${f.label || f.name || f.type}: ${v}`);
+        const usedSel = await this.fillSingleField(page, f, String(v));
+        if (usedSel) {
+          filledSelectors.push(usedSel);
+          actions.push(`${f.label || f.name || f.type}: ${String(v)}`);
+        }
       }
 
       const nextClicked = await this.clickNextStepUniversal(page);
@@ -617,13 +639,19 @@ class HotSessionManager {
 
     const submitInfo: JsonObj = {};
     if (autoSubmit) {
-      const submit = await this.trySubmitUniversal(page, schema);
+      const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
       submitInfo.submit_attempted = submit.attempted;
       submitInfo.submit_method = submit.method;
       submitInfo.submit_clicked = submit.clicked;
       submitInfo.submit_debug = submit.debug;
+
+      const invalid = await this.getInvalidFields(page);
+      submitInfo.invalid_fields = invalid;
+
       if (submit.clicked) actions.push("Кликнах Изпрати");
       else actions.push("Не намерих submit бутон за клик");
+
+      if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
     }
 
     const obs = await this.quickObserve(page);
@@ -651,62 +679,98 @@ class HotSessionManager {
     return false;
   }
 
-  private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<boolean> {
-  const selectors = [
-    ...(f.selector_candidates || []),
-    f.name ? `[name="${f.name}"]` : "",
-    f.name ? `#${f.name}` : "",
-  ].filter(Boolean);
+  /**
+   * Returns the selector that worked (for closest-form submit),
+   * or null if not filled.
+   */
+  private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
+    const selectors = [
+      ...(f.selector_candidates || []),
+      f.name ? `[name="${f.name}"]` : "",
+      f.name ? `#${f.name}` : "",
+    ].filter(Boolean);
 
-  for (const sel of selectors) {
-    try {
-      const el = await page.$(sel);
-      if (!el) continue;
+    for (const sel of selectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
 
-      const visible = await el.isVisible().catch(() => false);
-      if (!visible && f.tag !== "select") continue;
+        const visible = await el.isVisible().catch(() => false);
+        // NOTE: select може да е hidden (Radix), allow it
+        if (!visible && f.tag !== "select" && f.type !== "select") continue;
 
-      await el.scrollIntoViewIfNeeded().catch(() => {});
-      await el.click({ timeout: 1200 }).catch(() => {});
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 1200 }).catch(() => {});
 
-      // SMART SELECT
-      if (f.tag === "select" || f.type === "select") {
-        const ok = await this.smartSelectOption(page, sel, value);
-        return ok;
-      }
-
-      if (f.type === "file") continue;
-
-      await page.fill(sel, value, { timeout: 3000 });
-      await page.keyboard.press("Tab").catch(() => {});
-      await page.waitForTimeout(100).catch(() => {});
-      return true;
-
-    } catch {}
-  }
-
-  return false;
-}
-        // select
+        // SMART SELECT (handles hidden <select> + label/value match)
         if (f.tag === "select" || f.type === "select") {
-          await page.selectOption(sel, value, { timeout: 2500 });
-          await page.waitForTimeout(150).catch(() => {});
-          return true;
+          const ok = await this.smartSelectOption(page, sel, value);
+          if (ok) return sel;
+          continue;
         }
 
-        // file is handled separately
         if (f.type === "file") continue;
 
         await page.fill(sel, value, { timeout: 3000 });
 
-        // blur
+        // blur (some sites validate on blur)
         await page.keyboard.press("Tab").catch(() => {});
         await page.waitForTimeout(100).catch(() => {});
-        return true;
+        return sel;
       } catch {}
     }
 
-    return false;
+    return null;
+  }
+
+  private async smartSelectOption(page: Page, selectSelector: string, desired: string): Promise<boolean> {
+    const wanted = (desired || "").trim().toLowerCase();
+
+    try {
+      const options = await page.evaluate((sel) => {
+        const el = document.querySelector(sel) as HTMLSelectElement | null;
+        if (!el) return [];
+        return Array.from(el.options).map(o => ({
+          value: (o.value || "").toString(),
+          label: (o.textContent || "").trim()
+        }));
+      }, selectSelector);
+
+      console.log(`[SELECT] selector=${selectSelector} desired="${desired}" options=${options.length}`);
+      for (const o of options.slice(0, 20)) {
+        console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
+      }
+
+      let picked =
+        options.find(o => o.value.trim().toLowerCase() === wanted) ||
+        options.find(o => o.label.trim().toLowerCase() === wanted) ||
+        (wanted ? options.find(o => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
+        // fallback: first non-empty
+        options.find(o => (o.value || "").trim() !== "");
+
+      if (!picked) {
+        console.log("[SELECT] no option could be picked");
+        return false;
+      }
+
+      const ok = await page.evaluate((sel, v) => {
+        const el = document.querySelector(sel) as HTMLSelectElement | null;
+        if (!el) return false;
+
+        el.value = v;
+
+        // dispatch events (important for frameworks)
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }, selectSelector, picked.value);
+
+      console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
+      return ok;
+    } catch (e) {
+      console.log("[SELECT] smartSelectOption error:", e);
+      return false;
+    }
   }
 
   private async uploadFile(
@@ -721,7 +785,6 @@ class HotSessionManager {
       const buffer = Buffer.from(file.base64, "base64");
       fs.writeFileSync(tmpPath, buffer);
 
-      // choose best file field
       const fileFields = fields.filter(f => f.type === "file" || f.tag === "input");
       const target = fileFields.find(f => f.name === file.field_name) || fileFields[0];
 
@@ -801,7 +864,7 @@ class HotSessionManager {
         await el.click({ timeout: 3000, force: true });
         debug.push(`clicked:${sel}`);
         return true;
-      } catch (e) {
+      } catch {
         debug.push(`fail:${sel}`);
       }
     }
@@ -816,7 +879,6 @@ class HotSessionManager {
     const t = (text || "").trim();
     if (!t) return false;
 
-    // Try strict-ish strategies
     const candidates = [
       `button:has-text("${t}")`,
       `a:has-text("${t}")`,
@@ -838,7 +900,6 @@ class HotSessionManager {
   }
 
   private async clickBestSubmitInDOM(page: Page, debug: string[]): Promise<boolean> {
-    // Last resort: choose the most "submit-like" button/input visible
     try {
       const ok = await page.evaluate(() => {
         const isVisible = (el: Element) => {
@@ -853,18 +914,14 @@ class HotSessionManager {
           const text = ((el as any).value || el.textContent || "").toString().trim().toLowerCase();
           let s = 0;
 
-          // strongest: explicit submit
           if (tag === "button" && type === "submit") s += 50;
           if (tag === "input" && type === "submit") s += 50;
 
-          // generic submit-ish text
           const words = ["изпрати", "изпрат", "прати", "submit", "send", "request", "заяви", "оферта", "запитване"];
           if (words.some(w => text.includes(w))) s += 20;
 
-          // forms: prefer inside form
           if (el.closest("form")) s += 10;
 
-          // disabled penalty
           const disabled = (el as any).disabled === true || el.getAttribute("aria-disabled") === "true";
           if (disabled) s -= 100;
 
@@ -877,8 +934,7 @@ class HotSessionManager {
         if (nodes.length === 0) return false;
 
         nodes.sort((a, b) => score(b) - score(a));
-        const best = nodes[0] as HTMLElement;
-        best.click();
+        (nodes[0] as HTMLElement).click();
         return true;
       });
 
@@ -893,12 +949,85 @@ class HotSessionManager {
     return false;
   }
 
+  private async clickSubmitWithinClosestForm(page: Page, anchorSelector: string, debug: string[]): Promise<boolean> {
+    try {
+      const r = await page.evaluate((sel) => {
+        const anchor = document.querySelector(sel) as HTMLElement | null;
+        if (!anchor) return { ok: false, reason: "anchor_missing" };
+
+        const form = anchor.closest("form") as HTMLFormElement | null;
+        if (!form) return { ok: false, reason: "no_form" };
+
+        const btn =
+          (form.querySelector('button[type="submit"]') as HTMLElement | null) ||
+          (form.querySelector('input[type="submit"]') as HTMLElement | null);
+
+        if (btn) {
+          btn.click();
+          return { ok: true, method: "form_submit_button" };
+        }
+
+        // text heuristic inside form
+        const nodes = Array.from(form.querySelectorAll("button, input[type='button'], a, [role='button']")) as any[];
+        const words = ["изпрати", "изпрат", "прати", "submit", "send", "запитване", "оферта"];
+        for (const n of nodes) {
+          const txt = String(n.textContent || n.value || "").trim().toLowerCase();
+          if (words.some(w => txt.includes(w))) {
+            (n as HTMLElement).click();
+            return { ok: true, method: "form_text_button", text: txt.slice(0, 80) };
+          }
+        }
+
+        // last resort: requestSubmit/submit
+        const anyForm: any = form as any;
+        if (typeof anyForm.requestSubmit === "function") {
+          anyForm.requestSubmit();
+          return { ok: true, method: "requestSubmit" };
+        }
+        form.submit();
+        return { ok: true, method: "form.submit" };
+      }, anchorSelector);
+
+      if ((r as any)?.ok) {
+        debug.push(`closest_form:${(r as any).method || "ok"}`);
+        return true;
+      }
+      debug.push(`closest_form_fail:${(r as any)?.reason || "unknown"}`);
+      return false;
+    } catch {
+      debug.push("closest_form_fail:exception");
+      return false;
+    }
+  }
+
+  private async getInvalidFields(page: Page): Promise<string[]> {
+    try {
+      const invalid = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll("input:invalid, textarea:invalid, select:invalid")) as any[];
+        return els.slice(0, 20).map(el => el.name || el.id || el.getAttribute("aria-label") || el.tagName.toLowerCase());
+      });
+      return Array.isArray(invalid) ? invalid : [];
+    } catch {
+      return [];
+    }
+  }
+
   private async trySubmitUniversal(
     page: Page,
-    schema?: FormSchemaRow
+    schema?: FormSchemaRow,
+    filledSelectors: string[] = []
   ): Promise<{ attempted: boolean; clicked: boolean; method: string; debug: string[] }> {
     const debug: string[] = [];
     const attempted = true;
+
+    // 0) submit within closest form of a filled field (highest signal)
+    for (const a of filledSelectors.slice(0, 3)) {
+      const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
+      if (ok) {
+        await page.waitForTimeout(700).catch(() => {});
+        return { attempted, clicked: true, method: "closest_form", debug };
+      }
+    }
 
     // 1) schema submit selectors
     const schemaSelectors = schema?.schema.submit?.selector_candidates || [];
@@ -1032,7 +1161,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.0", mode: "schema-first", keywords: "disabled" });
+    res.json({ name: "NEO Worker", version: "6.0.1", mode: "schema-first", keywords: "disabled" });
   });
 
   app.get("/health", (_, res) => {
@@ -1098,7 +1227,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0 listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.1 listening on :${PORT}`);
   });
 
   await manager.start();
