@@ -583,6 +583,15 @@ class HotSessionManager {
     const actions: string[] = [];
     const maxSteps = 8;
 
+    const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
+    if (!hasAnyData) {
+      const obs = await this.quickObserve(page);
+      (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
+      return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
+    }
+
+    let didInteract = false;
+
     console.log(`[WIZARD] start url=${page.url()}`);
 
     for (let step = 1; step <= maxSteps; step++) {
@@ -609,6 +618,7 @@ class HotSessionManager {
           filled++;
           actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
         }
+      if (filled > 0) didInteract = true;
       }
 
       // 2) Handle choice buttons (e.g. Пол: Мъж/Жена)
@@ -622,10 +632,12 @@ class HotSessionManager {
           console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
           if (clicked) actions.push(`Пол: ${pick.text}`);
         }
+          if (clicked) didInteract = true;
+        }
       }
 
       // Early success detection (some wizards auto-advance)
-      if (await this.detectWizardSuccess(page)) {
+      if (didInteract && await this.detectWizardSuccess(page)) {
         const obs = await this.quickObserve(page);
         console.log(`[WIZARD] success detected at step=${step}`);
         return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
@@ -636,6 +648,7 @@ class HotSessionManager {
       console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
 
       if (clicked.clicked) {
+        didInteract = true;
         actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
         await this.waitForWizardStepChange(page, beforeSig);
 
