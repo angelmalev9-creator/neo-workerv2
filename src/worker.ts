@@ -42,6 +42,23 @@ interface FormSchemaField {
   selector_candidates: string[];
 }
 
+type WizardScannedField = {
+  tag: "input" | "textarea" | "select";
+  type: string;
+  name: string;
+  id: string;
+  label: string;
+  placeholder: string;
+  aria_label: string;
+  required: boolean;
+  selector: string; // best-effort unique-ish CSS selector
+};
+
+type WizardChoiceButton = {
+  text: string;
+  selector: string;
+};
+
 interface FormSchemaSubmit {
   text: string;
   selector_candidates: string[];
@@ -402,14 +419,14 @@ class HotSessionManager {
 
     await this.ensureOnSchemaUrl(session.page, schema.url);
 
-    let result: { message: string; observation?: JsonObj };
+    let result: { ok: boolean; message: string; observation?: JsonObj };
     if (schema.kind === "wizard") {
       result = await this.fillWizard(session.page, schema, merged, autoSubmit);
     } else {
       result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit);
     }
 
-    return { success: true, ...result };
+    return { success: !!result.ok, message: result.message, observation: result.observation };
   }
 
   // ─────────────────────────────────────────────────────────
@@ -433,7 +450,7 @@ class HotSessionManager {
       if (best) {
         await this.ensureOnSchemaUrl(session.page, best.url);
         const r = await this.fillFormSchema(session.page, best, data, undefined, true);
-        return { success: true, ...r };
+        return { success: !!r.ok, message: r.message, observation: r.observation };
       }
     }
 
@@ -483,7 +500,7 @@ class HotSessionManager {
     data: Record<string, unknown>,
     file?: FillFormRequest["file"],
     autoSubmit = true
-  ): Promise<{ message: string; observation?: JsonObj }> {
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const fields = schema.schema.fields || [];
     const actions: string[] = [];
     const filledSelectors: string[] = [];
@@ -521,6 +538,7 @@ class HotSessionManager {
     }
 
     const submitInfo: JsonObj = {};
+    let submitClicked = false;
     if (autoSubmit) {
       console.log("[SUBMIT] attempting...");
       const submit = await this.trySubmitUniversal(page, schema, filledSelectors);
@@ -528,6 +546,8 @@ class HotSessionManager {
       submitInfo.submit_method = submit.method;
       submitInfo.submit_clicked = submit.clicked;
       submitInfo.submit_debug = submit.debug;
+
+      submitClicked = !!submit.clicked;
 
       const invalid = await this.getInvalidFields(page);
       submitInfo.invalid_fields = invalid;
@@ -544,6 +564,7 @@ class HotSessionManager {
     obs.submit = submitInfo;
 
     return {
+      ok: autoSubmit ? submitClicked : true,
       message: actions.length ? `Попълних: ${actions.join(", ")}` : "Не успях да попълня полета",
       observation: obs,
     };
@@ -554,10 +575,463 @@ class HotSessionManager {
     schema: FormSchemaRow,
     data: Record<string, unknown>,
     autoSubmit = true
-  ): Promise<{ message: string; observation?: JsonObj }> {
-    // keep minimal; focus now on form
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    // Универсален multi-step wizard:
+    // - На всяка стъпка: сканира видимите полета, попълва, клика Next/Напред или Submit/Изпрати,
+    //   изчаква DOM промяна, повтаря до успех или лимит.
+
+    const actions: string[] = [];
+    const maxSteps = 8;
+
+    console.log(`[WIZARD] start url=${page.url()}`);
+
+    for (let step = 1; step <= maxSteps; step++) {
+      const beforeSig = await this.getWizardDomSignature(page);
+      const scanned = await this.scanWizardStep(page);
+
+      console.log(
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
+      );
+
+      // 1) Fill visible fields based on semantics (name/email/phone/message/age/etc.)
+      let filled = 0;
+      for (const f of scanned.fields) {
+        const v = this.matchWizardFieldValue(f, data);
+        const matched = v !== undefined && String(v).trim().length > 0;
+
+        console.log(
+          `[WIZARD][FIELD] tag=${f.tag} type=${f.type} name="${f.name}" label="${f.label}" required=${f.required} matched=${matched ? "yes" : "no"}`
+        );
+
+        if (!matched) continue;
+        const ok = await this.fillWizardField(page, f, String(v));
+        if (ok) {
+          filled++;
+          actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
+        }
+      }
+
+      // 2) Handle choice buttons (e.g. Пол: Мъж/Жена)
+      const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
+      if (gender && scanned.choices.length) {
+        const wanted = gender.toLowerCase();
+        const pick = scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
+          scanned.choices.find((c) => c.text.toLowerCase().includes(wanted));
+        if (pick) {
+          const clicked = await this.safeClick(page, pick.selector);
+          console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
+          if (clicked) actions.push(`Пол: ${pick.text}`);
+        }
+      }
+
+      // Early success detection (some wizards auto-advance)
+      if (await this.detectWizardSuccess(page)) {
+        const obs = await this.quickObserve(page);
+        console.log(`[WIZARD] success detected at step=${step}`);
+        return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
+      }
+
+      // 3) Decide Next vs Submit
+      const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
+      console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
+
+      if (clicked.clicked) {
+        actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
+        await this.waitForWizardStepChange(page, beforeSig);
+
+        if (await this.detectWizardSuccess(page)) {
+          const obs = await this.quickObserve(page);
+          console.log(`[WIZARD] success detected after click at step=${step}`);
+          return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
+        }
+
+        // continue to next step
+        continue;
+      }
+
+      // 4) No buttons found. If we filled something but no navigation, bail with debug.
+      const invalid = await this.getInvalidFields(page);
+      if (invalid.length) {
+        actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
+      }
+
+      const obs = await this.quickObserve(page);
+      (obs as any).wizard = {
+        step,
+        filled,
+        invalid_fields: invalid,
+        note: "No next/submit button detected",
+      };
+
+      return {
+        ok: false,
+        message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон",
+        observation: obs,
+      };
+    }
+
     const obs = await this.quickObserve(page);
-    return { message: "Wizard режим: не е активиран в този build", observation: obs };
+    (obs as any).wizard = { note: "maxSteps reached" };
+    return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: прекалено много стъпки", observation: obs };
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Wizard helpers
+  // ─────────────────────────────────────────────────────────
+
+  private wizardFieldText(f: WizardScannedField): string {
+    return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
+  }
+
+  private matchWizardFieldValue(field: WizardScannedField, data: Record<string, unknown>): string | undefined {
+    // 1) direct by name/id
+    if (field.name && data[field.name] !== undefined) return String(data[field.name]);
+    if (field.id && data[field.id] !== undefined) return String(data[field.id]);
+
+    const t = this.wizardFieldText(field);
+
+    // 2) common semantics
+    if (field.type === "email" || /e-?mail|email|имейл|поща/.test(t)) {
+      const v = (data as any).email || (data as any).e_mail;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (field.type === "tel" || /phone|tel|телефон|мобил|gsm/.test(t)) {
+      const v = (data as any).phone || (data as any).telephone || (data as any).tel;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (/name|име|first|last|fullname|фамил/.test(t)) {
+      const v = (data as any).name || (data as any).full_name || (data as any).first_name;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (field.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t)) {
+      const v = (data as any).message || (data as any).note || (data as any).comment;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    if (/age|възраст/.test(t)) {
+      const v = (data as any).age || (data as any).years || (data as any).възраст;
+      return v !== undefined ? String(v) : undefined;
+    }
+
+    // 3) fallback: try any key that appears in label (deterministic)
+    for (const k of Object.keys(data || {})) {
+      if (!k) continue;
+      const kk = k.toLowerCase();
+      if (kk.length < 3) continue;
+      if (t.includes(kk) && (data as any)[k] !== undefined) return String((data as any)[k]);
+    }
+
+    return undefined;
+  }
+
+  private async fillWizardField(page: Page, f: WizardScannedField, value: string): Promise<boolean> {
+    const sel = f.selector;
+    const valSummary = summarizeValue(f.name || f.type, value);
+    console.log(`[WIZARD][FILL] selector=${sel} value=${valSummary}`);
+
+    try {
+      const el = await page.$(sel);
+      if (!el) return false;
+
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) return false;
+
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 1200 }).catch(() => {});
+
+      if (f.tag === "select" || f.type === "select") {
+        return await this.smartSelectOption(page, sel, String(value));
+      }
+
+      // Some wizards use type=number but accept text fill.
+      await page.fill(sel, String(value), { timeout: 3000 });
+      await page.keyboard.press("Tab").catch(() => {});
+      await page.waitForTimeout(80).catch(() => {});
+      return true;
+    } catch (e) {
+      console.log(`[WIZARD][FILL][FAIL] selector=${sel}`, e);
+      return false;
+    }
+  }
+
+  private async safeClick(page: Page, selector: string): Promise<boolean> {
+    try {
+      const el = await page.$(selector);
+      if (!el) return false;
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) return false;
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 2500, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async clickWizardNextOrSubmit(
+    page: Page,
+    autoSubmit: boolean
+  ): Promise<{ clicked: boolean; kind: "next" | "submit" | "none"; text: string }>
+  {
+    // Prefer NEXT first if exists.
+    const nextTexts = ["Напред", "Следва", "Продължи", "Next", "Continue", ">", "→"];
+    const submitTexts = ["Изпрати", "Завърши", "Готово", "Submit", "Send", "Finish", "Потвърди"];
+
+    const clickedNext = await this.clickWizardButtonByTexts(page, nextTexts);
+    if (clickedNext.clicked) return { clicked: true, kind: "next", text: clickedNext.text };
+
+    if (!autoSubmit) return { clicked: false, kind: "none", text: "" };
+
+    const clickedSubmit = await this.clickWizardButtonByTexts(page, submitTexts, true);
+    if (clickedSubmit.clicked) return { clicked: true, kind: "submit", text: clickedSubmit.text };
+
+    // Fallback: any visible submit button
+    try {
+      const ok = await page.evaluate(() => {
+        const btn = document.querySelector('button[type="submit"], input[type="submit"]') as any;
+        if (!btn) return false;
+        const r = btn.getBoundingClientRect();
+        const visible = r.width > 0 && r.height > 0;
+        if (!visible) return false;
+        btn.click();
+        return true;
+      });
+      if (ok) return { clicked: true, kind: "submit", text: "type=submit" };
+    } catch {}
+
+    return { clicked: false, kind: "none", text: "" };
+  }
+
+  private async clickWizardButtonByTexts(
+    page: Page,
+    texts: string[],
+    allowSubmitInputs = false
+  ): Promise<{ clicked: boolean; text: string }>
+  {
+    for (const t of texts) {
+      const text = (t || "").trim();
+      if (!text) continue;
+
+      // Try buttons / links with has-text
+      const candidates = [
+        `button:has-text("${text}")`,
+        `a:has-text("${text}")`,
+      ];
+      if (allowSubmitInputs) candidates.push(`input[type="submit"][value*="${text}"]`);
+
+      for (const sel of candidates) {
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          const visible = await el.isVisible().catch(() => false);
+          if (!visible) continue;
+
+          // Avoid disabled
+          const disabled = await el.evaluate((n: any) => !!n.disabled).catch(() => false);
+          if (disabled) continue;
+
+          await el.scrollIntoViewIfNeeded().catch(() => {});
+          await el.click({ timeout: 2500, force: true });
+          return { clicked: true, text };
+        } catch {
+          // keep trying
+        }
+      }
+    }
+    return { clicked: false, text: "" };
+  }
+
+  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[] }> {
+    return await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const style = window.getComputedStyle(el as any);
+        if (!style) return false;
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        const r = (el as any).getBoundingClientRect?.();
+        if (!r) return false;
+        return r.width > 0 && r.height > 0;
+      };
+
+      const cssEscape = (s: string) => {
+        try {
+          // @ts-ignore
+          return CSS.escape(s);
+        } catch {
+          return s.replace(/[^a-zA-Z0-9_-]/g, "\\$");
+        }
+      };
+
+      const getSelector = (el: Element): string => {
+        const any = el as any;
+        const id = any.id ? String(any.id) : "";
+        if (id) return `#${cssEscape(id)}`;
+        const name = any.name ? String(any.name) : "";
+        const tag = el.tagName.toLowerCase();
+        if (name) return `${tag}[name="${name.replace(/\"/g, "")}"]`;
+        const aria = any.getAttribute?.("aria-label") || "";
+        if (aria) return `${tag}[aria-label="${aria.replace(/\"/g, "")}"]`;
+
+        // fallback: build a short nth-of-type path (deterministic)
+        let cur: Element | null = el;
+        const parts: string[] = [];
+        let depth = 0;
+        while (cur && depth < 5) {
+          const t = cur.tagName.toLowerCase();
+          const par = cur.parentElement as Element | null;
+          if (!par) break;
+          const siblings = Array.from(par.children as unknown as Element[]).filter((c: Element) => c.tagName === cur!.tagName);
+          const idx = siblings.indexOf(cur) + 1;
+          parts.unshift(`${t}:nth-of-type(${idx})`);
+          cur = par;
+          depth++;
+          if (t === "form" || t === "main") break;
+        }
+        return parts.length ? parts.join(" > ") : el.tagName.toLowerCase();
+      };
+
+      const getLabel = (el: Element) => {
+        const any = el as any;
+        const id = any.id ? String(any.id) : "";
+        if (id) {
+          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
+          if (lab && lab.textContent) return lab.textContent.trim();
+        }
+        // nearest label wrapper
+        let p: Element | null = el;
+        for (let i = 0; i < 4; i++) {
+          if (!p) break;
+          const lab = p.querySelector?.("label") as HTMLElement | null;
+          if (lab && lab.textContent) return lab.textContent.trim();
+          p = p.parentElement;
+        }
+        // aria-labelledby
+        const labelledby = any.getAttribute?.("aria-labelledby") || "";
+        if (labelledby) {
+          const t = labelledby
+            .split(/\s+/)
+            .map((id: string) => document.getElementById(id)?.textContent?.trim() || "")
+            .filter(Boolean)
+            .join(" ");
+          if (t) return t;
+        }
+        return "";
+      };
+
+      const inputs = Array.from(document.querySelectorAll("input, textarea, select"));
+      const fields = inputs
+        .filter((el) => {
+          const any = el as any;
+          if (!isVisible(el)) return false;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "input") {
+            const type = (any.type || "").toLowerCase();
+            if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+          }
+          if (any.disabled) return false;
+          if (any.getAttribute?.("aria-hidden") === "true") return false;
+          return true;
+        })
+        .slice(0, 40)
+        .map((el) => {
+          const any = el as any;
+          const tag = el.tagName.toLowerCase() as any;
+          const type = (any.type || (tag === "select" ? "select" : tag)).toLowerCase();
+          return {
+            tag,
+            type,
+            name: any.name ? String(any.name) : "",
+            id: any.id ? String(any.id) : "",
+            label: getLabel(el),
+            placeholder: any.placeholder ? String(any.placeholder) : "",
+            aria_label: any.getAttribute?.("aria-label") ? String(any.getAttribute("aria-label")) : "",
+            required: !!any.required,
+            selector: getSelector(el),
+          };
+        });
+
+      // Common wizard choice buttons like "Мъж" / "Жена"
+      const btns = Array.from(document.querySelectorAll("button, [role='button']"))
+        .filter((el) => isVisible(el))
+        .map((el) => {
+          const t = (el.textContent || "").trim();
+          return { text: t, selector: getSelector(el) };
+        })
+        .filter((b) => ["мъж", "жена"].includes((b.text || "").trim().toLowerCase()))
+        .slice(0, 6);
+
+      return { fields, choices: btns };
+    });
+  }
+
+  private async getWizardDomSignature(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const title = document.title || "";
+        const h1 = (document.querySelector("h1")?.textContent || "").trim();
+        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+          .filter((el: any) => {
+            const r = (el as any).getBoundingClientRect?.();
+            if (!r) return false;
+            const style = window.getComputedStyle(el as any);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            return r.width > 0 && r.height > 0;
+          })
+          .slice(0, 25)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+          .join("|");
+        return `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
+      });
+    } catch {
+      return `sig:${Date.now()}`;
+    }
+  }
+
+  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
+    // Wait for DOM signature to change, but don't hang forever.
+    try {
+      await page.waitForFunction(
+        (sig: string) => {
+          const title = document.title || "";
+          const h1 = (document.querySelector("h1")?.textContent || "").trim();
+          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+            .filter((el: any) => {
+              const r = (el as any).getBoundingClientRect?.();
+              if (!r) return false;
+              const style = window.getComputedStyle(el as any);
+              if (style.display === "none" || style.visibility === "hidden") return false;
+              return r.width > 0 && r.height > 0;
+            })
+            .slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+            .join("|");
+          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
+          return cur !== sig;
+        },
+        beforeSig,
+        { timeout: 9000 }
+      );
+    } catch {
+      // fallback
+      await page.waitForTimeout(900).catch(() => {});
+    }
+  }
+
+  private async detectWizardSuccess(page: Page): Promise<boolean> {
+    try {
+      return await page.evaluate(() => {
+        const txt = (document.body?.innerText || "").toLowerCase();
+        // Keep it simple & language-agnostic
+        const hits = ["благодар", "успеш", "изпрат", "thank you", "success", "submitted"];
+        return hits.some((h) => txt.includes(h));
+      });
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -620,10 +1094,10 @@ class HotSessionManager {
     const options = await page.evaluate<
       { value: string; label: string }[],
       { sel: string }
-    >(({ sel }) => {
+    >(({ sel }: { sel: string }) => {
       const el = document.querySelector(sel) as HTMLSelectElement | null;
       if (!el) return [];
-      return Array.from(el.options).map(o => ({
+      return Array.from(el.options).map((o: HTMLOptionElement) => ({
         value: (o.value || "").toString(),
         label: (o.textContent || "").trim()
       }));
@@ -635,15 +1109,15 @@ class HotSessionManager {
     }
 
     let picked =
-      options.find(o => o.value.trim().toLowerCase() === wanted) ||
-      options.find(o => o.label.trim().toLowerCase() === wanted) ||
-      (wanted ? options.find(o => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
-      options.find(o => (o.value || "").trim() !== "");
+      options.find((o: { value: string; label: string }) => o.value.trim().toLowerCase() === wanted) ||
+      options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase() === wanted) ||
+      (wanted ? options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
+      options.find((o: { value: string; label: string }) => (o.value || "").trim() !== "");
 
     if (!picked) return false;
 
     const ok = await page.evaluate<boolean, { sel: string; v: string }>(
-      ({ sel, v }) => {
+      ({ sel, v }: { sel: string; v: string }) => {
         const el = document.querySelector(sel) as HTMLSelectElement | null;
         if (!el) return false;
         el.value = v;
@@ -742,7 +1216,7 @@ class HotSessionManager {
 
   private async clickSubmitWithinClosestForm(page: Page, anchorSelector: string, debug: string[]): Promise<boolean> {
     const ok = await page.evaluate<boolean, { sel: string }>(
-      ({ sel }) => {
+      ({ sel }: { sel: string }) => {
         const anchor = document.querySelector(sel) as HTMLElement | null;
         if (!anchor) return false;
         const form = anchor.closest("form") as HTMLFormElement | null;
