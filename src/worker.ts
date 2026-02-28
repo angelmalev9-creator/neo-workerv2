@@ -52,7 +52,7 @@ type WizardScannedField = {
   aria_label: string;
   required: boolean;
   selector: string; // best-effort unique-ish CSS selector
-  options?: { value: string; label: string }[]; // for selects
+  options?: { value: string; label: string }[]; // for <select>
 };
 
 type WizardChoiceButton = {
@@ -108,9 +108,6 @@ interface FillFormRequest {
     message?: string;
     [k: string]: string | undefined;
   };
-  // When true, selects will NEVER fall back to a "best guess".
-  // If no safe match exists, worker returns NO_SAFE_SELECT_MATCH and exposes options.
-  strict_select?: boolean;
   file?: {
     field_name: string;
     base64: string;
@@ -392,12 +389,6 @@ class HotSessionManager {
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
     const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
     const autoSubmit = request.auto_submit !== false;
-    const strictSelect = request.strict_select === true;
-    const confirmedKeys = new Set(
-      Object.keys((confirmed as any) || {})
-        .map((k) => (k || "").toLowerCase())
-        .filter(Boolean)
-    );
 
     const session = this.sessions.get(site_id);
     if (!session) return { success: false, message: "Няма активна сесия" };
@@ -430,11 +421,10 @@ class HotSessionManager {
     await this.ensureOnSchemaUrl(session.page, schema.url);
 
     let result: { ok: boolean; message: string; observation?: JsonObj };
-    const fillOpts = { strictSelect, confirmedKeys };
     if (schema.kind === "wizard") {
-      result = await this.fillWizard(session.page, schema, merged, autoSubmit, fillOpts);
+      result = await this.fillWizard(session.page, schema, merged, autoSubmit);
     } else {
-      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, fillOpts);
+      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit);
     }
 
     return { success: !!result.ok, message: result.message, observation: result.observation };
@@ -510,8 +500,7 @@ class HotSessionManager {
     schema: FormSchemaRow,
     data: Record<string, unknown>,
     file?: FillFormRequest["file"],
-    autoSubmit = true,
-    opts?: { strictSelect: boolean; confirmedKeys: Set<string> }
+    autoSubmit = true
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const fields = schema.schema.fields || [];
     const actions: string[] = [];
@@ -531,7 +520,7 @@ class HotSessionManager {
       if (v === undefined) continue;
       matchedCount++;
 
-      const usedSel = await this.fillSingleField(page, f, String(v), opts);
+      const usedSel = await this.fillSingleField(page, f, String(v));
       if (usedSel) {
         filledSelectors.push(usedSel);
         actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
@@ -575,35 +564,6 @@ class HotSessionManager {
     const obs = await this.quickObserve(page);
     obs.submit = submitInfo;
 
-    const invalidNow = Array.isArray((submitInfo as any).invalid_fields)
-      ? ((submitInfo as any).invalid_fields as string[])
-      : [];
-
-    // Scan live DOM for newly revealed fields (multi-step forms) and expose what's missing.
-    const scanned = await this.scanWizardStep(page).catch(() => ({ fields: [], choices: [] }));
-    const next = this.buildNextPayloadFromScan(scanned.fields, data);
-    const needsMore = next.missing_required.length > 0;
-    const blocked = invalidNow.length > 0;
-
-    if (autoSubmit && (!submitClicked || blocked || needsMore)) {
-      // Only return a "next_step" if we have something concrete to ask.
-      if (blocked || needsMore) {
-        (obs as any).next_step = {
-          reason: blocked ? "validation" : "missing_required",
-          invalid_fields: invalidNow,
-          missing_required: next.missing_required,
-          fields: next.fields,
-          choices: scanned.choices,
-          note: "Worker detected additional required inputs after interaction (multi-step or validation).",
-        };
-        return {
-          ok: false,
-          message: "Формата изисква още данни, за да продължа.",
-          observation: obs,
-        };
-      }
-    }
-
     return {
       ok: autoSubmit ? submitClicked : true,
       message: actions.length ? `Попълних: ${actions.join(", ")}` : "Не успях да попълня полета",
@@ -615,8 +575,7 @@ class HotSessionManager {
     page: Page,
     schema: FormSchemaRow,
     data: Record<string, unknown>,
-    autoSubmit = true,
-    opts?: { strictSelect: boolean; confirmedKeys: Set<string> }
+    autoSubmit = true
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     // Универсален multi-step wizard:
     // - На всяка стъпка: сканира видимите полета, попълва, клика Next/Напред или Submit/Изпрати,
@@ -627,20 +586,9 @@ class HotSessionManager {
 
     const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
     if (!hasAnyData) {
-      // Payload is empty. Don't "fail submit" — return the live required fields/options
-      // so the caller (Gemini) can ask the user naturally what to provide next.
-      const scanned = await this.scanWizardStep(page);
-      const next = this.buildNextPayloadFromScan(scanned.fields, data || {});
       const obs = await this.quickObserve(page);
-      (obs as any).needs_input = true;
-      (obs as any).wizard_next = {
-        step: 1,
-        missing_required: next.missing_required,
-        fields: next.fields,
-        choices: scanned.choices,
-        note: "Wizard has no payload yet. Ask user for required fields shown above.",
-      };
-      return { ok: false, message: "Wizard: трябват данни за да започна (липсва payload).", observation: obs };
+      (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
+      return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
     }
 
     let didInteract = false;
@@ -654,22 +602,6 @@ class HotSessionManager {
       console.log(
         `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
       );
-
-      // If this step has required fields we can't satisfy from the current payload,
-      // stop and return a deterministic next payload so Gemini can ask naturally.
-      const next = this.buildNextPayloadFromScan(scanned.fields, data);
-      if (next.missing_required.length > 0) {
-        const obs = await this.quickObserve(page);
-        (obs as any).needs_input = true;
-        (obs as any).wizard_next = {
-          step,
-          missing_required: next.missing_required,
-          fields: next.fields,
-          choices: scanned.choices,
-          note: "Wizard step needs more confirmed user input.",
-        };
-        return { ok: false, message: "Wizard: трябват още данни за следващата стъпка.", observation: obs };
-      }
 
       // 1) Fill visible fields based on semantics (name/email/phone/message/age
       let filled = 0;
@@ -707,12 +639,22 @@ class HotSessionManager {
         }
       }
 
-      // Early success detection (some wizards auto-advance)
-      if (didInteract && await this.detectWizardSuccess(page)) {
+      // If we still miss required fields on the current step, stop and ask (do NOT click Next/Submit).
+      const needNow = this.buildWizardNeedPayload(scanned, data);
+      if (needNow.missing_required.length > 0) {
         const obs = await this.quickObserve(page);
-        console.log(`[WIZARD] success detected at step=${step}`);
-        return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
+        (obs as any).needs_input = true;
+        (obs as any).wizard_next = {
+          ...needNow,
+          step,
+          total_steps: maxSteps,
+          advanced: false,
+          last_clicked: null,
+        };
+        console.log(`[WIZARD] needs_input on current step=${step} missing=${needNow.missing_required.length}`);
+        return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
       }
+
 
       // 3) Decide Next vs Submit
       const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
@@ -729,7 +671,39 @@ class HotSessionManager {
           return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
         }
 
-        // continue to next step
+        // After navigation, scan the new step and return what we need next (multi-step support)
+        const afterSig = await this.getWizardDomSignature(page);
+        const nextScanned = await this.scanWizardStep(page);
+        const nextNeed = this.buildWizardNeedPayload(nextScanned, data);
+
+        // If we still have required fields without values, stop here and ask for them.
+        if (nextNeed.missing_required.length > 0) {
+          const obs = await this.quickObserve(page);
+          (obs as any).needs_input = true;
+          (obs as any).wizard_next = {
+            ...nextNeed,
+            step: Math.min(step + 1, maxSteps),
+            total_steps: maxSteps,
+            advanced: beforeSig !== afterSig,
+            last_clicked: { kind: clicked.kind, text: clicked.text },
+          };
+          console.log(`[WIZARD] needs_input after click step=${step} missing=${nextNeed.missing_required.length}`);
+          return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
+        }
+
+        // Nothing missing on the next step — continue if autoSubmit, otherwise stop with snapshot
+        if (!autoSubmit) {
+          const obs = await this.quickObserve(page);
+          (obs as any).wizard_next = {
+            ...nextNeed,
+            step: Math.min(step + 1, maxSteps),
+            total_steps: maxSteps,
+            advanced: beforeSig !== afterSig,
+            last_clicked: { kind: clicked.kind, text: clicked.text },
+          };
+          return { ok: false, message: "Wizard: следваща стъпка е готова", observation: obs };
+        }
+
         continue;
       }
 
@@ -766,6 +740,85 @@ class HotSessionManager {
   private wizardFieldText(f: WizardScannedField): string {
     return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
   }
+
+  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[] }, data: Record<string, string>) {
+    const missing_required: Array<{
+      label: string;
+      type: string;
+      selector: string;
+      options?: { value: string; label: string }[];
+    }> = [];
+
+    for (const f of scanned.fields) {
+      if (!f.required) continue;
+      const found = this.matchWizardDataForField(f, data);
+      if (!found) {
+        missing_required.push({
+          label: (f.label || f.aria_label || f.placeholder || f.name || f.id || "Поле").trim(),
+          type: f.type || f.tag,
+          selector: f.selector,
+          options: f.options,
+        });
+      }
+    }
+
+    const fields = scanned.fields.map((f) => ({
+      tag: f.tag,
+      type: f.type,
+      name: f.name,
+      id: f.id,
+      label: f.label,
+      placeholder: f.placeholder,
+      aria_label: f.aria_label,
+      required: f.required,
+      selector: f.selector,
+      options: f.options,
+    }));
+
+    return { missing_required, fields, choices: scanned.choices };
+  }
+
+  private matchWizardDataForField(f: WizardScannedField, data: Record<string, string>): { key: string; value: string } | null {
+    const txt = this.wizardFieldText(f);
+
+    const pickByKeys = (keys: string[]) => {
+      for (const k of keys) {
+        const v = (data as any)[k];
+        if (typeof v === "string" && v.trim()) return { key: k, value: v.trim() };
+      }
+      return null;
+    };
+
+    // Strong type-based hints
+    if ((f.type || "").includes("email") || txt.includes("имейл") || txt.includes("e-mail")) {
+      return pickByKeys(["email", "e_mail", "mail"]);
+    }
+    if ((f.type || "").includes("tel") || txt.includes("тел") || txt.includes("phone") || txt.includes("gsm")) {
+      return pickByKeys(["phone", "tel", "telephone", "gsm"]);
+    }
+    if ((f.type || "").includes("number") || txt.includes("възраст") || txt.includes("age")) {
+      return pickByKeys(["age", "years", "възраст"]);
+    }
+    if (txt.includes("име") || txt.includes("name")) {
+      return pickByKeys(["name", "full_name", "fullname", "first_name", "last_name", "names"]);
+    }
+    if (txt.includes("съобщ") || txt.includes("message") || txt.includes("коментар") || txt.includes("note")) {
+      return pickByKeys(["message", "comment", "note", "details"]);
+    }
+
+    // Generic: try any key that appears in the field text
+    for (const k of Object.keys(data || {})) {
+      const key = k.toLowerCase();
+      if (!key) continue;
+      if (txt.includes(key)) {
+        const v = (data as any)[k];
+        if (typeof v === "string" && v.trim()) return { key: k, value: v.trim() };
+      }
+    }
+
+    return null;
+  }
+
 
   private matchWizardFieldValue(field: WizardScannedField, data: Record<string, unknown>): string | undefined {
     // 1) direct by name/id
@@ -827,11 +880,7 @@ class HotSessionManager {
       await el.click({ timeout: 1200 }).catch(() => {});
 
       if (f.tag === "select" || f.type === "select") {
-        return await this.smartSelectOption(page, sel, String(value), {
-          strict: true,
-          fieldLabel: f.label,
-          optionsHint: f.options,
-        });
+        return await this.smartSelectOption(page, sel, String(value));
       }
 
       // Some wizards use type=number but accept text fill.
@@ -1027,14 +1076,6 @@ class HotSessionManager {
           const any = el as any;
           const tag = el.tagName.toLowerCase() as any;
           const type = (any.type || (tag === "select" ? "select" : tag)).toLowerCase();
-          let options: { value: string; label: string }[] | undefined = undefined;
-          if (tag === "select") {
-            const sel = el as HTMLSelectElement;
-            options = Array.from(sel.options || []).map((o: any) => ({
-              value: String(o.value || ""),
-              label: String(o.textContent || "").trim(),
-            }));
-          }
           return {
             tag,
             type,
@@ -1043,9 +1084,21 @@ class HotSessionManager {
             label: getLabel(el),
             placeholder: any.placeholder ? String(any.placeholder) : "",
             aria_label: any.getAttribute?.("aria-label") ? String(any.getAttribute("aria-label")) : "",
-            required: !!any.required,
+            required: (() => {
+            const lab = (getLabel(el) || "").trim();
+            const ariaReq = (any.getAttribute?.("aria-required") || "").toString().toLowerCase() === "true";
+            const dataReq = (any.getAttribute?.("data-required") || "").toString().toLowerCase() === "true";
+            const star = lab.includes("*");
+            return !!any.required || ariaReq || dataReq || star;
+          })(),
             selector: getSelector(el),
-            options,
+            options:
+              tag === "select"
+                ? Array.from((el as HTMLSelectElement).options || []).slice(0, 60).map((o) => ({
+                    value: (o as any).value ? String((o as any).value) : "",
+                    label: (o as any).label ? String((o as any).label) : (o.textContent || "").trim(),
+                  }))
+                : undefined,
           };
         });
 
@@ -1061,77 +1114,6 @@ class HotSessionManager {
 
       return { fields, choices: btns };
     });
-  }
-
-  // Build a deterministic "what's missing" payload from the *live DOM*.
-  // This is what Gemini should convert to natural questions.
-  private buildNextPayloadFromScan(
-    scannedFields: WizardScannedField[],
-    data: Record<string, unknown>
-  ): {
-    missing_required: { key: string; label: string; type: string; options?: { value: string; label: string }[] }[];
-    fields: { key: string; label: string; type: string; required: boolean; options?: { value: string; label: string }[] }[];
-  } {
-    const fields = (scannedFields || []).map((f) => ({
-      key: (f.name || f.id || f.selector || "").trim(),
-      label: (f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim(),
-      type: f.tag === "select" ? "select" : (f.type || f.tag),
-      required: !!f.required,
-      options: f.options,
-    }));
-
-    const missing_required = fields
-      .filter((f) => f.required)
-      .filter((f) => {
-        // Special case: required SELECT must be a safe match to one of the options.
-        if (f.type === "select" && Array.isArray(f.options) && f.options.length > 0) {
-          const raw = f.key && (data as any)[f.key] !== undefined ? String((data as any)[f.key]) : "";
-          const planFallback = String((data as any).plan || "");
-          const desired = (raw || planFallback || "").trim();
-          if (!desired) return true;
-          const norms = this.expandPlanSynonyms(desired);
-          const ok = f.options.some((o) => norms.includes(this.normalizeOptionText(o.value)) || norms.includes(this.normalizeOptionText(o.label)));
-          return !ok;
-        }
-
-        if (f.key && (data as any)[f.key] !== undefined && String((data as any)[f.key]).trim().length > 0) return false;
-        const t = `${f.key} ${f.label}`.toLowerCase();
-        if (/e-?mail|email|имейл|поща/.test(t)) return !String((data as any).email || "").trim();
-        if (/phone|tel|телефон|gsm|мобил/.test(t)) return !String((data as any).phone || (data as any).telephone || "").trim();
-        if (/name|име|first|last|fullname|фамил/.test(t)) return !String((data as any).name || (data as any).full_name || "").trim();
-        if (/message|съобщ|note|comment|описание|забел/.test(t)) return !String((data as any).message || (data as any).note || "").trim();
-        return true;
-      })
-      .map((f) => ({ key: f.key, label: f.label, type: f.type, options: f.options }));
-
-    return { missing_required, fields };
-  }
-
-  private normalizeOptionText(s: string): string {
-    return (s || "")
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .replace(/[–—-]/g, "-")
-      .replace(/\([^)]*\)/g, " ")
-      .replace(/\b(лв\.?|bgn|eur|usd)\b/g, " ")
-      .replace(/\b\d+[\d\s.,]*\b/g, " ")
-      .replace(/[^a-zа-я0-9\s-]/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  private expandPlanSynonyms(input: string): string[] {
-    const n = this.normalizeOptionText(input);
-    if (!n) return [];
-    const out = new Set<string>([n]);
-
-    const add = (arr: string[]) => arr.forEach((x) => out.add(this.normalizeOptionText(x)));
-
-    if (/(advanced|standard|standart|стандарт)/.test(n)) add(["standarten", "standart", "standard", "стандартен", "стандарт"]);
-    if (/(essential|basic|starter|start|старт|начален|основен)/.test(n)) add(["startov", "starter", "basic", "essential", "стартов", "начален", "основен"]);
-    if (/(premium|ultimate|pro|enterprise|премиум|индивидуал)/.test(n)) add(["premium", "ultimate", "pro", "enterprise", "премиум", "индивидуална оферта"]);
-
-    return Array.from(out).filter(Boolean);
   }
 
   private async getWizardDomSignature(page: Page): Promise<string> {
@@ -1206,12 +1188,7 @@ class HotSessionManager {
    * Returns selector that worked, else null.
    * Adds detailed selector attempt logs.
    */
-  private async fillSingleField(
-    page: Page,
-    f: FormSchemaField,
-    value: string,
-    opts?: { strictSelect: boolean; confirmedKeys: Set<string> }
-  ): Promise<string | null> {
+  private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
     const selectors = [
       ...(f.selector_candidates || []),
       f.name ? `[name="${f.name}"]` : "",
@@ -1239,17 +1216,7 @@ class HotSessionManager {
         await el.click({ timeout: 1200 }).catch(() => {});
 
         if (f.tag === "select" || f.type === "select") {
-          const fieldKey = (f.name || "").toLowerCase();
-          const isPlanLike = /\b(plan|package|tier|service)\b|пакет|план|услуга/.test(fieldText(f));
-          const strict =
-            opts?.strictSelect === true ||
-            (fieldKey && opts?.confirmedKeys?.has(fieldKey)) ||
-            (isPlanLike && (opts?.confirmedKeys?.has("plan") || opts?.confirmedKeys?.has("package") || opts?.confirmedKeys?.has("пакет")));
-
-          const ok = await this.smartSelectOption(page, sel, String(value), {
-            strict,
-            fieldLabel: f.label || f.name || "",
-          });
+          const ok = await this.smartSelectOption(page, sel, String(value));
           console.log(`[FILL][SELECT] ${sel} ok=${ok}`);
           if (ok) return sel;
           continue;
@@ -1271,15 +1238,8 @@ class HotSessionManager {
     return null;
   }
 
-  private async smartSelectOption(
-    page: Page,
-    selectSelector: string,
-    desired: string,
-    cfg?: { strict?: boolean; fieldLabel?: string; optionsHint?: { value: string; label: string }[] }
-  ): Promise<boolean> {
-    const strict = cfg?.strict === true;
-    const wantedRaw = (desired || "").trim();
-    const wanted = wantedRaw.toLowerCase();
+  private async smartSelectOption(page: Page, selectSelector: string, desired: string): Promise<boolean> {
+    const wanted = (desired || "").trim().toLowerCase();
 
     const options = await page.evaluate<
       { value: string; label: string }[],
@@ -1293,38 +1253,16 @@ class HotSessionManager {
       }));
     }, { sel: selectSelector });
 
-    console.log(`[SELECT] selector=${selectSelector} desired="${desired}" strict=${strict} options=${options.length}`);
+    console.log(`[SELECT] selector=${selectSelector} desired="${desired}" options=${options.length}`);
     for (const o of options.slice(0, 20)) {
       console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
     }
 
-    // 1) Exact matches
     let picked =
-      options.find((o) => o.value.trim().toLowerCase() === wanted) ||
-      options.find((o) => o.label.trim().toLowerCase() === wanted);
-
-    // 2) Normalized label/value match + package synonyms (covers Advanced→Стандартен, etc.)
-    if (!picked && wantedRaw) {
-      const wantedNorms = this.expandPlanSynonyms(wantedRaw);
-      picked =
-        options.find((o) => wantedNorms.includes(this.normalizeOptionText(o.value))) ||
-        options.find((o) => wantedNorms.includes(this.normalizeOptionText(o.label)));
-    }
-
-    // 3) Safe partial only if not strict
-    if (!picked && !strict && wantedRaw) {
-      const w = this.normalizeOptionText(wantedRaw);
-      if (w) picked = options.find((o) => this.normalizeOptionText(o.label).includes(w));
-    }
-
-    // 4) Never guess in strict mode
-    if (!picked) {
-      if (strict) {
-        console.log(`[SELECT][NO_SAFE_MATCH] field="${cfg?.fieldLabel || ""}" desired="${desired}"`);
-        return false;
-      }
-      picked = options.find((o) => (o.value || "").trim() !== "");
-    }
+      options.find((o: { value: string; label: string }) => o.value.trim().toLowerCase() === wanted) ||
+      options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase() === wanted) ||
+      (wanted ? options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
+      options.find((o: { value: string; label: string }) => (o.value || "").trim() !== "");
 
     if (!picked) return false;
 
