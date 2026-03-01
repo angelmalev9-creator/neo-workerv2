@@ -1,9 +1,11 @@
 /**
- * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
+ * NEO WORKER v6.0.6-universal-choices — Universal, deterministic, schema-first
  *
- * Patch v6.0.5-wizard-rescan-after-click:
- * - Wizard: ALWAYS rescan after Next/Submit click and return needs_input if new required fields appear
- * - Wizard: make detectWizardSuccess() stricter (avoid false positives)
+ * Patch v6.0.6-universal-choices:
+ * - Wizard: scanWizardStep detects ALL button choice groups generically (not just gender)
+ * - Wizard: fillWizard matches ANY choice from data by group name/label
+ * - Wizard: buildWizardNeedPayload checks choice groups as missing_required
+ * - Added WizardChoiceGroup type for structured choice group handling
  * - Does NOT change kind=form flow besides select matching safety
  */
 
@@ -62,6 +64,14 @@ type WizardChoiceButton = {
   selector: string;
 };
 
+type WizardChoiceGroup = {
+  name: string;
+  label: string;
+  required: boolean;
+  type: "button_group" | "radio" | "select";
+  options: WizardChoiceButton[];
+};
+
 interface FormSchemaSubmit {
   text: string;
   selector_candidates: string[];
@@ -76,6 +86,13 @@ interface FormSchemaRow {
   fingerprint: string;
   schema: {
     fields?: FormSchemaField[];
+    choices?: Array<{
+      name: string;
+      label: string;
+      required: boolean;
+      type: string;
+      options: Array<{ value: string; label: string; selector_candidates?: string[] }>;
+    }>;
     submit?: FormSchemaSubmit | null;
     action?: string;
     method?: string;
@@ -702,20 +719,43 @@ class HotSessionManager {
       }
       if (filled > 0) didInteract = true;
 
-      // 2) Handle choice buttons
-      const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
-      if (gender && scanned.choices.length) {
-        const wanted = gender.toLowerCase();
+      // 2) Handle choice button groups (generic — matches any choice from data)
+      for (const group of scanned.choiceGroups) {
+        // Try to find the value for this choice group in data
+        // Look by group name, label, and common aliases
+        const groupNameNorm = normLabel(group.name);
+        let desiredValue = "";
+
+        // Direct lookup by group name/label
+        for (const k of Object.keys(data)) {
+          const kNorm = normLabel(k);
+          if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
+            desiredValue = String((data as any)[k] ?? "").trim();
+            break;
+          }
+        }
+
+        // Fallback: special aliases for common fields
+        if (!desiredValue && /пол|gender|sex/i.test(group.name)) {
+          desiredValue = String((data as any).gender || (data as any).sex || (data as any).pol || (data as any)["Пол"] || "").trim();
+        }
+
+        if (!desiredValue) continue;
+
+        const wantedNorm = normLabel(desiredValue);
         const pick =
-          scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
-          scanned.choices.find((c) => c.text.toLowerCase().includes(wanted));
+          group.options.find((c) => normLabel(c.text) === wantedNorm) ||
+          group.options.find((c) => normLabel(c.text).includes(wantedNorm) || wantedNorm.includes(normLabel(c.text)));
+
         if (pick) {
           const clicked = await this.safeClick(page, pick.selector);
-          console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
+          console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
           if (clicked) {
-            actions.push(`Пол: ${pick.text}`);
+            actions.push(`${group.name}: ${pick.text}`);
             didInteract = true;
           }
+        } else {
+          console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
         }
       }
 
@@ -852,7 +892,7 @@ class HotSessionManager {
     return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
   }
 
-  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[] }, data: Record<string, unknown>) {
+  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }, data: Record<string, unknown>) {
     const missing_required: Array<{
       label: string;
       type: string;
@@ -873,6 +913,37 @@ class HotSessionManager {
       }
     }
 
+    // ✅ Also check choice groups for missing required values
+    for (const group of scanned.choiceGroups) {
+      if (!group.required) continue;
+
+      const groupNameNorm = normLabel(group.name);
+      let hasValue = false;
+
+      for (const k of Object.keys(data)) {
+        const kNorm = normLabel(k);
+        if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
+          const v = String((data as any)[k] ?? "").trim();
+          if (v) { hasValue = true; break; }
+        }
+      }
+
+      // Fallback aliases
+      if (!hasValue && /пол|gender|sex/i.test(group.name)) {
+        const v = String((data as any).gender || (data as any).sex || (data as any).pol || (data as any)["Пол"] || "").trim();
+        if (v) hasValue = true;
+      }
+
+      if (!hasValue) {
+        missing_required.push({
+          label: group.label || group.name,
+          type: "button_group",
+          selector: group.options[0]?.selector || "",
+          options: group.options.map(o => ({ value: o.text, label: o.text })),
+        });
+      }
+    }
+
     const fields = scanned.fields.map((f) => ({
       tag: f.tag,
       type: f.type,
@@ -887,7 +958,7 @@ class HotSessionManager {
       options: f.options,
     }));
 
-    return { missing_required, fields, choices: scanned.choices };
+    return { missing_required, fields, choices: scanned.choices, choiceGroups: scanned.choiceGroups };
   }
 
   private async detectWizardMissingByDom(page: Page, fields: WizardScannedField[]): Promise<string[]> {
@@ -1150,7 +1221,7 @@ class HotSessionManager {
     return { clicked: false, text: "" };
   }
 
-  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[] }> {
+  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }> {
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
         const style = window.getComputedStyle(el as any);
@@ -1296,16 +1367,123 @@ class HotSessionManager {
           };
         });
 
-      const btns = Array.from(document.querySelectorAll("button, [role='button']"))
-        .filter((el) => isVisible(el))
-        .map((el) => {
-          const t = (el.textContent || "").trim();
-          return { text: t, selector: getSelector(el) };
-        })
-        .filter((b) => ["мъж", "жена"].includes((b.text || "").trim().toLowerCase()))
-        .slice(0, 6);
+      const btns: Array<{ text: string; selector: string; groupLabel: string; required: boolean }> = [];
 
-      return { fields, choices: btns };
+      // Detect button-based choice groups: containers with 2+ sibling buttons
+      const seenContainers = new Set<Element>();
+      const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+
+      document.querySelectorAll("button, [role='button']").forEach((btn) => {
+        if (!isVisible(btn)) return;
+        const parent = btn.parentElement;
+        if (!parent || seenContainers.has(parent)) return;
+
+        // Get sibling buttons in this container
+        const siblingBtns = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
+          .filter((b) => isVisible(b));
+
+        if (siblingBtns.length < 2) return;
+
+        // Filter out nav/submit buttons
+        const optionBtns = siblingBtns.filter((b) => {
+          const t = ((b as any).textContent || "").trim();
+          return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
+        });
+
+        if (optionBtns.length < 2) return;
+        seenContainers.add(parent);
+
+        // Find group label from preceding element or parent
+        let groupLabel = "";
+        const prevSib = parent.previousElementSibling as HTMLElement | null;
+        if (prevSib) {
+          const t = (prevSib.textContent || "").trim();
+          if (t.length >= 2 && t.length <= 60) groupLabel = t;
+        }
+        if (!groupLabel) {
+          // Try label inside parent's parent
+          const grandParent = parent.parentElement;
+          if (grandParent) {
+            const lab = grandParent.querySelector("label, [class*='label']") as HTMLElement | null;
+            if (lab) {
+              const t = (lab.textContent || "").trim();
+              if (t.length >= 2 && t.length <= 60) groupLabel = t;
+            }
+          }
+        }
+
+        const isRequired = /\*|задължително|required/i.test(groupLabel);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+
+        optionBtns.forEach((b) => {
+          const text = ((b as any).textContent || "").trim();
+          btns.push({
+            text,
+            selector: getSelector(b),
+            groupLabel: cleanLabel || "button_choice",
+            required: isRequired,
+          });
+        });
+      });
+
+      // Also detect radio-like buttons: [role="radio"], button[aria-pressed]
+      document.querySelectorAll('[role="radio"], button[aria-pressed]').forEach((btn) => {
+        if (!isVisible(btn)) return;
+        const text = ((btn as any).textContent || "").trim();
+        if (!text || text.length < 1 || text.length > 30) return;
+        if (submitRe.test(text)) return;
+
+        const parent = btn.parentElement;
+        let groupLabel = "";
+        if (parent) {
+          const prevSib = parent.previousElementSibling as HTMLElement | null;
+          if (prevSib) {
+            const t = (prevSib.textContent || "").trim();
+            if (t.length >= 2 && t.length <= 60) groupLabel = t;
+          }
+        }
+
+        const isRequired = /\*|задължително|required/i.test(groupLabel);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+
+        // Avoid duplicate
+        if (btns.some((b) => b.selector === getSelector(btn))) return;
+
+        btns.push({
+          text,
+          selector: getSelector(btn),
+          groupLabel: cleanLabel || "button_choice",
+          required: isRequired,
+        });
+      });
+
+      // Group buttons by groupLabel
+      const choiceGroups: Array<{
+        name: string;
+        label: string;
+        required: boolean;
+        type: "button_group";
+        options: Array<{ text: string; selector: string }>;
+      }> = [];
+
+      const groupMap = new Map<string, typeof btns>();
+      for (const b of btns) {
+        const key = b.groupLabel;
+        if (!groupMap.has(key)) groupMap.set(key, []);
+        groupMap.get(key)!.push(b);
+      }
+
+      for (const [name, items] of groupMap) {
+        choiceGroups.push({
+          name,
+          label: name,
+          required: items.some((i) => i.required),
+          type: "button_group",
+          options: items.map((i) => ({ text: i.text, selector: i.selector })),
+        });
+      }
+
+      return { fields, choices: btns, choiceGroups };
     });
   }
 
@@ -1779,7 +1957,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.5-wizard-rescan-after-click", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.6-universal-choices", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -1848,7 +2026,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.5-wizard-rescan-after-click listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.6-universal-choices listening on :${PORT}`);
   });
 
   await manager.start();
