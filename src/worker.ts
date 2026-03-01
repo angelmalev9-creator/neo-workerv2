@@ -735,9 +735,22 @@ class HotSessionManager {
           }
         }
 
-        // Fallback: special aliases for common fields
-        if (!desiredValue && /пол|gender|sex/i.test(group.name)) {
-          desiredValue = String((data as any).gender || (data as any).sex || (data as any).pol || (data as any)["Пол"] || "").trim();
+        // Fallback: if no direct key match, check if any data VALUE matches an option text
+        // e.g. data has "Пол (избор: Мъж / Жена)": "Мъж" — the key won't match group.name directly
+        if (!desiredValue) {
+          for (const k of Object.keys(data)) {
+            const v = String((data as any)[k] ?? "").trim();
+            if (!v) continue;
+            const vNorm = normLabel(v);
+            // Check if this value matches one of the group's option texts
+            const optMatch = group.options.some(
+              (o) => normLabel(o.text) === vNorm || normLabel(o.text).includes(vNorm) || vNorm.includes(normLabel(o.text))
+            );
+            if (optMatch) {
+              desiredValue = v;
+              break;
+            }
+          }
         }
 
         if (!desiredValue) continue;
@@ -834,6 +847,15 @@ class HotSessionManager {
         }
 
         // ✅ Only after we confirmed no missing required, check success (stricter)
+        // CRITICAL: Before declaring success, check if there are visible EMPTY fields in DOM.
+        // Multi-step wizards show new empty fields after "Напред" — that's a new step, NOT success.
+        const unfilled = await this.countUnfilledVisibleFields(page);
+        if (unfilled.count > 0) {
+          console.log(`[WIZARD] step=${step} after click: ${unfilled.count} unfilled visible fields (${unfilled.labels.join(", ")}) — NOT success, continuing`);
+          // Loop will re-scan, fill what it can, and ask for what it can't
+          continue;
+        }
+
         if (await this.detectWizardSuccess(page)) {
           const obs = await this.quickObserve(page);
           console.log(`[WIZARD] success detected after click at step=${step}`);
@@ -928,10 +950,17 @@ class HotSessionManager {
         }
       }
 
-      // Fallback aliases
-      if (!hasValue && /пол|gender|sex/i.test(group.name)) {
-        const v = String((data as any).gender || (data as any).sex || (data as any).pol || (data as any)["Пол"] || "").trim();
-        if (v) hasValue = true;
+      // Fallback: check if any data value matches an option text
+      if (!hasValue) {
+        for (const k of Object.keys(data)) {
+          const v = String((data as any)[k] ?? "").trim();
+          if (!v) continue;
+          const vNorm = normLabel(v);
+          const optMatch = group.options.some(
+            (o) => normLabel(o.text) === vNorm || normLabel(o.text).includes(vNorm) || vNorm.includes(normLabel(o.text))
+          );
+          if (optMatch) { hasValue = true; break; }
+        }
       }
 
       if (!hasValue) {
@@ -1537,6 +1566,69 @@ class HotSessionManager {
       );
     } catch {
       await page.waitForTimeout(900).catch(() => {});
+    }
+  }
+
+  // ✅ Count visible fields that are currently EMPTY in the DOM
+  // Used after clicking Next to detect new wizard steps (empty fields = new step, not success)
+  private async countUnfilledVisibleFields(page: Page): Promise<{ count: number; labels: string[] }> {
+    try {
+      return await page.evaluate(() => {
+        const isVisible = (el: Element) => {
+          const style = window.getComputedStyle(el as any);
+          if (!style) return false;
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const r = (el as any).getBoundingClientRect?.();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+
+        const getLabel = (el: Element) => {
+          const any = el as any;
+          const id = any.id ? String(any.id) : "";
+          if (id) {
+            const lab = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
+            if (lab && lab.textContent) return lab.textContent.trim();
+          }
+          let p: Element | null = el;
+          for (let i = 0; i < 3; i++) {
+            if (!p) break;
+            p = p.parentElement;
+            if (p) {
+              const lab = p.querySelector?.("label") as HTMLElement | null;
+              if (lab && lab.textContent) return lab.textContent.trim();
+            }
+          }
+          return any.placeholder || any.name || any.type || "field";
+        };
+
+        const emptyFields: string[] = [];
+
+        document.querySelectorAll("input, textarea, select").forEach((el: any) => {
+          if (!isVisible(el)) return;
+          const tag = (el.tagName || "").toLowerCase();
+          const type = (el.type || "").toLowerCase();
+
+          // Skip non-fillable types
+          if (["hidden", "submit", "button", "image", "reset", "file"].includes(type)) return;
+          if (el.disabled) return;
+          if (el.getAttribute?.("aria-hidden") === "true") return;
+
+          // Check if empty
+          if (type === "checkbox" || type === "radio") {
+            // For radio/checkbox, skip — they're handled by choice groups
+            return;
+          }
+
+          const val = (el.value || "").toString().trim();
+          if (!val) {
+            emptyFields.push(getLabel(el));
+          }
+        });
+
+        return { count: emptyFields.length, labels: emptyFields.slice(0, 10) };
+      });
+    } catch {
+      return { count: 0, labels: [] };
     }
   }
 
