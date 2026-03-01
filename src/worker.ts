@@ -1,10 +1,10 @@
 /**
- * NEO WORKER v6.0.5-wizard-rescan
+ * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
  *
- * Patch:
- * - Wizard: after clicking NEXT, always rescan and compute missing; NEVER return success on NEXT.
- * - Wizard: success detection only after SUBMIT, or after rescan shows no fields + success markers.
- * - Keeps strict_select behavior for <select> from previous patch.
+ * Patch v6.0.5-wizard-rescan-after-click:
+ * - Wizard: ALWAYS rescan after Next/Submit click and return needs_input if new required fields appear
+ * - Wizard: make detectWizardSuccess() stricter (avoid false positives)
+ * - Does NOT change kind=form flow besides select matching safety
  */
 
 import express, { Request, Response } from "express";
@@ -300,8 +300,8 @@ function planOptionScore(opt: { value: string; label: string }, intent: string):
   }
   if (intent === "advanced") {
     if (hay.includes("standarten") || hay.includes("стандарт")) return 100;
-    if (hay.includes("premium") || hay.includes("премиум")) return 60;
     if (hay.includes("startov") || hay.includes("стартов")) return 40;
+    if (hay.includes("premium") || hay.includes("премиум")) return 60;
   }
   if (intent === "ultimate") {
     if (hay.includes("premium") || hay.includes("премиум") || hay.includes("индивидуал")) return 100;
@@ -464,6 +464,10 @@ class HotSessionManager {
     return schemas;
   }
 
+  // ─────────────────────────────────────────────────────────
+  // /fill-form
+  // ─────────────────────────────────────────────────────────
+
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
     const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
     const autoSubmit = request.auto_submit !== false;
@@ -507,6 +511,10 @@ class HotSessionManager {
 
     return { success: !!result.ok, message: result.message, observation: result.observation };
   }
+
+  // ─────────────────────────────────────────────────────────
+  // /execute (legacy)
+  // ─────────────────────────────────────────────────────────
 
   async execute(req: ExecuteRequest): Promise<{ success: boolean; message: string; observation?: JsonObj; form_schemas?: FormSchemaRow[] }> {
     const { site_id, session_id, data } = req;
@@ -554,6 +562,10 @@ class HotSessionManager {
     }
   }
 
+  // ─────────────────────────────────────────────────────────
+  // Filling logic
+  // ─────────────────────────────────────────────────────────
+
   private matchFieldValue(field: FormSchemaField, data: Record<string, unknown>): string | undefined {
     if (field.name && data[field.name] !== undefined) return String(data[field.name]);
 
@@ -564,10 +576,6 @@ class HotSessionManager {
 
     return undefined;
   }
-
-  // ─────────────────────────────────────────────────────────
-  // FORM (unchanged logic from previous patch, omitted here for brevity in comments)
-  // ─────────────────────────────────────────────────────────
 
   private async fillFormSchema(
     page: Page,
@@ -637,7 +645,7 @@ class HotSessionManager {
     }
 
     const obs = await this.quickObserve(page);
-    (obs as any).submit = submitInfo;
+    obs.submit = submitInfo;
 
     return {
       ok: autoSubmit ? submitClicked : true,
@@ -645,10 +653,6 @@ class HotSessionManager {
       observation: obs,
     };
   }
-
-  // ─────────────────────────────────────────────────────────
-  // WIZARD (patched)
-  // ─────────────────────────────────────────────────────────
 
   private async fillWizard(
     page: Page,
@@ -658,7 +662,7 @@ class HotSessionManager {
     strictSelect = false
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const actions: string[] = [];
-    const maxSteps = 10;
+    const maxSteps = 8;
 
     const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
     if (!hasAnyData) {
@@ -666,6 +670,8 @@ class HotSessionManager {
       (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
       return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
     }
+
+    let didInteract = false;
 
     console.log(`[WIZARD] start url=${page.url()}`);
 
@@ -694,8 +700,26 @@ class HotSessionManager {
           actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
         }
       }
+      if (filled > 0) didInteract = true;
 
-      // 2) Missing required (payload + DOM verification)
+      // 2) Handle choice buttons
+      const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
+      if (gender && scanned.choices.length) {
+        const wanted = gender.toLowerCase();
+        const pick =
+          scanned.choices.find((c) => c.text.toLowerCase() === wanted) ||
+          scanned.choices.find((c) => c.text.toLowerCase().includes(wanted));
+        if (pick) {
+          const clicked = await this.safeClick(page, pick.selector);
+          console.log(`[WIZARD][CHOICE] gender="${gender}" picked="${pick.text}" clicked=${clicked}`);
+          if (clicked) {
+            actions.push(`Пол: ${pick.text}`);
+            didInteract = true;
+          }
+        }
+      }
+
+      // 2.5) Missing required: payload-based + DOM verification fallback
       let needNow = this.buildWizardNeedPayload(scanned, data);
       if (needNow.missing_required.length > 0) {
         const domMissing = await this.detectWizardMissingByDom(page, scanned.fields);
@@ -725,40 +749,36 @@ class HotSessionManager {
         return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
       }
 
-      // 3) Click NEXT or SUBMIT
+      // 3) Decide Next vs Submit
       const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
       console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
 
-      if (!clicked.clicked) {
-        const invalid = await this.getInvalidFields(page);
-        const obs = await this.quickObserve(page);
-        (obs as any).wizard = { step, filled, invalid_fields: invalid, note: "No next/submit button detected" };
-        return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон", observation: obs };
-      }
+      if (clicked.clicked) {
+        didInteract = true;
+        actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
 
-      // 4) Always wait + RESCAN after click
-      await this.waitForWizardStepChange(page, beforeSig);
+        // ✅ Wait and then ALWAYS rescan
+        await this.waitForWizardStepChange(page, beforeSig);
 
-      const afterSig = await this.getWizardDomSignature(page);
-      const nextScanned = await this.scanWizardStep(page);
+        const afterSig = await this.getWizardDomSignature(page);
+        const nextScanned = await this.scanWizardStep(page);
 
-      // 4.1) If NEXT: DO NOT claim success. Instead compute missing and return needs_input if needed.
-      let nextNeed = this.buildWizardNeedPayload(nextScanned, data);
-      if (nextNeed.missing_required.length > 0) {
-        const domMissing2 = await this.detectWizardMissingByDom(page, nextScanned.fields);
-        if (domMissing2.length === 0) {
-          nextNeed = { ...nextNeed, missing_required: [] };
-        } else {
-          nextNeed = {
-            ...nextNeed,
-            missing_required: nextNeed.missing_required.filter((m) =>
-              domMissing2.some((x) => labelSoftIncludes(x, m.label))
-            ),
-          };
+        // ✅ If next step introduces new required fields -> needs_input (NO fake success)
+        let nextNeed = this.buildWizardNeedPayload(nextScanned, data);
+        if (nextNeed.missing_required.length > 0) {
+          const domMissing2 = await this.detectWizardMissingByDom(page, nextScanned.fields);
+          if (domMissing2.length === 0) {
+            nextNeed = { ...nextNeed, missing_required: [] };
+          } else {
+            nextNeed = {
+              ...nextNeed,
+              missing_required: nextNeed.missing_required.filter((m) =>
+                domMissing2.some((x) => labelSoftIncludes(x, m.label))
+              ),
+            };
+          }
         }
-      }
 
-      if (clicked.kind === "next") {
         if (nextNeed.missing_required.length > 0) {
           const obs = await this.quickObserve(page);
           (obs as any).needs_input = true;
@@ -769,59 +789,54 @@ class HotSessionManager {
             advanced: beforeSig !== afterSig,
             last_clicked: { kind: clicked.kind, text: clicked.text },
           };
-          console.log(`[WIZARD] needs_input after NEXT step=${step} missing=${nextNeed.missing_required.length}`);
+          console.log(`[WIZARD] needs_input after click step=${step} missing=${nextNeed.missing_required.length}`);
           return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
         }
 
-        // No missing -> continue loop to fill next step (even if fields appear later)
-        actions.push("Кликнах Напред");
+        // ✅ Only after we confirmed no missing required, check success (stricter)
+        if (await this.detectWizardSuccess(page)) {
+          const obs = await this.quickObserve(page);
+          console.log(`[WIZARD] success detected after click at step=${step}`);
+          return {
+            ok: true,
+            message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено",
+            observation: obs
+          };
+        }
+
+        if (!autoSubmit) {
+          const obs = await this.quickObserve(page);
+          (obs as any).wizard_next = {
+            ...nextNeed,
+            step: Math.min(step + 1, maxSteps),
+            total_steps: maxSteps,
+            advanced: beforeSig !== afterSig,
+            last_clicked: { kind: clicked.kind, text: clicked.text },
+          };
+          return { ok: false, message: "Wizard: следваща стъпка е готова", observation: obs };
+        }
+
         continue;
       }
 
-      // 4.2) If SUBMIT: then and only then try success detection
-      actions.push("Кликнах Изпрати");
-
-      const success = await this.detectWizardSuccess(page);
-      if (success) {
-        // extra safety: if there are still required fields visible, do not claim success
-        if (nextNeed.missing_required.length === 0) {
-          const obs = await this.quickObserve(page);
-          console.log(`[WIZARD] success detected after SUBMIT at step=${step}`);
-          return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
-        }
+      const invalid = await this.getInvalidFields(page);
+      if (invalid.length) {
+        actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
       }
 
-      // If submit didn't succeed, but needs more fields, ask for them
-      if (nextNeed.missing_required.length > 0) {
-        const obs = await this.quickObserve(page);
-        (obs as any).needs_input = true;
-        (obs as any).wizard_next = {
-          ...nextNeed,
-          step: Math.min(step + 1, maxSteps),
-          total_steps: maxSteps,
-          advanced: beforeSig !== afterSig,
-          last_clicked: { kind: clicked.kind, text: clicked.text },
-        };
-        console.log(`[WIZARD] needs_input after SUBMIT step=${step} missing=${nextNeed.missing_required.length}`);
-        return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
-      }
-
-      // If submit clicked but no success markers and no missing, keep going a bit (some sites redirect)
-      await page.waitForTimeout(800).catch(() => {});
-      const success2 = await this.detectWizardSuccess(page);
-      if (success2) {
-        const obs = await this.quickObserve(page);
-        console.log(`[WIZARD] success detected after SUBMIT retry at step=${step}`);
-        return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
-      }
-
-      // Otherwise: stop with observation
       const obs = await this.quickObserve(page);
       (obs as any).wizard = {
         step,
-        note: "Submit clicked but no success markers",
+        filled,
+        invalid_fields: invalid,
+        note: "No next/submit button detected",
       };
-      return { ok: false, message: "Wizard: натиснах Изпрати, но не виждам потвърждение", observation: obs };
+
+      return {
+        ok: false,
+        message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон",
+        observation: obs,
+      };
     }
 
     const obs = await this.quickObserve(page);
@@ -830,7 +845,7 @@ class HotSessionManager {
   }
 
   // ─────────────────────────────────────────────────────────
-  // Wizard helpers (same as before)
+  // Wizard helpers
   // ─────────────────────────────────────────────────────────
 
   private wizardFieldText(f: WizardScannedField): string {
@@ -838,7 +853,12 @@ class HotSessionManager {
   }
 
   private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[] }, data: Record<string, unknown>) {
-    const missing_required: Array<{ label: string; type: string; selector: string; options?: { value: string; label: string }[] }> = [];
+    const missing_required: Array<{
+      label: string;
+      type: string;
+      selector: string;
+      options?: { value: string; label: string }[];
+    }> = [];
 
     for (const f of scanned.fields) {
       if (!f.required) continue;
@@ -926,11 +946,21 @@ class HotSessionManager {
       return null;
     };
 
-    if ((f.type || "").includes("email") || txt.includes("имейл") || txt.includes("e-mail")) return pickByKeys(["email", "e_mail", "mail"]);
-    if ((f.type || "").includes("tel") || txt.includes("тел") || txt.includes("phone") || txt.includes("gsm")) return pickByKeys(["phone", "tel", "telephone", "gsm"]);
-    if ((f.type || "").includes("number") || txt.includes("възраст") || txt.includes("age")) return pickByKeys(["age", "years", "възраст"]);
-    if (txt.includes("име") || txt.includes("name")) return pickByKeys(["name", "full_name", "fullname", "first_name", "last_name", "names"]);
-    if (txt.includes("съобщ") || txt.includes("message") || txt.includes("коментар") || txt.includes("note")) return pickByKeys(["message", "comment", "note", "details"]);
+    if ((f.type || "").includes("email") || txt.includes("имейл") || txt.includes("e-mail")) {
+      return pickByKeys(["email", "e_mail", "mail"]);
+    }
+    if ((f.type || "").includes("tel") || txt.includes("тел") || txt.includes("phone") || txt.includes("gsm")) {
+      return pickByKeys(["phone", "tel", "telephone", "gsm"]);
+    }
+    if ((f.type || "").includes("number") || txt.includes("възраст") || txt.includes("age")) {
+      return pickByKeys(["age", "years", "възраст"]);
+    }
+    if (txt.includes("име") || txt.includes("name")) {
+      return pickByKeys(["name", "full_name", "fullname", "first_name", "last_name", "names"]);
+    }
+    if (txt.includes("съобщ") || txt.includes("message") || txt.includes("коментар") || txt.includes("note")) {
+      return pickByKeys(["message", "comment", "note", "details"]);
+    }
 
     const fLabel = f.label || f.aria_label || f.placeholder || f.name || f.id;
     for (const k of Object.keys(data || {})) {
@@ -939,7 +969,9 @@ class HotSessionManager {
       const s = typeof v === "string" ? v : String(v);
       if (!s.trim()) continue;
 
-      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(txt, k)) return { key: k, value: s.trim() };
+      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(txt, k)) {
+        return { key: k, value: s.trim() };
+      }
     }
 
     return null;
@@ -983,7 +1015,9 @@ class HotSessionManager {
       const s = typeof v === "string" ? v : String(v);
       if (!s.trim()) continue;
 
-      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(t, k)) return s.trim();
+      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(t, k)) {
+        return s.trim();
+      }
     }
 
     for (const k of Object.keys(data || {})) {
@@ -1033,6 +1067,20 @@ class HotSessionManager {
 
     console.log(`[WIZARD][FILL][GIVEUP] label="${f.label}"`);
     return false;
+  }
+
+  private async safeClick(page: Page, selector: string): Promise<boolean> {
+    try {
+      const el = await page.$(selector);
+      if (!el) return false;
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) return false;
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 2500, force: true });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async clickWizardNextOrSubmit(
@@ -1103,7 +1151,6 @@ class HotSessionManager {
   }
 
   private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[] }> {
-    // same as previous version (kept)
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
         const style = window.getComputedStyle(el as any);
@@ -1315,21 +1362,47 @@ class HotSessionManager {
     }
   }
 
+  // ✅ stricter success: require success keywords AND no visible inputs/selects/textarea OR URL indicates thanks
   private async detectWizardSuccess(page: Page): Promise<boolean> {
     try {
       return await page.evaluate(() => {
+        const url = (location.href || "").toLowerCase();
+        const urlSuccess = ["thank", "thanks", "success", "submitted", "thank-you", "blagodar", "благодар"].some((x) => url.includes(x));
+
         const txt = (document.body?.innerText || "").toLowerCase();
         const hits = ["благодар", "успеш", "изпрат", "thank you", "success", "submitted"];
-        return hits.some((h) => txt.includes(h));
+        const textSuccess = hits.some((h) => txt.includes(h));
+
+        const isVisible = (el: Element) => {
+          const style = window.getComputedStyle(el as any);
+          if (!style) return false;
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const r = (el as any).getBoundingClientRect?.();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+
+        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+          .filter((el: any) => {
+            if (!isVisible(el)) return false;
+            const tag = (el.tagName || "").toLowerCase();
+            if (tag === "input") {
+              const type = (el.type || "").toLowerCase();
+              if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+            }
+            if (el.disabled) return false;
+            if (el.getAttribute?.("aria-hidden") === "true") return false;
+            return true;
+          });
+
+        // If there are still visible form fields, don't call it success unless URL is clearly a thank-you page
+        if (inputs.length > 0 && !urlSuccess) return false;
+
+        return Boolean(urlSuccess || textSuccess);
       });
     } catch {
       return false;
     }
   }
-
-  // ─────────────────────────────────────────────────────────
-  // Select + submit helpers (same as previous patched version)
-  // ─────────────────────────────────────────────────────────
 
   private async fillSingleField(page: Page, f: FormSchemaField, value: string, strictSelect: boolean): Promise<string | null> {
     const selectors = [
@@ -1385,17 +1458,22 @@ class HotSessionManager {
     const desiredRaw = String(desired || "").trim();
     const wanted = normSelectText(desiredRaw);
 
-    const options = await page.evaluate<{ value: string; label: string }[], { sel: string }>(({ sel }) => {
+    const options = await page.evaluate<
+      { value: string; label: string }[],
+      { sel: string }
+    >(({ sel }: { sel: string }) => {
       const el = document.querySelector(sel) as HTMLSelectElement | null;
       if (!el) return [];
-      return Array.from(el.options).map((o) => ({
+      return Array.from(el.options).map((o: HTMLOptionElement) => ({
         value: (o.value || "").toString(),
-        label: (o.textContent || "").trim(),
+        label: (o.textContent || "").trim()
       }));
     }, { sel: selectSelector });
 
     console.log(`[SELECT] selector=${selectSelector} desired="${desiredRaw}" options=${options.length} strict=${strictSelect}`);
-    for (const o of options.slice(0, 20)) console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
+    for (const o of options.slice(0, 20)) {
+      console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
+    }
 
     const nonEmpty = options.filter((o) => (o.value || "").trim() !== "");
 
@@ -1403,14 +1481,17 @@ class HotSessionManager {
       const idx = Math.max(1, parseInt(wanted, 10));
       const candidate = nonEmpty[idx - 1];
       if (candidate) {
-        const ok = await page.evaluate(({ sel, v }) => {
-          const el = document.querySelector(sel) as HTMLSelectElement | null;
-          if (!el) return false;
-          el.value = v;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-          return true;
-        }, { sel: selectSelector, v: candidate.value });
+        const ok = await page.evaluate<boolean, { sel: string; v: string }>(
+          ({ sel, v }) => {
+            const el = document.querySelector(sel) as HTMLSelectElement | null;
+            if (!el) return false;
+            el.value = v;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          },
+          { sel: selectSelector, v: candidate.value }
+        );
         console.log(`[SELECT] picked(numeric) value="${candidate.value}" label="${candidate.label}" ok=${ok}`);
         return ok;
       }
@@ -1439,23 +1520,33 @@ class HotSessionManager {
       return false;
     }
 
-    if (!picked) picked = nonEmpty[0];
+    if (!picked) {
+      picked = nonEmpty[0];
+    }
+
     if (!picked || !String(picked.value || "").trim()) return false;
 
-    const ok = await page.evaluate(({ sel, v }) => {
-      const el = document.querySelector(sel) as HTMLSelectElement | null;
-      if (!el) return false;
-      el.value = v;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    }, { sel: selectSelector, v: picked.value });
+    const ok = await page.evaluate<boolean, { sel: string; v: string }>(
+      ({ sel, v }) => {
+        const el = document.querySelector(sel) as HTMLSelectElement | null;
+        if (!el) return false;
+        el.value = v;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      },
+      { sel: selectSelector, v: picked.value }
+    );
 
     console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
     return ok;
   }
 
-  private async uploadFile(page: Page, fields: FormSchemaField[], file: NonNullable<FillFormRequest["file"]>): Promise<boolean> {
+  private async uploadFile(
+    page: Page,
+    fields: FormSchemaField[],
+    file: NonNullable<FillFormRequest["file"]>
+  ): Promise<boolean> {
     const fs = await import("fs");
     const tmpPath = `/tmp/upload_${Date.now()}_${file.filename}`;
 
@@ -1491,25 +1582,51 @@ class HotSessionManager {
     }
   }
 
-  private async getInvalidFields(page: Page): Promise<string[]> {
-    const invalid = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("input:invalid, textarea:invalid, select:invalid")) as any[];
-      return els.slice(0, 20).map(el => el.name || el.id || el.getAttribute("aria-label") || el.tagName.toLowerCase());
-    }).catch(() => []);
-    return Array.isArray(invalid) ? invalid : [];
+  private async clickBySelectors(page: Page, selectors: string[], debug: string[]): Promise<boolean> {
+    for (const sel of selectors) {
+      if (!sel) continue;
+      try {
+        const el = await page.$(sel);
+        if (!el) { debug.push(`miss:${sel}`); continue; }
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) { debug.push(`hidden:${sel}`); continue; }
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 3000, force: true });
+        debug.push(`clicked:${sel}`);
+        return true;
+      } catch {
+        debug.push(`fail:${sel}`);
+      }
+    }
+    return false;
   }
 
-  private async trySubmitUniversal(
-    page: Page,
-    schema?: FormSchemaRow,
-    filledSelectors: string[] = []
-  ): Promise<{ attempted: boolean; clicked: boolean; method: string; debug: string[] }> {
-    // unchanged from previous version (you already have it working)
-    const debug: string[] = [];
-    const attempted = true;
+  private async clickByTextHeuristic(page: Page, text: string, debug: string[]): Promise<boolean> {
+    const t = (text || "").trim();
+    if (!t) return false;
 
-    const clickSubmitWithinClosestForm = async (anchorSelector: string) => {
-      const ok = await page.evaluate(({ sel }) => {
+    const candidates = [
+      `button:has-text("${t}")`,
+      `a:has-text("${t}")`,
+      `input[type="submit"][value*="${t}"]`,
+      `text="${t}"`,
+    ];
+
+    for (const sel of candidates) {
+      try {
+        await page.click(sel, { timeout: 2500, force: true });
+        debug.push(`clicked_text:${sel}`);
+        return true;
+      } catch {
+        debug.push(`fail_text:${sel}`);
+      }
+    }
+    return false;
+  }
+
+  private async clickSubmitWithinClosestForm(page: Page, anchorSelector: string, debug: string[]): Promise<boolean> {
+    const ok = await page.evaluate<boolean, { sel: string }>(
+      ({ sel }) => {
         const anchor = document.querySelector(sel) as HTMLElement | null;
         if (!anchor) return false;
         const form = anchor.closest("form") as HTMLFormElement | null;
@@ -1528,65 +1645,43 @@ class HotSessionManager {
         }
         form.submit();
         return true;
-      }, { sel: anchorSelector });
+      },
+      { sel: anchorSelector }
+    );
 
-      debug.push(ok ? `closest_form:ok:${anchorSelector}` : `closest_form:miss:${anchorSelector}`);
-      return ok;
-    };
+    debug.push(ok ? `closest_form:ok:${anchorSelector}` : `closest_form:miss:${anchorSelector}`);
+    return ok;
+  }
+
+  private async getInvalidFields(page: Page): Promise<string[]> {
+    const invalid = await page
+      .evaluate<string[]>(() => {
+        const els = Array.from(document.querySelectorAll("input:invalid, textarea:invalid, select:invalid")) as any[];
+        return els.slice(0, 20).map(el => el.name || el.id || el.getAttribute("aria-label") || el.tagName.toLowerCase());
+      })
+      .catch(() => []);
+    return Array.isArray(invalid) ? invalid : [];
+  }
+
+  private async trySubmitUniversal(
+    page: Page,
+    schema?: FormSchemaRow,
+    filledSelectors: string[] = []
+  ): Promise<{ attempted: boolean; clicked: boolean; method: string; debug: string[] }> {
+    const debug: string[] = [];
+    const attempted = true;
 
     for (const a of filledSelectors.slice(0, 3)) {
-      const ok = await clickSubmitWithinClosestForm(a);
+      const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
       if (ok) {
         await page.waitForTimeout(700).catch(() => {});
         return { attempted, clicked: true, method: "closest_form", debug };
       }
     }
 
-    const clickBySelectors = async (selectors: string[]) => {
-      for (const sel of selectors) {
-        if (!sel) continue;
-        try {
-          const el = await page.$(sel);
-          if (!el) { debug.push(`miss:${sel}`); continue; }
-          const visible = await el.isVisible().catch(() => false);
-          if (!visible) { debug.push(`hidden:${sel}`); continue; }
-          await el.scrollIntoViewIfNeeded().catch(() => {});
-          await el.click({ timeout: 3000, force: true });
-          debug.push(`clicked:${sel}`);
-          return true;
-        } catch {
-          debug.push(`fail:${sel}`);
-        }
-      }
-      return false;
-    };
-
-    const clickByTextHeuristic = async (text: string) => {
-      const t = (text || "").trim();
-      if (!t) return false;
-
-      const candidates = [
-        `button:has-text("${t}")`,
-        `a:has-text("${t}")`,
-        `input[type="submit"][value*="${t}"]`,
-        `text="${t}"`,
-      ];
-
-      for (const sel of candidates) {
-        try {
-          await page.click(sel, { timeout: 2500, force: true });
-          debug.push(`clicked_text:${sel}`);
-          return true;
-        } catch {
-          debug.push(`fail_text:${sel}`);
-        }
-      }
-      return false;
-    };
-
     const schemaSelectors = schema?.schema.submit?.selector_candidates || [];
     if (schemaSelectors.length) {
-      const ok = await clickBySelectors(schemaSelectors);
+      const ok = await this.clickBySelectors(page, schemaSelectors, debug);
       if (ok) {
         await page.waitForTimeout(700).catch(() => {});
         return { attempted, clicked: true, method: "schema.selector_candidates", debug };
@@ -1595,7 +1690,7 @@ class HotSessionManager {
 
     const submitText = (schema?.schema.submit?.text || "").trim();
     if (submitText) {
-      const ok = await clickByTextHeuristic(submitText);
+      const ok = await this.clickByTextHeuristic(page, submitText, debug);
       if (ok) {
         await page.waitForTimeout(700).catch(() => {});
         return { attempted, clicked: true, method: "schema.text", debug };
@@ -1610,7 +1705,7 @@ class HotSessionManager {
       'button:has-text("Send")',
     ];
     {
-      const ok = await clickBySelectors(universalSelectors);
+      const ok = await this.clickBySelectors(page, universalSelectors, debug);
       if (ok) {
         await page.waitForTimeout(700).catch(() => {});
         return { attempted, clicked: true, method: "universal_selectors", debug };
@@ -1618,7 +1713,7 @@ class HotSessionManager {
     }
 
     try {
-      const ok = await page.evaluate(() => {
+      const ok = await page.evaluate<boolean>(() => {
         const form = document.querySelector("form") as any;
         if (!form) return false;
         if (typeof form.requestSubmit === "function") { form.requestSubmit(); return true; }
@@ -1684,7 +1779,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.5-wizard-rescan", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.5-wizard-rescan-after-click", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -1714,8 +1809,46 @@ async function main() {
     res.json(r);
   });
 
+  app.post("/execute", async (req: Request, res: Response) => {
+    const { site_id, session_id, keywords, data } = req.body || {};
+    if (!site_id || !Array.isArray(keywords)) return res.json({ success: false, message: "Invalid request" });
+
+    const r = await manager.execute({
+      site_id: String(site_id),
+      session_id: session_id ? String(session_id) : undefined,
+      keywords,
+      data: (data || undefined) as any,
+    });
+    res.json(r);
+  });
+
+  app.get("/forms/:sessionId", async (req: Request, res: Response) => {
+    const sessionId = String(req.params.sessionId || "");
+    if (!sessionId) return res.json({ success: false, error: "Missing sessionId" });
+
+    const cached = manager.getSessionByDbSessionId(sessionId);
+    if (cached) return res.json({ success: true, source: "cache", forms: cached.formSchemas });
+
+    const forms = await manager.loadSchemasForApi(sessionId);
+    res.json({ success: true, source: "db", forms });
+  });
+
+  app.post("/refresh-forms", async (req: Request, res: Response) => {
+    const { site_id } = req.body || {};
+    if (!site_id) return res.json({ success: false, error: "Missing site_id" });
+
+    const forms = await manager.refreshFormSchemas(String(site_id));
+    res.json({ success: true, count: forms.length, forms });
+  });
+
+  app.post("/close-session", async (req: Request, res: Response) => {
+    const { site_id } = req.body || {};
+    if (site_id) await manager.closeSession(String(site_id));
+    res.json({ success: true });
+  });
+
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.5-wizard-rescan listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.5-wizard-rescan-after-click listening on :${PORT}`);
   });
 
   await manager.start();
