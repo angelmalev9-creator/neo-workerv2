@@ -1,10 +1,11 @@
 /**
  * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
  *
- * Patch v6.0.3-wizard-labelmatch:
- * - Wizard: robust label-key matching (normalize "*" / punctuation / spacing)
- * - Wizard: selector_candidates + fill via locator-first
- * - Does NOT change kind=form flow
+ * Patch v6.0.4-strict-select-dom-missing:
+ * - Form/Wizard: strict_select support (no random select fallback)
+ * - Form: smartSelectOption() robust matching (value/label/keywords/1-2-3)
+ * - Wizard: DOM-based missing_required verification to avoid false positives
+ * - Does NOT change kind=form flow besides select matching safety
  */
 
 import express, { Request, Response } from "express";
@@ -53,7 +54,7 @@ type WizardScannedField = {
   aria_label: string;
   required: boolean;
   selector: string; // best-effort unique-ish CSS selector
-  selector_candidates: string[]; // NEW: candidates similar to schema-first
+  selector_candidates: string[]; // candidates similar to schema-first
   options?: { value: string; label: string }[]; // for <select>
 };
 
@@ -228,12 +229,15 @@ function isMessageField(f: FormSchemaField): boolean {
 }
 
 // ───────────────────────────────────────────────────────────────
-// Wizard label normalization (NEW)
+// Wizard label normalization
 // ───────────────────────────────────────────────────────────────
 
 function normLabel(s: unknown): string {
   const t = String(s ?? "")
     .toLowerCase()
+    .normalize("NFKD")
+    // remove combining marks (diacritics)
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/\*/g, " ")
     .replace(/[“”"']/g, " ")
     .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
@@ -247,6 +251,69 @@ function labelSoftIncludes(a: string, b: string): boolean {
   const B = normLabel(b);
   if (!A || !B) return false;
   return A.includes(B) || B.includes(A);
+}
+
+// ───────────────────────────────────────────────────────────────
+// Select normalization + matching
+// ───────────────────────────────────────────────────────────────
+
+function normSelectText(s: unknown): string {
+  return String(s ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[₀-₉]/g, "")
+    .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pickPlanIntent(desiredRaw: string): "essential" | "advanced" | "ultimate" | "" {
+  const d = normSelectText(desiredRaw);
+
+  // numeric shortcuts: 1/2/3
+  if (/^\d+$/.test(d)) {
+    if (d === "1") return "essential";
+    if (d === "2") return "advanced";
+    if (d === "3") return "ultimate";
+  }
+
+  if (d.includes("advanced") || d.includes("standart") || d.includes("стандарт")) return "advanced";
+  if (d.includes("ultimate") || d.includes("premium") || d.includes("премиум")) return "ultimate";
+  if (d.includes("essential") || d.includes("basic") || d.includes("start") || d.includes("старт")) return "essential";
+
+  // Bulgarian words that users say
+  if (d.includes("втори") || d.includes("2")) return "advanced";
+  if (d.includes("първи") || d.includes("1")) return "essential";
+  if (d.includes("трети") || d.includes("3")) return "ultimate";
+
+  return "";
+}
+
+function planOptionScore(opt: { value: string; label: string }, intent: string): number {
+  const v = normSelectText(opt.value);
+  const l = normSelectText(opt.label);
+  const hay = `${v} ${l}`;
+
+  if (!intent) return 0;
+
+  if (intent === "essential") {
+    if (hay.includes("startov") || hay.includes("стартов")) return 100;
+    if (hay.includes("standarten") || hay.includes("стандарт")) return 40;
+    if (hay.includes("premium") || hay.includes("премиум")) return 20;
+  }
+  if (intent === "advanced") {
+    if (hay.includes("standarten") || hay.includes("стандарт")) return 100;
+    if (hay.includes("startov") || hay.includes("стартов")) return 40;
+    if (hay.includes("premium") || hay.includes("премиум")) return 60; // still closer than стартов sometimes
+  }
+  if (intent === "ultimate") {
+    if (hay.includes("premium") || hay.includes("премиум") || hay.includes("индивидуал")) return 100;
+    if (hay.includes("standarten") || hay.includes("стандарт")) return 60;
+    if (hay.includes("startov") || hay.includes("стартов")) return 40;
+  }
+
+  return 0;
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -408,6 +475,7 @@ class HotSessionManager {
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
     const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
     const autoSubmit = request.auto_submit !== false;
+    const strictSelect = request.strict_select === true;
 
     const session = this.sessions.get(site_id);
     if (!session) return { success: false, message: "Няма активна сесия" };
@@ -441,9 +509,9 @@ class HotSessionManager {
 
     let result: { ok: boolean; message: string; observation?: JsonObj };
     if (schema.kind === "wizard") {
-      result = await this.fillWizard(session.page, schema, merged, autoSubmit);
+      result = await this.fillWizard(session.page, schema, merged, autoSubmit, strictSelect);
     } else {
-      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit);
+      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
     }
 
     return { success: !!result.ok, message: result.message, observation: result.observation };
@@ -469,7 +537,7 @@ class HotSessionManager {
       const best = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
       if (best) {
         await this.ensureOnSchemaUrl(session.page, best.url);
-        const r = await this.fillFormSchema(session.page, best, data, undefined, true);
+        const r = await this.fillFormSchema(session.page, best, data, undefined, true, false);
         return { success: !!r.ok, message: r.message, observation: r.observation };
       }
     }
@@ -519,7 +587,8 @@ class HotSessionManager {
     schema: FormSchemaRow,
     data: Record<string, unknown>,
     file?: FillFormRequest["file"],
-    autoSubmit = true
+    autoSubmit = true,
+    strictSelect = false
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const fields = schema.schema.fields || [];
     const actions: string[] = [];
@@ -539,7 +608,7 @@ class HotSessionManager {
       if (v === undefined) continue;
       matchedCount++;
 
-      const usedSel = await this.fillSingleField(page, f, String(v));
+      const usedSel = await this.fillSingleField(page, f, String(v), strictSelect);
       if (usedSel) {
         filledSelectors.push(usedSel);
         actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
@@ -594,7 +663,8 @@ class HotSessionManager {
     page: Page,
     schema: FormSchemaRow,
     data: Record<string, unknown>,
-    autoSubmit = true
+    autoSubmit = true,
+    strictSelect = false
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const actions: string[] = [];
     const maxSteps = 8;
@@ -629,7 +699,7 @@ class HotSessionManager {
         );
 
         if (!matched) continue;
-        const ok = await this.fillWizardField(page, f, String(v));
+        const ok = await this.fillWizardField(page, f, String(v), strictSelect);
         if (ok) {
           filled++;
           actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
@@ -654,7 +724,25 @@ class HotSessionManager {
         }
       }
 
-      const needNow = this.buildWizardNeedPayload(scanned, data);
+      // 2.5) Missing required: payload-based + DOM verification fallback
+      let needNow = this.buildWizardNeedPayload(scanned, data);
+      if (needNow.missing_required.length > 0) {
+        // If we did fill interactions, verify by DOM values to avoid false key mismatch.
+        const domMissing = await this.detectWizardMissingByDom(page, scanned.fields);
+        if (filled > 0 && domMissing.length === 0) {
+          // treat as OK
+          needNow = { ...needNow, missing_required: [] };
+        } else if (domMissing.length > 0) {
+          // keep only what DOM says missing (more truthful)
+          needNow = {
+            ...needNow,
+            missing_required: needNow.missing_required.filter((m) =>
+              domMissing.some((x) => labelSoftIncludes(x, m.label))
+            ),
+          };
+        }
+      }
+
       if (needNow.missing_required.length > 0) {
         const obs = await this.quickObserve(page);
         (obs as any).needs_input = true;
@@ -686,7 +774,21 @@ class HotSessionManager {
 
         const afterSig = await this.getWizardDomSignature(page);
         const nextScanned = await this.scanWizardStep(page);
-        const nextNeed = this.buildWizardNeedPayload(nextScanned, data);
+        let nextNeed = this.buildWizardNeedPayload(nextScanned, data);
+
+        if (nextNeed.missing_required.length > 0) {
+          const domMissing2 = await this.detectWizardMissingByDom(page, nextScanned.fields);
+          if (domMissing2.length === 0) {
+            nextNeed = { ...nextNeed, missing_required: [] };
+          } else {
+            nextNeed = {
+              ...nextNeed,
+              missing_required: nextNeed.missing_required.filter((m) =>
+                domMissing2.some((x) => labelSoftIncludes(x, m.label))
+              ),
+            };
+          }
+        }
 
         if (nextNeed.missing_required.length > 0) {
           const obs = await this.quickObserve(page);
@@ -788,8 +890,50 @@ class HotSessionManager {
     return { missing_required, fields, choices: scanned.choices };
   }
 
+  private async detectWizardMissingByDom(page: Page, fields: WizardScannedField[]): Promise<string[]> {
+    try {
+      const payload = fields
+        .filter((f) => f.required)
+        .map((f) => ({
+          label: f.label || f.aria_label || f.placeholder || f.name || f.id || "Поле",
+          type: (f.type || f.tag || "").toLowerCase(),
+          selectors: Array.from(new Set([...(f.selector_candidates || []), f.selector].filter(Boolean))).slice(0, 10),
+        }));
+
+      const missing = await page.evaluate((reqFields) => {
+        const isEmptyValue = (el: any, type: string) => {
+          if (!el) return true;
+          const tag = (el.tagName || "").toLowerCase();
+          if (tag === "select") {
+            const v = (el.value || "").toString().trim();
+            return !v;
+          }
+          if (type === "checkbox" || type === "radio") {
+            return !Boolean(el.checked);
+          }
+          const v = (el.value || "").toString().trim();
+          return !v;
+        };
+
+        const out: string[] = [];
+        for (const f of reqFields as any[]) {
+          let el: any = null;
+          for (const sel of f.selectors || []) {
+            el = document.querySelector(sel);
+            if (el) break;
+          }
+          if (isEmptyValue(el, f.type || "")) out.push(String(f.label || "Поле"));
+        }
+        return out;
+      }, payload);
+
+      return Array.isArray(missing) ? missing.slice(0, 20) : [];
+    } catch {
+      return [];
+    }
+  }
+
   private matchWizardDataForField(f: WizardScannedField, data: Record<string, unknown>): { key: string; value: string } | null {
-    // keep existing logic but add label-key fallback
     const txt = this.wizardFieldText(f);
 
     const pickByKeys = (keys: string[]) => {
@@ -818,7 +962,7 @@ class HotSessionManager {
       return pickByKeys(["message", "comment", "note", "details"]);
     }
 
-    // NEW: label-key match for label-based payload keys
+    // label-key match for label-based payload keys
     const fLabel = f.label || f.aria_label || f.placeholder || f.name || f.id;
     for (const k of Object.keys(data || {})) {
       const v = (data as any)[k];
@@ -835,13 +979,11 @@ class HotSessionManager {
   }
 
   private matchWizardFieldValue(field: WizardScannedField, data: Record<string, unknown>): string | undefined {
-    // 1) direct by name/id
     if (field.name && data[field.name] !== undefined) return String(data[field.name]);
     if (field.id && data[field.id] !== undefined) return String(data[field.id]);
 
     const t = this.wizardFieldText(field);
 
-    // 2) common semantics
     if (field.type === "email" || /e-?mail|email|имейл|поща/.test(t)) {
       const v = (data as any).email || (data as any).e_mail;
       if (v !== undefined) return String(v);
@@ -867,7 +1009,7 @@ class HotSessionManager {
       if (v !== undefined) return String(v);
     }
 
-    // NEW: robust label-key match for payload keys like "Три имена *"
+    // robust label-key match for payload keys like "Три имена *"
     const fLabel = field.label || field.aria_label || field.placeholder || field.name || field.id;
     for (const k of Object.keys(data || {})) {
       const v = (data as any)[k];
@@ -880,7 +1022,6 @@ class HotSessionManager {
       }
     }
 
-    // 3) fallback: old deterministic "includes"
     for (const k of Object.keys(data || {})) {
       if (!k) continue;
       const kk = k.toLowerCase();
@@ -891,10 +1032,8 @@ class HotSessionManager {
     return undefined;
   }
 
-  private async fillWizardField(page: Page, f: WizardScannedField, value: string): Promise<boolean> {
+  private async fillWizardField(page: Page, f: WizardScannedField, value: string, strictSelect: boolean): Promise<boolean> {
     const valSummary = summarizeValue(f.name || f.type, value);
-
-    // NEW: try selector_candidates first (stable), then fallback to f.selector
     const candidates = [...(f.selector_candidates || []), f.selector].filter(Boolean);
 
     console.log(`[WIZARD][FILL] candidates=${candidates.length} value=${valSummary}`);
@@ -912,7 +1051,7 @@ class HotSessionManager {
         await loc.click({ timeout: 1500 }).catch(() => {});
 
         if (f.tag === "select" || f.type === "select") {
-          const ok = await this.smartSelectOption(page, sel, String(value));
+          const ok = await this.smartSelectOption(page, sel, String(value), strictSelect);
           console.log(`[WIZARD][FILL][SELECT] sel=${sel} ok=${ok}`);
           if (ok) return true;
           continue;
@@ -1076,12 +1215,10 @@ class HotSessionManager {
         if (aria) out.push(`${tag}[aria-label="${aria.replace(/\"/g, "")}"]`);
         if (ph) out.push(`${tag}[placeholder="${ph.replace(/\"/g, "")}"]`);
 
-        // type-based (not unique but good fallback with .first())
         if (tag === "input" && type) out.push(`input[type="${type}"]`);
         if (tag === "textarea") out.push("textarea");
         if (tag === "select") out.push("select");
 
-        // best-effort unique-ish selector as last
         out.push(getSelector(el));
         return Array.from(new Set(out)).slice(0, 12);
       };
@@ -1239,7 +1376,7 @@ class HotSessionManager {
     }
   }
 
-  private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
+  private async fillSingleField(page: Page, f: FormSchemaField, value: string, strictSelect: boolean): Promise<string | null> {
     const selectors = [
       ...(f.selector_candidates || []),
       f.name ? `[name="${f.name}"]` : "",
@@ -1267,7 +1404,7 @@ class HotSessionManager {
         await el.click({ timeout: 1200 }).catch(() => {});
 
         if (f.tag === "select" || f.type === "select") {
-          const ok = await this.smartSelectOption(page, sel, String(value));
+          const ok = await this.smartSelectOption(page, sel, String(value), strictSelect);
           console.log(`[FILL][SELECT] ${sel} ok=${ok}`);
           if (ok) return sel;
           continue;
@@ -1289,8 +1426,9 @@ class HotSessionManager {
     return null;
   }
 
-  private async smartSelectOption(page: Page, selectSelector: string, desired: string): Promise<boolean> {
-    const wanted = (desired || "").trim().toLowerCase();
+  private async smartSelectOption(page: Page, selectSelector: string, desired: string, strictSelect: boolean): Promise<boolean> {
+    const desiredRaw = String(desired || "").trim();
+    const wanted = normSelectText(desiredRaw);
 
     const options = await page.evaluate<
       { value: string; label: string }[],
@@ -1304,18 +1442,66 @@ class HotSessionManager {
       }));
     }, { sel: selectSelector });
 
-    console.log(`[SELECT] selector=${selectSelector} desired="${desired}" options=${options.length}`);
+    console.log(`[SELECT] selector=${selectSelector} desired="${desiredRaw}" options=${options.length} strict=${strictSelect}`);
     for (const o of options.slice(0, 20)) {
       console.log(`[SELECT][OPT] value="${o.value}" label="${o.label}"`);
     }
 
-    let picked =
-      options.find((o) => o.value.trim().toLowerCase() === wanted) ||
-      options.find((o) => o.label.trim().toLowerCase() === wanted) ||
-      (wanted ? options.find((o) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
-      options.find((o) => (o.value || "").trim() !== "");
+    const nonEmpty = options.filter((o) => (o.value || "").trim() !== "");
 
-    if (!picked) return false;
+    // 1) numeric index (1/2/3) -> nth non-empty (deterministic)
+    if (/^\d+$/.test(wanted)) {
+      const idx = Math.max(1, parseInt(wanted, 10));
+      const candidate = nonEmpty[idx - 1];
+      if (candidate) {
+        const ok = await page.evaluate<boolean, { sel: string; v: string }>(
+          ({ sel, v }) => {
+            const el = document.querySelector(sel) as HTMLSelectElement | null;
+            if (!el) return false;
+            el.value = v;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          },
+          { sel: selectSelector, v: candidate.value }
+        );
+        console.log(`[SELECT] picked(numeric) value="${candidate.value}" label="${candidate.label}" ok=${ok}`);
+        return ok;
+      }
+    }
+
+    // 2) exact / includes match on value/label
+    let picked =
+      options.find((o) => normSelectText(o.value) === wanted) ||
+      options.find((o) => normSelectText(o.label) === wanted) ||
+      (wanted ? options.find((o) => normSelectText(o.label).includes(wanted)) : undefined) ||
+      (wanted ? options.find((o) => normSelectText(o.value).includes(wanted)) : undefined);
+
+    // 3) plan-intent keyword mapping (fixes Webvision)
+    if (!picked) {
+      const intent = pickPlanIntent(desiredRaw);
+      if (intent) {
+        let best: { opt: { value: string; label: string }; score: number } | null = null;
+        for (const o of nonEmpty) {
+          const score = planOptionScore(o, intent);
+          if (!best || score > best.score) best = { opt: o, score };
+        }
+        if (best && best.score >= 80) picked = best.opt;
+      }
+    }
+
+    // 4) strict mode: NO random fallback
+    if (!picked && strictSelect) {
+      console.log(`[SELECT] strict_select=ON -> no match, returning false`);
+      return false;
+    }
+
+    // 5) legacy fallback (only when strict_select=false)
+    if (!picked) {
+      picked = nonEmpty[0];
+    }
+
+    if (!picked || !String(picked.value || "").trim()) return false;
 
     const ok = await page.evaluate<boolean, { sel: string; v: string }>(
       ({ sel, v }) => {
@@ -1326,7 +1512,7 @@ class HotSessionManager {
         el.dispatchEvent(new Event("change", { bubbles: true }));
         return true;
       },
-      { sel: selectSelector, v: picked!.value }
+      { sel: selectSelector, v: picked.value }
     );
 
     console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
@@ -1570,7 +1756,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.3-wizard-labelmatch", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.4-strict-select-dom-missing", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -1593,7 +1779,7 @@ async function main() {
 
     const dataKeys = safeKeys(body.data);
     const confKeys = safeKeys(body.confirmed);
-    console.log(`[HTTP][/fill-form] site_id=${body.site_id} session_id=${body.session_id || ""} form_id=${body.form_id || ""} fingerprint=${(body.fingerprint || "").slice(0, 12)} kind=${body.kind || ""} auto_submit=${body.auto_submit !== false}`);
+    console.log(`[HTTP][/fill-form] site_id=${body.site_id} session_id=${body.session_id || ""} form_id=${body.form_id || ""} fingerprint=${(body.fingerprint || "").slice(0, 12)} kind=${body.kind || ""} auto_submit=${body.auto_submit !== false} strict_select=${body.strict_select === true}`);
     console.log(`[HTTP][/fill-form] data_keys=${dataKeys.join(",")} confirmed_keys=${confKeys.join(",")}`);
 
     const r = await manager.executeFillForm(body);
@@ -1639,7 +1825,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.3-wizard-labelmatch listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.4-strict-select-dom-missing listening on :${PORT}`);
   });
 
   await manager.start();
