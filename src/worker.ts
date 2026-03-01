@@ -1,9 +1,10 @@
 /**
  * NEO WORKER v6.0.2-logs — Universal, deterministic, schema-first
  *
- * This revision adds:
- * - Deterministic debug logs for payload -> field match -> selector fill -> submit -> validation
- * - PII-safe logging (no raw email/phone/message content)
+ * Patch v6.0.3-wizard-labelmatch:
+ * - Wizard: robust label-key matching (normalize "*" / punctuation / spacing)
+ * - Wizard: selector_candidates + fill via locator-first
+ * - Does NOT change kind=form flow
  */
 
 import express, { Request, Response } from "express";
@@ -52,6 +53,7 @@ type WizardScannedField = {
   aria_label: string;
   required: boolean;
   selector: string; // best-effort unique-ish CSS selector
+  selector_candidates: string[]; // NEW: candidates similar to schema-first
   options?: { value: string; label: string }[]; // for <select>
 };
 
@@ -100,8 +102,6 @@ interface FillFormRequest {
   form_id?: string;
   fingerprint?: string;
   kind?: string;
-  // Incoming payload can contain non-string values (numbers, booleans, null)
-  // We normalize to strings when filling.
   data: Record<string, unknown>;
   confirmed?: Record<string, unknown>;
   file?: {
@@ -111,7 +111,6 @@ interface FillFormRequest {
     mime_type: string;
   };
   auto_submit?: boolean;
-  // When true, never "guess" a select option; only safe matches.
   strict_select?: boolean;
 }
 
@@ -197,10 +196,10 @@ function mergeConfirmedData(
   if (confirmed && typeof confirmed === "object") {
     for (const [k, v] of Object.entries(confirmed)) merged[k] = v;
   }
-  if (merged.email) merged.email = normalizeEmail(merged.email);
-  if (merged.phone) merged.phone = normalizePhone(merged.phone);
-  if (!merged.email && (merged as any).e_mail) merged.email = normalizeEmail((merged as any).e_mail);
-  if (!merged.phone && (merged as any).telephone) merged.phone = normalizePhone((merged as any).telephone);
+  if ((merged as any).email) (merged as any).email = normalizeEmail((merged as any).email);
+  if ((merged as any).phone) (merged as any).phone = normalizePhone((merged as any).phone);
+  if (!(merged as any).email && (merged as any).e_mail) (merged as any).email = normalizeEmail((merged as any).e_mail);
+  if (!(merged as any).phone && (merged as any).telephone) (merged as any).phone = normalizePhone((merged as any).telephone);
   return merged;
 }
 
@@ -226,6 +225,28 @@ function isNameField(f: FormSchemaField): boolean {
 function isMessageField(f: FormSchemaField): boolean {
   const t = fieldText(f);
   return f.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t);
+}
+
+// ───────────────────────────────────────────────────────────────
+// Wizard label normalization (NEW)
+// ───────────────────────────────────────────────────────────────
+
+function normLabel(s: unknown): string {
+  const t = String(s ?? "")
+    .toLowerCase()
+    .replace(/\*/g, " ")
+    .replace(/[“”"']/g, " ")
+    .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return t;
+}
+
+function labelSoftIncludes(a: string, b: string): boolean {
+  const A = normLabel(a);
+  const B = normLabel(b);
+  if (!A || !B) return false;
+  return A.includes(B) || B.includes(A);
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -575,10 +596,6 @@ class HotSessionManager {
     data: Record<string, unknown>,
     autoSubmit = true
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
-    // Универсален multi-step wizard:
-    // - На всяка стъпка: сканира видимите полета, попълва, клика Next/Напред или Submit/Изпрати,
-    //   изчаква DOM промяна, повтаря до успех или лимит.
-
     const actions: string[] = [];
     const maxSteps = 8;
 
@@ -601,7 +618,7 @@ class HotSessionManager {
         `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
       );
 
-      // 1) Fill visible fields based on semantics (name/email/phone/message/age
+      // 1) Fill visible fields
       let filled = 0;
       for (const f of scanned.fields) {
         const v = this.matchWizardFieldValue(f, data);
@@ -620,7 +637,7 @@ class HotSessionManager {
       }
       if (filled > 0) didInteract = true;
 
-      // 2) Handle choice buttons (e.g. Пол: Мъж/Жена)
+      // 2) Handle choice buttons
       const gender = String((data as any).gender || (data as any).sex || (data as any).pol || "").trim();
       if (gender && scanned.choices.length) {
         const wanted = gender.toLowerCase();
@@ -637,7 +654,6 @@ class HotSessionManager {
         }
       }
 
-      // If we still miss required fields on the current step, stop and ask (do NOT click Next/Submit).
       const needNow = this.buildWizardNeedPayload(scanned, data);
       if (needNow.missing_required.length > 0) {
         const obs = await this.quickObserve(page);
@@ -652,7 +668,6 @@ class HotSessionManager {
         console.log(`[WIZARD] needs_input on current step=${step} missing=${needNow.missing_required.length}`);
         return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
       }
-
 
       // 3) Decide Next vs Submit
       const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
@@ -669,12 +684,10 @@ class HotSessionManager {
           return { ok: true, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено", observation: obs };
         }
 
-        // After navigation, scan the new step and return what we need next (multi-step support)
         const afterSig = await this.getWizardDomSignature(page);
         const nextScanned = await this.scanWizardStep(page);
         const nextNeed = this.buildWizardNeedPayload(nextScanned, data);
 
-        // If we still have required fields without values, stop here and ask for them.
         if (nextNeed.missing_required.length > 0) {
           const obs = await this.quickObserve(page);
           (obs as any).needs_input = true;
@@ -689,7 +702,6 @@ class HotSessionManager {
           return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
         }
 
-        // Nothing missing on the next step — continue if autoSubmit, otherwise stop with snapshot
         if (!autoSubmit) {
           const obs = await this.quickObserve(page);
           (obs as any).wizard_next = {
@@ -705,7 +717,6 @@ class HotSessionManager {
         continue;
       }
 
-      // 4) No buttons found. If we filled something but no navigation, bail with debug.
       const invalid = await this.getInvalidFields(page);
       if (invalid.length) {
         actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
@@ -770,6 +781,7 @@ class HotSessionManager {
       aria_label: f.aria_label,
       required: f.required,
       selector: f.selector,
+      selector_candidates: f.selector_candidates,
       options: f.options,
     }));
 
@@ -777,6 +789,7 @@ class HotSessionManager {
   }
 
   private matchWizardDataForField(f: WizardScannedField, data: Record<string, unknown>): { key: string; value: string } | null {
+    // keep existing logic but add label-key fallback
     const txt = this.wizardFieldText(f);
 
     const pickByKeys = (keys: string[]) => {
@@ -789,7 +802,6 @@ class HotSessionManager {
       return null;
     };
 
-    // Strong type-based hints
     if ((f.type || "").includes("email") || txt.includes("имейл") || txt.includes("e-mail")) {
       return pickByKeys(["email", "e_mail", "mail"]);
     }
@@ -806,21 +818,21 @@ class HotSessionManager {
       return pickByKeys(["message", "comment", "note", "details"]);
     }
 
-    // Generic: try any key that appears in the field text
+    // NEW: label-key match for label-based payload keys
+    const fLabel = f.label || f.aria_label || f.placeholder || f.name || f.id;
     for (const k of Object.keys(data || {})) {
-      const key = k.toLowerCase();
-      if (!key) continue;
-      if (txt.includes(key)) {
-        const v = (data as any)[k];
-        if (v === null || v === undefined) continue;
-        const s = typeof v === "string" ? v : String(v);
-        if (s.trim()) return { key: k, value: s.trim() };
+      const v = (data as any)[k];
+      if (v === null || v === undefined) continue;
+      const s = typeof v === "string" ? v : String(v);
+      if (!s.trim()) continue;
+
+      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(txt, k)) {
+        return { key: k, value: s.trim() };
       }
     }
 
     return null;
   }
-
 
   private matchWizardFieldValue(field: WizardScannedField, data: Record<string, unknown>): string | undefined {
     // 1) direct by name/id
@@ -832,30 +844,43 @@ class HotSessionManager {
     // 2) common semantics
     if (field.type === "email" || /e-?mail|email|имейл|поща/.test(t)) {
       const v = (data as any).email || (data as any).e_mail;
-      return v !== undefined ? String(v) : undefined;
+      if (v !== undefined) return String(v);
     }
 
     if (field.type === "tel" || /phone|tel|телефон|мобил|gsm/.test(t)) {
       const v = (data as any).phone || (data as any).telephone || (data as any).tel;
-      return v !== undefined ? String(v) : undefined;
+      if (v !== undefined) return String(v);
     }
 
     if (/name|име|first|last|fullname|фамил/.test(t)) {
       const v = (data as any).name || (data as any).full_name || (data as any).first_name;
-      return v !== undefined ? String(v) : undefined;
+      if (v !== undefined) return String(v);
     }
 
     if (field.tag === "textarea" || /message|съобщ|забел|note|comment|описание/.test(t)) {
       const v = (data as any).message || (data as any).note || (data as any).comment;
-      return v !== undefined ? String(v) : undefined;
+      if (v !== undefined) return String(v);
     }
 
     if (/age|възраст/.test(t)) {
       const v = (data as any).age || (data as any).years || (data as any).възраст;
-      return v !== undefined ? String(v) : undefined;
+      if (v !== undefined) return String(v);
     }
 
-    // 3) fallback: try any key that appears in label (deterministic)
+    // NEW: robust label-key match for payload keys like "Три имена *"
+    const fLabel = field.label || field.aria_label || field.placeholder || field.name || field.id;
+    for (const k of Object.keys(data || {})) {
+      const v = (data as any)[k];
+      if (v === null || v === undefined) continue;
+      const s = typeof v === "string" ? v : String(v);
+      if (!s.trim()) continue;
+
+      if (labelSoftIncludes(fLabel, k) || labelSoftIncludes(t, k)) {
+        return s.trim();
+      }
+    }
+
+    // 3) fallback: old deterministic "includes"
     for (const k of Object.keys(data || {})) {
       if (!k) continue;
       const kk = k.toLowerCase();
@@ -867,33 +892,44 @@ class HotSessionManager {
   }
 
   private async fillWizardField(page: Page, f: WizardScannedField, value: string): Promise<boolean> {
-    const sel = f.selector;
     const valSummary = summarizeValue(f.name || f.type, value);
-    console.log(`[WIZARD][FILL] selector=${sel} value=${valSummary}`);
 
-    try {
-      const el = await page.$(sel);
-      if (!el) return false;
+    // NEW: try selector_candidates first (stable), then fallback to f.selector
+    const candidates = [...(f.selector_candidates || []), f.selector].filter(Boolean);
 
-      const visible = await el.isVisible().catch(() => false);
-      if (!visible) return false;
+    console.log(`[WIZARD][FILL] candidates=${candidates.length} value=${valSummary}`);
 
-      await el.scrollIntoViewIfNeeded().catch(() => {});
-      await el.click({ timeout: 1200 }).catch(() => {});
+    for (const sel of candidates) {
+      try {
+        const loc = page.locator(sel).first();
+        const count = await loc.count().catch(() => 0);
+        if (count <= 0) continue;
 
-      if (f.tag === "select" || f.type === "select") {
-        return await this.smartSelectOption(page, sel, String(value));
+        const visible = await loc.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.click({ timeout: 1500 }).catch(() => {});
+
+        if (f.tag === "select" || f.type === "select") {
+          const ok = await this.smartSelectOption(page, sel, String(value));
+          console.log(`[WIZARD][FILL][SELECT] sel=${sel} ok=${ok}`);
+          if (ok) return true;
+          continue;
+        }
+
+        await loc.fill(String(value), { timeout: 3000 });
+        await page.keyboard.press("Tab").catch(() => {});
+        await page.waitForTimeout(80).catch(() => {});
+        console.log(`[WIZARD][FILL][OK] sel=${sel}`);
+        return true;
+      } catch (e) {
+        console.log(`[WIZARD][FILL][FAIL] sel=${sel}`, e);
       }
-
-      // Some wizards use type=number but accept text fill.
-      await page.fill(sel, String(value), { timeout: 3000 });
-      await page.keyboard.press("Tab").catch(() => {});
-      await page.waitForTimeout(80).catch(() => {});
-      return true;
-    } catch (e) {
-      console.log(`[WIZARD][FILL][FAIL] selector=${sel}`, e);
-      return false;
     }
+
+    console.log(`[WIZARD][FILL][GIVEUP] label="${f.label}"`);
+    return false;
   }
 
   private async safeClick(page: Page, selector: string): Promise<boolean> {
@@ -915,7 +951,6 @@ class HotSessionManager {
     autoSubmit: boolean
   ): Promise<{ clicked: boolean; kind: "next" | "submit" | "none"; text: string }>
   {
-    // Prefer NEXT first if exists.
     const nextTexts = ["Напред", "Следва", "Продължи", "Next", "Continue", ">", "→"];
     const submitTexts = ["Изпрати", "Завърши", "Готово", "Submit", "Send", "Finish", "Потвърди"];
 
@@ -927,7 +962,6 @@ class HotSessionManager {
     const clickedSubmit = await this.clickWizardButtonByTexts(page, submitTexts, true);
     if (clickedSubmit.clicked) return { clicked: true, kind: "submit", text: clickedSubmit.text };
 
-    // Fallback: any visible submit button
     try {
       const ok = await page.evaluate(() => {
         const btn = document.querySelector('button[type="submit"], input[type="submit"]') as any;
@@ -954,7 +988,6 @@ class HotSessionManager {
       const text = (t || "").trim();
       if (!text) continue;
 
-      // Try buttons / links with has-text
       const candidates = [
         `button:has-text("${text}")`,
         `a:has-text("${text}")`,
@@ -968,16 +1001,13 @@ class HotSessionManager {
           const visible = await el.isVisible().catch(() => false);
           if (!visible) continue;
 
-          // Avoid disabled
           const disabled = await el.evaluate((n: any) => !!n.disabled).catch(() => false);
           if (disabled) continue;
 
           await el.scrollIntoViewIfNeeded().catch(() => {});
           await el.click({ timeout: 2500, force: true });
           return { clicked: true, text };
-        } catch {
-          // keep trying
-        }
+        } catch {}
       }
     }
     return { clicked: false, text: "" };
@@ -1013,7 +1043,6 @@ class HotSessionManager {
         const aria = any.getAttribute?.("aria-label") || "";
         if (aria) return `${tag}[aria-label="${aria.replace(/\"/g, "")}"]`;
 
-        // fallback: build a short nth-of-type path (deterministic)
         let cur: Element | null = el;
         const parts: string[] = [];
         let depth = 0;
@@ -1031,6 +1060,32 @@ class HotSessionManager {
         return parts.length ? parts.join(" > ") : el.tagName.toLowerCase();
       };
 
+      const getSelectorCandidates = (el: Element): string[] => {
+        const any = el as any;
+        const tag = el.tagName.toLowerCase();
+        const out: string[] = [];
+
+        const id = any.id ? String(any.id) : "";
+        const name = any.name ? String(any.name) : "";
+        const type = (any.type || (tag === "select" ? "select" : tag)).toLowerCase();
+        const ph = any.placeholder ? String(any.placeholder) : "";
+        const aria = any.getAttribute?.("aria-label") ? String(any.getAttribute("aria-label")) : "";
+
+        if (id) out.push(`#${cssEscape(id)}`);
+        if (name) out.push(`${tag}[name="${name.replace(/\"/g, "")}"]`);
+        if (aria) out.push(`${tag}[aria-label="${aria.replace(/\"/g, "")}"]`);
+        if (ph) out.push(`${tag}[placeholder="${ph.replace(/\"/g, "")}"]`);
+
+        // type-based (not unique but good fallback with .first())
+        if (tag === "input" && type) out.push(`input[type="${type}"]`);
+        if (tag === "textarea") out.push("textarea");
+        if (tag === "select") out.push("select");
+
+        // best-effort unique-ish selector as last
+        out.push(getSelector(el));
+        return Array.from(new Set(out)).slice(0, 12);
+      };
+
       const getLabel = (el: Element) => {
         const any = el as any;
         const id = any.id ? String(any.id) : "";
@@ -1038,7 +1093,6 @@ class HotSessionManager {
           const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
           if (lab && lab.textContent) return lab.textContent.trim();
         }
-        // nearest label wrapper
         let p: Element | null = el;
         for (let i = 0; i < 4; i++) {
           if (!p) break;
@@ -1046,7 +1100,6 @@ class HotSessionManager {
           if (lab && lab.textContent) return lab.textContent.trim();
           p = p.parentElement;
         }
-        // aria-labelledby
         const labelledby = any.getAttribute?.("aria-labelledby") || "";
         if (labelledby) {
           const t = labelledby
@@ -1078,22 +1131,26 @@ class HotSessionManager {
           const any = el as any;
           const tag = el.tagName.toLowerCase() as any;
           const type = (any.type || (tag === "select" ? "select" : tag)).toLowerCase();
+
+          const label = getLabel(el);
+          const required = (() => {
+            const ariaReq = (any.getAttribute?.("aria-required") || "").toString().toLowerCase() === "true";
+            const dataReq = (any.getAttribute?.("data-required") || "").toString().toLowerCase() === "true";
+            const star = (label || "").includes("*");
+            return !!any.required || ariaReq || dataReq || star;
+          })();
+
           return {
             tag,
             type,
             name: any.name ? String(any.name) : "",
             id: any.id ? String(any.id) : "",
-            label: getLabel(el),
+            label,
             placeholder: any.placeholder ? String(any.placeholder) : "",
             aria_label: any.getAttribute?.("aria-label") ? String(any.getAttribute("aria-label")) : "",
-            required: (() => {
-            const lab = (getLabel(el) || "").trim();
-            const ariaReq = (any.getAttribute?.("aria-required") || "").toString().toLowerCase() === "true";
-            const dataReq = (any.getAttribute?.("data-required") || "").toString().toLowerCase() === "true";
-            const star = lab.includes("*");
-            return !!any.required || ariaReq || dataReq || star;
-          })(),
+            required,
             selector: getSelector(el),
+            selector_candidates: getSelectorCandidates(el),
             options:
               tag === "select"
                 ? Array.from((el as HTMLSelectElement).options || []).slice(0, 60).map((o) => ({
@@ -1104,7 +1161,6 @@ class HotSessionManager {
           };
         });
 
-      // Common wizard choice buttons like "Мъж" / "Жена"
       const btns = Array.from(document.querySelectorAll("button, [role='button']"))
         .filter((el) => isVisible(el))
         .map((el) => {
@@ -1143,7 +1199,6 @@ class HotSessionManager {
   }
 
   private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
-    // Wait for DOM signature to change, but don't hang forever.
     try {
       await page.waitForFunction(
         (sig: string) => {
@@ -1168,7 +1223,6 @@ class HotSessionManager {
         { timeout: 9000 }
       );
     } catch {
-      // fallback
       await page.waitForTimeout(900).catch(() => {});
     }
   }
@@ -1177,7 +1231,6 @@ class HotSessionManager {
     try {
       return await page.evaluate(() => {
         const txt = (document.body?.innerText || "").toLowerCase();
-        // Keep it simple & language-agnostic
         const hits = ["благодар", "успеш", "изпрат", "thank you", "success", "submitted"];
         return hits.some((h) => txt.includes(h));
       });
@@ -1186,10 +1239,6 @@ class HotSessionManager {
     }
   }
 
-  /**
-   * Returns selector that worked, else null.
-   * Adds detailed selector attempt logs.
-   */
   private async fillSingleField(page: Page, f: FormSchemaField, value: string): Promise<string | null> {
     const selectors = [
       ...(f.selector_candidates || []),
@@ -1261,15 +1310,15 @@ class HotSessionManager {
     }
 
     let picked =
-      options.find((o: { value: string; label: string }) => o.value.trim().toLowerCase() === wanted) ||
-      options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase() === wanted) ||
-      (wanted ? options.find((o: { value: string; label: string }) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
-      options.find((o: { value: string; label: string }) => (o.value || "").trim() !== "");
+      options.find((o) => o.value.trim().toLowerCase() === wanted) ||
+      options.find((o) => o.label.trim().toLowerCase() === wanted) ||
+      (wanted ? options.find((o) => o.label.trim().toLowerCase().includes(wanted)) : undefined) ||
+      options.find((o) => (o.value || "").trim() !== "");
 
     if (!picked) return false;
 
     const ok = await page.evaluate<boolean, { sel: string; v: string }>(
-      ({ sel, v }: { sel: string; v: string }) => {
+      ({ sel, v }) => {
         const el = document.querySelector(sel) as HTMLSelectElement | null;
         if (!el) return false;
         el.value = v;
@@ -1277,7 +1326,7 @@ class HotSessionManager {
         el.dispatchEvent(new Event("change", { bubbles: true }));
         return true;
       },
-      { sel: selectSelector, v: picked.value }
+      { sel: selectSelector, v: picked!.value }
     );
 
     console.log(`[SELECT] picked value="${picked.value}" label="${picked.label}" ok=${ok}`);
@@ -1368,7 +1417,7 @@ class HotSessionManager {
 
   private async clickSubmitWithinClosestForm(page: Page, anchorSelector: string, debug: string[]): Promise<boolean> {
     const ok = await page.evaluate<boolean, { sel: string }>(
-      ({ sel }: { sel: string }) => {
+      ({ sel }) => {
         const anchor = document.querySelector(sel) as HTMLElement | null;
         if (!anchor) return false;
         const form = anchor.closest("form") as HTMLFormElement | null;
@@ -1413,7 +1462,6 @@ class HotSessionManager {
     const debug: string[] = [];
     const attempted = true;
 
-    // 0) closest form
     for (const a of filledSelectors.slice(0, 3)) {
       const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
       if (ok) {
@@ -1422,7 +1470,6 @@ class HotSessionManager {
       }
     }
 
-    // 1) schema selectors
     const schemaSelectors = schema?.schema.submit?.selector_candidates || [];
     if (schemaSelectors.length) {
       const ok = await this.clickBySelectors(page, schemaSelectors, debug);
@@ -1432,7 +1479,6 @@ class HotSessionManager {
       }
     }
 
-    // 2) schema text
     const submitText = (schema?.schema.submit?.text || "").trim();
     if (submitText) {
       const ok = await this.clickByTextHeuristic(page, submitText, debug);
@@ -1442,7 +1488,6 @@ class HotSessionManager {
       }
     }
 
-    // 3) universal
     const universalSelectors = [
       'button[type="submit"]',
       'input[type="submit"]',
@@ -1458,7 +1503,6 @@ class HotSessionManager {
       }
     }
 
-    // 4) requestSubmit
     try {
       const ok = await page.evaluate<boolean>(() => {
         const form = document.querySelector("form") as any;
@@ -1526,7 +1570,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.2-logs", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.3-wizard-labelmatch", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -1547,7 +1591,6 @@ async function main() {
       return res.json({ success: false, message: "Missing site_id/data" });
     }
 
-    // PII-safe request summary
     const dataKeys = safeKeys(body.data);
     const confKeys = safeKeys(body.confirmed);
     console.log(`[HTTP][/fill-form] site_id=${body.site_id} session_id=${body.session_id || ""} form_id=${body.form_id || ""} fingerprint=${(body.fingerprint || "").slice(0, 12)} kind=${body.kind || ""} auto_submit=${body.auto_submit !== false}`);
@@ -1596,7 +1639,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.2-logs listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.3-wizard-labelmatch listening on :${PORT}`);
   });
 
   await manager.start();
