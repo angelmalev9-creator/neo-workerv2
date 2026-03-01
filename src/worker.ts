@@ -486,6 +486,7 @@ class HotSessionManager {
   // ─────────────────────────────────────────────────────────
 
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
+    try {
     const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
     const autoSubmit = request.auto_submit !== false;
     const strictSelect = request.strict_select === true;
@@ -501,11 +502,12 @@ class HotSessionManager {
 
     let schema: FormSchemaRow | undefined;
     if (form_id) schema = session.formSchemas.find(s => s.id === form_id);
-    else if (fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
-    else if (kind) schema = session.formSchemas.find(s => s.kind === kind);
-    else schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
+    if (!schema && fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
+    if (!schema && kind) schema = session.formSchemas.find(s => s.kind === kind);
+    if (!schema) schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
     if (!schema) {
+      console.log(`[FILL-FORM][NO_SCHEMA] form_id=${form_id || ""} fingerprint=${(fingerprint || "").slice(0, 12)} schemas=${session.formSchemas.length} ids=${session.formSchemas.map(s => s.id).join(",")}`);
       return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
     }
 
@@ -527,6 +529,11 @@ class HotSessionManager {
     }
 
     return { success: !!result.ok, message: result.message, observation: result.observation };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[FILL-FORM][CRASH] ${msg}`, e);
+      return { success: false, message: `Fill-form error: ${msg}` };
+    }
   }
 
   // ─────────────────────────────────────────────────────────
@@ -678,6 +685,7 @@ class HotSessionManager {
     autoSubmit = true,
     strictSelect = false
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    try {
     const actions: string[] = [];
     const maxSteps = 8;
 
@@ -1025,6 +1033,13 @@ class HotSessionManager {
     const obs = await this.quickObserve(page);
     (obs as any).wizard = { note: "maxSteps reached" };
     return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: прекалено много стъпки", observation: obs };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[WIZARD][CRASH] ${msg}`, e);
+      const obs = await this.quickObserve(page).catch(() => ({} as JsonObj));
+      (obs as any).wizard_error = msg;
+      return { ok: false, message: `Wizard error: ${msg}`, observation: obs };
+    }
   }
 
   // ─────────────────────────────────────────────────────────
