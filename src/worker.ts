@@ -944,7 +944,10 @@ class HotSessionManager {
 
             // Also add unfilled choice groups
             for (const group of freshScanned2.choiceGroups) {
-              if (!freshNeed.missing_required.some((m) => normLabel(m.label) === normLabel(group.name))) {
+              const groupDisplayLabel = (group.label && group.label !== "button_choice")
+                ? group.label
+                : group.options.map((o) => o.text).join(" / ");
+              if (!freshNeed.missing_required.some((m) => normLabel(m.label) === normLabel(groupDisplayLabel))) {
                 const groupNameNorm = normLabel(group.name);
                 let hasVal = false;
                 for (const k of Object.keys(data)) {
@@ -954,7 +957,7 @@ class HotSessionManager {
                 }
                 if (!hasVal) {
                   freshNeed.missing_required.push({
-                    label: group.label || group.name,
+                    label: groupDisplayLabel,
                     type: "button_group",
                     selector: group.options[0]?.selector || "",
                     options: group.options.map((o) => ({ value: o.text, label: o.text })),
@@ -1100,8 +1103,11 @@ class HotSessionManager {
       }
 
       if (!hasValue) {
+        const groupDisplayLabel = (group.label && group.label !== "button_choice")
+          ? group.label
+          : group.options.map(o => o.text).join(" / ");
         missing_required.push({
-          label: group.label || group.name,
+          label: groupDisplayLabel,
           type: "button_group",
           selector: group.options[0]?.selector || "",
           options: group.options.map(o => ({ value: o.text, label: o.text })),
@@ -1537,6 +1543,15 @@ class HotSessionManager {
       // Detect button-based choice groups: containers with 2+ sibling buttons
       const seenContainers = new Set<Element>();
       const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+      // Language codes & nav elements to skip
+      const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
+      const isLangSwitcher = (btns: Element[]) => {
+        if (btns.length < 2 || btns.length > 5) return false;
+        return btns.every((b) => {
+          const t = ((b as any).textContent || "").trim().toLowerCase();
+          return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
+        });
+      };
 
       document.querySelectorAll("button, [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
@@ -1556,6 +1571,14 @@ class HotSessionManager {
         });
 
         if (optionBtns.length < 2) return;
+
+        // Skip language switchers (BG/EN, etc.)
+        if (isLangSwitcher(optionBtns)) return;
+
+        // Skip buttons inside nav/header elements
+        const closestNav = parent.closest("nav, header, [role='navigation']");
+        if (closestNav) return;
+
         seenContainers.add(parent);
 
         // Find group label from preceding element or parent
@@ -1755,12 +1778,16 @@ class HotSessionManager {
 
         // 2) Unselected button choice groups
         const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+        const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
         const seenContainers = new Set<Element>();
 
         document.querySelectorAll("button, [role='button']").forEach((btn) => {
           if (!isVisible(btn)) return;
           const parent = btn.parentElement;
           if (!parent || seenContainers.has(parent)) return;
+
+          // Skip buttons inside nav/header
+          if (parent.closest("nav, header, [role='navigation']")) return;
 
           // Find sibling buttons
           const siblings = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
@@ -1773,6 +1800,14 @@ class HotSessionManager {
             return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
           });
           if (optBtns.length < 2) return;
+
+          // Skip language switchers (BG/EN, etc.)
+          const allLang = optBtns.every((b) => {
+            const t = ((b as any).textContent || "").trim().toLowerCase();
+            return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
+          });
+          if (allLang) return;
+
           seenContainers.add(parent);
 
           // Check if any button in this group is already selected
