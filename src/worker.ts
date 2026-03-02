@@ -1,11 +1,11 @@
 /**
- * NEO WORKER v6.0.7-universal-choices+radio+file — Universal, deterministic, schema-first
+ * NEO WORKER v6.0.8-universal-choices+radio+file+customRadio — Universal, deterministic, schema-first
  *
- * Patch v6.0.7:
- * - Wizard: scanWizardStep detects RADIO groups (input[type=radio] grouped by name) + label-based selectors
- * - Wizard: supports file upload steps (input[type=file]) via FillFormRequest.file
- * - Wizard: countUnfilledVisibleFields counts unselected radio groups as pending
- * - Does NOT change kind=form flow besides keeping existing select matching safety
+ * Patch v6.0.8:
+ * - Wizard: scanWizardStep detects CUSTOM radio groups (role=radiogroup/role=radio, aria-checked, hidden inputs + visible wrappers)
+ * - Wizard: countUnfilledVisibleFields counts unselected custom radio groups as pending
+ * - Wizard: getWizardDomSignature includes visible step text snippet to avoid false "same step" loops
+ * - Keeps previous v6.0.7 changes (radio + file upload)
  */
 
 import express, { Request, Response } from "express";
@@ -706,10 +706,10 @@ class HotSessionManager {
         const scanned = await this.scanWizardStep(page);
 
         console.log(
-          `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} groups=${scanned.choiceGroups.length} sig=${beforeSig.slice(0, 40)}`
+          `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} groups=${scanned.choiceGroups.length} sig=${beforeSig.slice(0, 60)}`
         );
 
-        // 0) If there's a file upload step and user provided a file -> upload now
+        // 0) File upload step
         if (file) {
           const up = await this.uploadFileWizard(page, file);
           if (up) {
@@ -721,7 +721,6 @@ class HotSessionManager {
         // 1) Fill visible fields
         let filled = 0;
         for (const f of scanned.fields) {
-          // file fields are handled separately
           if ((f.type || "").toLowerCase() === "file") continue;
 
           const v = this.matchWizardFieldValue(f, data);
@@ -740,7 +739,7 @@ class HotSessionManager {
         }
         if (filled > 0) didInteract = true;
 
-        // 2) Handle choice groups (button_group + radio)
+        // 2) Choice groups (button + radio + custom radio)
         for (const group of scanned.choiceGroups) {
           const groupNameNorm = normLabel(group.name);
           let desiredValue = "";
@@ -757,7 +756,7 @@ class HotSessionManager {
             for (const k of Object.keys(data)) {
               const v = String((data as any)[k] ?? "").trim();
               if (!v) continue;
-              if (v.includes("@") || v.length > 60 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+              if (v.includes("@") || v.length > 80 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
               const vNorm = normLabel(v);
               if (!vNorm || vNorm.length < 2) continue;
               const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
@@ -807,7 +806,7 @@ class HotSessionManager {
           }
         }
 
-        // If file is required and not uploaded, force needs_input
+        // Required file check
         if (!needNow.missing_required.some(m => (m.type || "").toLowerCase() === "file")) {
           const fileNeeded = await page.evaluate(() => {
             const isVisible = (el: Element) => {
@@ -822,7 +821,6 @@ class HotSessionManager {
             if (vis.length === 0) return { needed: false, label: "" };
             const anyReq = vis.some(i => !!i.required || (i.getAttribute("aria-required") || "").toLowerCase() === "true");
             if (!anyReq) return { needed: false, label: "" };
-            // label heuristic
             const i = vis[0];
             const id = (i.id || "").toString();
             let label = "";
@@ -856,7 +854,7 @@ class HotSessionManager {
           return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
         }
 
-        // 3) Decide Next vs Submit
+        // 3) Next vs Submit
         const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
         console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
 
@@ -990,10 +988,7 @@ class HotSessionManager {
 
     for (const f of scanned.fields) {
       if (!f.required) continue;
-      if ((f.type || "").toLowerCase() === "file") {
-        // file required is handled via DOM check in fillWizard (needs actual file payload)
-        continue;
-      }
+      if ((f.type || "").toLowerCase() === "file") continue;
       const found = this.matchWizardDataForField(f, data);
       if (!found) {
         missing_required.push({
@@ -1023,7 +1018,7 @@ class HotSessionManager {
         for (const k of Object.keys(data)) {
           const v = String((data as any)[k] ?? "").trim();
           if (!v) continue;
-          if (v.includes("@") || v.length > 60 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+          if (v.includes("@") || v.length > 80 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
           const vNorm = normLabel(v);
           if (!vNorm || vNorm.length < 2) continue;
           const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
@@ -1032,7 +1027,7 @@ class HotSessionManager {
       }
 
       if (!hasValue) {
-        const groupDisplayLabel = (group.label && group.label !== "button_choice")
+        const groupDisplayLabel = (group.label && group.label !== "button_choice" && group.label !== "radio_choice")
           ? group.label
           : group.options.map(o => o.text).join(" / ");
         missing_required.push({
@@ -1321,6 +1316,90 @@ class HotSessionManager {
     return { clicked: false, text: "" };
   }
 
+  // ✅ v6.0.8: stronger signature includes visible wizard text snippet
+  private async getWizardDomSignature(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const isVisible = (el: Element) => {
+          const style = window.getComputedStyle(el as any);
+          if (!style) return false;
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const r = (el as any).getBoundingClientRect?.();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+
+        const title = document.title || "";
+        const h1 = (document.querySelector("h1")?.textContent || "").trim();
+        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+
+        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+          .filter((el: any) => isVisible(el))
+          .slice(0, 25)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+          .join("|");
+
+        // visible section text snippet (captures question text + options)
+        const candidates = Array.from(document.querySelectorAll("main, form, [role='form'], .wizard, .steps, .step, section, article"))
+          .filter(isVisible)
+          .slice(0, 6) as HTMLElement[];
+
+        let snippet = "";
+        for (const c of candidates) {
+          const t = (c.innerText || "").replace(/\s+/g, " ").trim();
+          if (t.length >= 40) { snippet = t.slice(0, 280); break; }
+        }
+
+        return `${location.pathname}||${title}||${h1}||${step}||${inputs}||${snippet}`;
+      });
+    } catch {
+      return `sig:${Date.now()}`;
+    }
+  }
+
+  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
+    try {
+      await page.waitForFunction(
+        (sig: string) => {
+          const isVisible = (el: Element) => {
+            const style = window.getComputedStyle(el as any);
+            if (!style) return false;
+            if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+            const r = (el as any).getBoundingClientRect?.();
+            return !!r && r.width > 0 && r.height > 0;
+          };
+
+          const title = document.title || "";
+          const h1 = (document.querySelector("h1")?.textContent || "").trim();
+          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
+
+          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+            .filter((el: any) => isVisible(el))
+            .slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
+            .join("|");
+
+          const candidates = Array.from(document.querySelectorAll("main, form, [role='form'], .wizard, .steps, .step, section, article"))
+            .filter(isVisible)
+            .slice(0, 6) as HTMLElement[];
+
+          let snippet = "";
+          for (const c of candidates) {
+            const t = (c.innerText || "").replace(/\s+/g, " ").trim();
+            if (t.length >= 40) { snippet = t.slice(0, 280); break; }
+          }
+
+          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}||${snippet}`;
+          return cur !== sig;
+        },
+        beforeSig,
+        { timeout: 9000 }
+      );
+    } catch {
+      await page.waitForTimeout(900).catch(() => {});
+    }
+  }
+
+  // ✅ v6.0.8: scanWizardStep now detects custom radios robustly
   private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }> {
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
@@ -1354,7 +1433,7 @@ class HotSessionManager {
         let cur: Element | null = el;
         const parts: string[] = [];
         let depth = 0;
-        while (cur && depth < 5) {
+        while (cur && depth < 6) {
           const t = cur.tagName.toLowerCase();
           const par = cur.parentElement as Element | null;
           if (!par) break;
@@ -1418,11 +1497,15 @@ class HotSessionManager {
         return "";
       };
 
+      // 1) Normal fields (input/textarea/select)
       const inputs = Array.from(document.querySelectorAll("input, textarea, select"));
       const fields = inputs
         .filter((el) => {
           const any = el as any;
+
+          // NOTE: for wizard we keep strict "visible" inputs only
           if (!isVisible(el)) return false;
+
           const tag = el.tagName.toLowerCase();
           if (tag === "input") {
             const type = (any.type || "").toLowerCase();
@@ -1480,6 +1563,7 @@ class HotSessionManager {
         });
       };
 
+      // 2) Existing "button group" detector
       document.querySelectorAll("button, [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
         const parent = btn.parentElement;
@@ -1496,7 +1580,6 @@ class HotSessionManager {
         });
 
         if (optionBtns.length < 2) return;
-
         if (isLangSwitcher(optionBtns)) return;
 
         const closestNav = parent.closest("nav, header, [role='navigation']");
@@ -1537,20 +1620,25 @@ class HotSessionManager {
         });
       });
 
-      // Also detect radio-like buttons: [role="radio"], button[aria-pressed]
+      // 3) role=radio / aria-pressed quick pass (kept)
       document.querySelectorAll('[role="radio"], button[aria-pressed]').forEach((btn) => {
         if (!isVisible(btn)) return;
         const text = ((btn as any).textContent || "").trim();
-        if (!text || text.length < 1 || text.length > 30) return;
+        if (!text || text.length < 1 || text.length > 60) return;
         if (submitRe.test(text)) return;
 
         const parent = btn.parentElement;
         let groupLabel = "";
-        if (parent) {
+        const rg = btn.closest('[role="radiogroup"]') as HTMLElement | null;
+        if (rg) {
+          const aria = (rg.getAttribute("aria-label") || "").trim();
+          if (aria) groupLabel = aria;
+        }
+        if (!groupLabel && parent) {
           const prevSib = parent.previousElementSibling as HTMLElement | null;
           if (prevSib) {
             const t = (prevSib.textContent || "").trim();
-            if (t.length >= 2 && t.length <= 80) groupLabel = t;
+            if (t.length >= 2 && t.length <= 120) groupLabel = t;
           }
         }
 
@@ -1567,133 +1655,158 @@ class HotSessionManager {
         });
       });
 
-      // ✅ NEW: Detect real radio groups input[type=radio] grouped by name
-      const radioGroups: Array<{
-        name: string;
-        label: string;
-        required: boolean;
-        options: Array<{ text: string; selector: string }>;
-      }> = [];
-
-      const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
-      const byName = new Map<string, HTMLInputElement[]>();
-      for (const r of radios) {
-        const name = (r.getAttribute("name") || "").toString().trim();
-        if (!name) continue;
-        if (r.disabled) continue;
-
-        // Radio itself may be hidden; allow if its label is visible
-        const id = (r.getAttribute("id") || "").toString();
-        let labelEl: HTMLElement | null = null;
-        if (id) labelEl = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
-
-        const okVisible = isVisible(r) || (labelEl ? isVisible(labelEl) : false);
-        if (!okVisible) continue;
-
-        if (!byName.has(name)) byName.set(name, []);
-        byName.get(name)!.push(r);
-      }
-
-      const guessGroupLabel = (firstRadio: HTMLInputElement): string => {
-        // fieldset legend
-        const fs = firstRadio.closest("fieldset");
-        if (fs) {
-          const lg = fs.querySelector("legend") as HTMLElement | null;
-          const t = (lg?.textContent || "").trim();
-          if (t.length >= 2 && t.length <= 120) return t;
-        }
-
-        // look for a nearby label/header text in ancestors
-        let p: HTMLElement | null = firstRadio.parentElement as any;
-        for (let i = 0; i < 6; i++) {
-          if (!p) break;
-          const candidates = Array.from(p.querySelectorAll(":scope > label, :scope > p, :scope > div, :scope > span, :scope > h3, :scope > h4")) as HTMLElement[];
-          for (const c of candidates) {
-            const t = (c.textContent || "").trim();
-            if (t.length >= 3 && t.length <= 140) {
-              // avoid option texts duplicated; this is heuristic
-              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-              if (!looksLikeData) return t;
-            }
-          }
-          const prev = p.previousElementSibling as HTMLElement | null;
-          if (prev) {
-            const t = (prev.textContent || "").trim();
-            if (t.length >= 3 && t.length <= 140) return t;
-          }
-          p = p.parentElement;
-        }
-        return "radio_choice";
-      };
-
-      for (const [name, items] of byName.entries()) {
-        if (items.length < 2) continue;
-
-        const groupLabelRaw = guessGroupLabel(items[0]);
-        const required =
-          items.some((r) => (r.required === true)) ||
-          items.some((r) => ((r.getAttribute("aria-required") || "").toLowerCase() === "true")) ||
-          /\*|задължително|required/i.test(groupLabelRaw);
-
-        const cleanLabel = groupLabelRaw.replace(/\s*\*\s*$/, "").trim() || "radio_choice";
-
-        const opts: Array<{ text: string; selector: string }> = [];
-        for (const r of items) {
-          const id = (r.getAttribute("id") || "").toString();
-          let labelText = "";
-          let clickSelector = "";
-
-          if (id) {
-            const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
-            if (lab) {
-              labelText = (lab.textContent || "").trim();
-              clickSelector = `label[for="${id.replace(/\"/g, "")}"]`;
-            }
-          }
-
-          if (!labelText) {
-            // maybe wrapped by label
-            const wrapLab = r.closest("label") as HTMLElement | null;
-            if (wrapLab) {
-              labelText = (wrapLab.textContent || "").trim();
-              clickSelector = getSelector(wrapLab);
-            }
-          }
-
-          if (!labelText) {
-            labelText = (r.value || "").toString().trim() || "Option";
-          }
-          if (!clickSelector) {
-            // click radio directly
-            clickSelector = getSelector(r);
-          }
-
-          const t = labelText.replace(/\s+/g, " ").trim();
-          if (!t || submitRe.test(t)) continue;
-
-          opts.push({ text: t, selector: clickSelector });
-        }
-
-        if (opts.length >= 2) {
-          radioGroups.push({
-            name: cleanLabel, // expose label as the "name" so data keys match better
-            label: cleanLabel,
-            required,
-            options: opts.slice(0, 10),
-          });
-        }
-      }
-
+      // ✅ 4) Robust custom radio groups:
+      // - input[type=radio] even if hidden, as long as a visible option wrapper exists
+      // - role=radiogroup + role=radio
+      // - generic elements with aria-checked and text
       const choiceGroups: WizardChoiceGroup[] = [];
 
-      // Group buttons by groupLabel -> button_group
+      const addGroup = (name: string, required: boolean, options: Array<{ text: string; selector: string }>) => {
+        const uniq: Record<string, { text: string; selector: string }> = {};
+        for (const o of options) {
+          const key = `${o.text}||${o.selector}`;
+          uniq[key] = o;
+        }
+        const opts = Object.values(uniq).slice(0, 12);
+        if (opts.length < 2) return;
+        choiceGroups.push({
+          name: name || "radio_choice",
+          label: name || "radio_choice",
+          required,
+          type: "radio",
+          options: opts.map(o => ({ text: o.text, selector: o.selector })),
+        });
+      };
+
+      const closestQuestionText = (el: Element): string => {
+        const rg = el.closest("fieldset, section, article, [role='group'], [role='radiogroup'], .step, .wizard, form") as HTMLElement | null;
+        if (!rg) return "";
+        // try legend/header first
+        const legend = rg.querySelector("legend, h2, h3, h4, label") as HTMLElement | null;
+        const t = (legend?.textContent || "").replace(/\s+/g, " ").trim();
+        if (t.length >= 3 && t.length <= 160) return t;
+        // fallback: first strong-ish text line
+        const raw = (rg.innerText || "").replace(/\s+/g, " ").trim();
+        if (!raw) return "";
+        return raw.slice(0, 120);
+      };
+
+      // 4a) role=radiogroup grouping
+      const radioGroups = Array.from(document.querySelectorAll('[role="radiogroup"]')) as HTMLElement[];
+      for (const rg of radioGroups) {
+        if (!isVisible(rg)) continue;
+        const label = (rg.getAttribute("aria-label") || "").trim() || closestQuestionText(rg);
+        const required =
+          (rg.getAttribute("aria-required") || "").toLowerCase() === "true" ||
+          /\*|задължително|required/i.test(label);
+
+        const radios = Array.from(rg.querySelectorAll('[role="radio"]')) as HTMLElement[];
+        const opts: Array<{ text: string; selector: string }> = [];
+        for (const r of radios) {
+          if (!isVisible(r)) continue;
+          const txt = (r.innerText || r.textContent || "").replace(/\s+/g, " ").trim();
+          if (!txt || submitRe.test(txt)) continue;
+          opts.push({ text: txt, selector: getSelector(r) });
+        }
+        addGroup(label.replace(/\s*\*\s*$/, "").trim() || "radio_choice", required, opts);
+      }
+
+      // 4b) input[type=radio] grouping by name (if available) OR by closest question container
+      const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
+      const byKey = new Map<string, HTMLInputElement[]>();
+
+      const visibleOptionSelector = (r: HTMLInputElement): { text: string; selector: string } | null => {
+        const id = (r.getAttribute("id") || "").toString();
+        // label[for=id]
+        if (id) {
+          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
+          if (lab && isVisible(lab)) {
+            const t = (lab.innerText || lab.textContent || "").replace(/\s+/g, " ").trim();
+            if (t) return { text: t, selector: `label[for="${id.replace(/\"/g, "")}"]` };
+          }
+        }
+        // wrapped by label
+        const wrap = r.closest("label") as HTMLElement | null;
+        if (wrap && isVisible(wrap)) {
+          const t = (wrap.innerText || wrap.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) return { text: t, selector: getSelector(wrap) };
+        }
+        // option row wrapper (common custom UI)
+        const row = r.closest("[role='radio'], li, .option, .radio, .radio-option, .choice, .selectable, .btn") as HTMLElement | null;
+        if (row && isVisible(row)) {
+          const t = (row.innerText || row.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) return { text: t, selector: getSelector(row) };
+        }
+        // last resort: click input itself if visible
+        if (isVisible(r)) {
+          const v = (r.value || "").toString().trim() || "Option";
+          return { text: v, selector: getSelector(r) };
+        }
+        return null;
+      };
+
+      for (const r of radios) {
+        if (r.disabled) continue;
+        const opt = visibleOptionSelector(r);
+        if (!opt) continue;
+
+        const name = (r.getAttribute("name") || "").toString().trim();
+        const q = closestQuestionText(r) || "radio_choice";
+        const key = name ? `name:${name}` : `q:${q}`;
+
+        if (!byKey.has(key)) byKey.set(key, []);
+        byKey.get(key)!.push(r);
+      }
+
+      for (const [key, list] of byKey.entries()) {
+        if (list.length < 2) continue;
+        const label =
+          key.startsWith("q:") ? key.slice(2) :
+          closestQuestionText(list[0]) || "radio_choice";
+
+        const required =
+          list.some(r => r.required) ||
+          list.some(r => (r.getAttribute("aria-required") || "").toLowerCase() === "true") ||
+          /\*|задължително|required/i.test(label);
+
+        const opts: Array<{ text: string; selector: string }> = [];
+        for (const r of list) {
+          const opt = visibleOptionSelector(r);
+          if (!opt) continue;
+          opts.push(opt);
+        }
+        addGroup(label.replace(/\s*\*\s*$/, "").trim() || "radio_choice", required, opts);
+      }
+
+      // 4c) aria-checked generic (some frameworks use divs w/ aria-checked but no role)
+      const genericAria = Array.from(document.querySelectorAll('[aria-checked]')) as HTMLElement[];
+      const tmpByQ = new Map<string, Array<{ text: string; selector: string; required: boolean }>>();
+      for (const el of genericAria) {
+        if (!isVisible(el)) continue;
+        const txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!txt || txt.length > 80) continue;
+        if (submitRe.test(txt)) continue;
+
+        const q = closestQuestionText(el) || "radio_choice";
+        const required = /\*|задължително|required/i.test(q);
+
+        if (!tmpByQ.has(q)) tmpByQ.set(q, []);
+        tmpByQ.get(q)!.push({ text: txt, selector: getSelector(el), required });
+      }
+      for (const [q, opts] of tmpByQ.entries()) {
+        // avoid duplicating if we already added similar group
+        const already = choiceGroups.some(g => (g.label || "").trim() === q.trim());
+        if (already) continue;
+        addGroup(q.replace(/\s*\*\s*$/, "").trim() || "radio_choice", opts.some(o => o.required), opts);
+      }
+
+      // Convert button group detection into choiceGroups too (kept behavior)
       const groupMap = new Map<string, typeof btns>();
       for (const b of btns) {
         const key = b.groupLabel;
         if (!groupMap.has(key)) groupMap.set(key, []);
         groupMap.get(key)!.push(b);
       }
-
       for (const [name, items] of groupMap) {
         choiceGroups.push({
           name,
@@ -1704,75 +1817,11 @@ class HotSessionManager {
         });
       }
 
-      // Add radio groups
-      for (const rg of radioGroups) {
-        choiceGroups.push({
-          name: rg.name,
-          label: rg.label,
-          required: rg.required,
-          type: "radio",
-          options: rg.options.map(o => ({ text: o.text, selector: o.selector })),
-        });
-      }
-
       return { fields, choices: btns, choiceGroups };
     });
   }
 
-  private async getWizardDomSignature(page: Page): Promise<string> {
-    try {
-      return await page.evaluate(() => {
-        const title = document.title || "";
-        const h1 = (document.querySelector("h1")?.textContent || "").trim();
-        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
-        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter((el: any) => {
-            const r = (el as any).getBoundingClientRect?.();
-            if (!r) return false;
-            const style = window.getComputedStyle(el as any);
-            if (style.display === "none" || style.visibility === "hidden") return false;
-            return r.width > 0 && r.height > 0;
-          })
-          .slice(0, 25)
-          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
-          .join("|");
-        return `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
-      });
-    } catch {
-      return `sig:${Date.now()}`;
-    }
-  }
-
-  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
-    try {
-      await page.waitForFunction(
-        (sig: string) => {
-          const title = document.title || "";
-          const h1 = (document.querySelector("h1")?.textContent || "").trim();
-          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
-          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-            .filter((el: any) => {
-              const r = (el as any).getBoundingClientRect?.();
-              if (!r) return false;
-              const style = window.getComputedStyle(el as any);
-              if (style.display === "none" || style.visibility === "hidden") return false;
-              return r.width > 0 && r.height > 0;
-            })
-            .slice(0, 25)
-            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
-            .join("|");
-          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
-          return cur !== sig;
-        },
-        beforeSig,
-        { timeout: 9000 }
-      );
-    } catch {
-      await page.waitForTimeout(900).catch(() => {});
-    }
-  }
-
-  // ✅ Count visible UNFILLED elements in the DOM: empty inputs AND unselected choice groups (button/radio)
+  // ✅ v6.0.8: counts custom radio groups as missing
   private async countUnfilledVisibleFields(page: Page): Promise<{ count: number; labels: string[] }> {
     try {
       return await page.evaluate(() => {
@@ -1784,28 +1833,18 @@ class HotSessionManager {
           return !!r && r.width > 0 && r.height > 0;
         };
 
-        const getLabel = (el: Element) => {
-          const any = el as any;
-          const id = any.id ? String(any.id) : "";
-          if (id) {
-            const lab = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
-            if (lab && lab.textContent) return lab.textContent.trim();
-          }
-          let p: Element | null = el;
-          for (let i = 0; i < 3; i++) {
-            if (!p) break;
-            p = p.parentElement;
-            if (p) {
-              const lab = p.querySelector?.("label") as HTMLElement | null;
-              if (lab && lab.textContent) return lab.textContent.trim();
-            }
-          }
-          return any.placeholder || any.name || any.type || "field";
+        const getLabelNear = (root: Element) => {
+          const legend = root.querySelector("legend, h2, h3, h4, label") as HTMLElement | null;
+          const t = (legend?.textContent || "").replace(/\s+/g, " ").trim();
+          if (t.length >= 3 && t.length <= 180) return t;
+          const raw = (root as any).innerText ? String((root as any).innerText) : "";
+          const r2 = raw.replace(/\s+/g, " ").trim();
+          return r2.slice(0, 120) || "Избор";
         };
 
         const pending: string[] = [];
 
-        // 1) Empty input / textarea / select fields (exclude radio/checkbox/file)
+        // 1) Empty inputs (exclude radio/checkbox/file)
         document.querySelectorAll("input, textarea, select").forEach((el: any) => {
           if (!isVisible(el)) return;
           const type = (el.type || "").toLowerCase();
@@ -1813,105 +1852,48 @@ class HotSessionManager {
           if (el.disabled) return;
           if (el.getAttribute?.("aria-hidden") === "true") return;
           const val = (el.value || "").toString().trim();
-          if (!val) pending.push(getLabel(el));
+          if (!val) pending.push(el.placeholder || el.name || el.getAttribute("aria-label") || "field");
         });
 
-        // 2) Unselected button choice groups (existing logic)
-        const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
-        const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
-        const seenContainers = new Set<Element>();
-
-        document.querySelectorAll("button, [role='button']").forEach((btn) => {
-          if (!isVisible(btn)) return;
-          const parent = btn.parentElement;
-          if (!parent || seenContainers.has(parent)) return;
-
-          if (parent.closest("nav, header, [role='navigation']")) return;
-
-          const siblings = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
-            .filter((b) => isVisible(b));
-          if (siblings.length < 2) return;
-
-          const optBtns = siblings.filter((b) => {
-            const t = ((b as any).textContent || "").trim();
-            return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
-          });
-          if (optBtns.length < 2) return;
-
-          const allLang = optBtns.every((b) => {
-            const t = ((b as any).textContent || "").trim().toLowerCase();
-            return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
-          });
-          if (allLang) return;
-
-          seenContainers.add(parent);
-
-          const hasSelected = optBtns.some((b: any) => {
-            if (b.getAttribute("aria-pressed") === "true") return true;
-            if (b.getAttribute("aria-checked") === "true") return true;
-            if (b.getAttribute("data-state") === "on" || b.getAttribute("data-state") === "active") return true;
-            const cls = (b.className || "").toLowerCase();
-            if (/\bactive\b|\bselected\b|\bchosen\b|\bchecked\b/.test(cls)) return true;
-            if (b.getAttribute("data-selected") === "true") return true;
-            return false;
-          });
-
-          if (!hasSelected) {
-            let groupLabel = "";
-            const prevSib = parent.previousElementSibling as HTMLElement | null;
-            if (prevSib) {
-              const t = (prevSib.textContent || "").trim();
-              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-              if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
-            }
-            const optTexts = optBtns.map((b: any) => ((b as any).textContent || "").trim()).join("/");
-            pending.push(groupLabel ? `${groupLabel} (${optTexts})` : `Избор: ${optTexts}`);
+        // 2) role=radiogroup without selected aria-checked=true
+        const rgs = Array.from(document.querySelectorAll('[role="radiogroup"]')) as HTMLElement[];
+        for (const rg of rgs) {
+          if (!isVisible(rg)) continue;
+          const radios = Array.from(rg.querySelectorAll('[role="radio"]')) as HTMLElement[];
+          if (radios.length < 2) continue;
+          const anyChecked = radios.some(r => (r.getAttribute("aria-checked") || "").toLowerCase() === "true");
+          if (!anyChecked) {
+            const label = (rg.getAttribute("aria-label") || "").trim() || getLabelNear(rg);
+            pending.push(label);
           }
-        });
+        }
 
-        // ✅ 3) Radio groups (input[type=radio] grouped by name) with no checked
+        // 3) input[type=radio] groups without checked
         const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
         const byName = new Map<string, HTMLInputElement[]>();
         for (const r of radios) {
-          const name = (r.getAttribute("name") || "").toString().trim();
-          if (!name) continue;
           if (r.disabled) continue;
-
+          // allow hidden input if some wrapper is visible
           const id = (r.getAttribute("id") || "").toString();
           let labelEl: HTMLElement | null = null;
           if (id) labelEl = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
-
           const okVisible = isVisible(r) || (labelEl ? isVisible(labelEl) : false);
           if (!okVisible) continue;
 
-          if (!byName.has(name)) byName.set(name, []);
-          byName.get(name)!.push(r);
+          const name = (r.getAttribute("name") || "").toString().trim();
+          const key = name || ("q:" + (r.closest("fieldset, section, article, [role='group'], .step, form") as any)?.innerText?.slice(0, 80) || "radio");
+          if (!byName.has(key)) byName.set(key, []);
+          byName.get(key)!.push(r);
         }
-
-        const guessLabel = (first: HTMLInputElement) => {
-          const fs = first.closest("fieldset");
-          if (fs) {
-            const lg = fs.querySelector("legend") as HTMLElement | null;
-            const t = (lg?.textContent || "").trim();
-            if (t.length >= 2 && t.length <= 120) return t;
-          }
-          const p = first.parentElement as HTMLElement | null;
-          const prev = p?.previousElementSibling as HTMLElement | null;
-          const t = (prev?.textContent || "").trim();
-          if (t && t.length >= 3 && t.length <= 140) return t;
-          return "Избор (radio)";
-        };
-
         for (const [, list] of byName.entries()) {
           if (list.length < 2) continue;
           const anyChecked = list.some(r => r.checked);
           if (anyChecked) continue;
-
-          const label = guessLabel(list[0]);
-          pending.push(label);
+          const root = (list[0].closest("fieldset, section, article, [role='group'], .step, form") as HTMLElement | null) || list[0].parentElement;
+          pending.push(root ? getLabelNear(root) : "Избор (radio)");
         }
 
-        return { count: pending.length, labels: pending.slice(0, 15) };
+        return { count: pending.length, labels: pending.slice(0, 20) };
       });
     } catch {
       return { count: 0, labels: [] };
@@ -1937,17 +1919,7 @@ class HotSessionManager {
         };
 
         const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter((el: any) => {
-            if (!isVisible(el)) return false;
-            const tag = (el.tagName || "").toLowerCase();
-            if (tag === "input") {
-              const type = (el.type || "").toLowerCase();
-              if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
-            }
-            if (el.disabled) return false;
-            if (el.getAttribute?.("aria-hidden") === "true") return false;
-            return true;
-          });
+          .filter((el: any) => isVisible(el));
 
         if (inputs.length > 0 && !urlSuccess) return false;
 
@@ -2074,10 +2046,7 @@ class HotSessionManager {
       return false;
     }
 
-    if (!picked) {
-      picked = nonEmpty[0];
-    }
-
+    if (!picked) picked = nonEmpty[0];
     if (!picked || !String(picked.value || "").trim()) return false;
 
     const ok = await page.evaluate<boolean, { sel: string; v: string }>(
@@ -2136,7 +2105,6 @@ class HotSessionManager {
     }
   }
 
-  // ✅ NEW: wizard file upload (no schema fields available)
   private async uploadFileWizard(
     page: Page,
     file: NonNullable<FillFormRequest["file"]>
@@ -2148,7 +2116,6 @@ class HotSessionManager {
       const buffer = Buffer.from(file.base64, "base64");
       fs.writeFileSync(tmpPath, buffer);
 
-      // Prefer by field_name -> input[name=...]
       const selectors: string[] = [];
       if (file.field_name) selectors.push(`input[type="file"][name="${file.field_name.replace(/\"/g, "")}"]`);
       selectors.push('input[type="file"]');
@@ -2374,7 +2341,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.7-universal-choices+radio+file", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.8-universal-choices+radio+file+customRadio", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -2443,7 +2410,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.7-universal-choices+radio+file listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.8-universal-choices+radio+file+customRadio listening on :${PORT}`);
   });
 
   await manager.start();
