@@ -1653,7 +1653,8 @@ class HotSessionManager {
         name: string;
         label: string;
         required: boolean;
-        type: "button_group";
+        // Keep this aligned with WizardChoiceGroup["type"] on the TS side.
+        type: "button_group" | "radio" | "select";
         options: Array<{ text: string; selector: string }>;
       }> = [];
 
