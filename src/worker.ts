@@ -1676,108 +1676,148 @@ class HotSessionManager {
 
 
       // ─────────────────────────────────────────────
-      // ✅ Native RADIO groups: input[type=radio] + label (Dentasay style)
+      // ✅ Native RADIO groups (even when inputs are hidden)
+      // Many UI kits render radio options as DIV rows with hidden inputs.
+      // We detect groups by input[name] and click the best visible wrapper.
       // ─────────────────────────────────────────────
-      try {
-        const cssEscape = (s: string) => {
-          try {
-            // @ts-ignore
-            return (CSS && (CSS as any).escape) ? (CSS as any).escape(s) : s.replace(/[^\w-]/g, "\\$&");
-          } catch {
-            return s.replace(/[^\w-]/g, "\\$&");
-          }
-        };
+      const radioInputs = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
 
-        const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
-        const byName = new Map<string, HTMLInputElement[]>();
+      const radioByName = new Map<string, HTMLInputElement[]>();
+      for (const r of radioInputs) {
+        const name = (r.name || "").toString().trim();
+        if (!name) continue;
+        if ((r as any).disabled) continue;
+        if ((r as any).getAttribute?.("aria-hidden") === "true") continue;
+        if (!radioByName.has(name)) radioByName.set(name, []);
+        radioByName.get(name)!.push(r);
+      }
 
-        for (const r of radios) {
-          const name = (r.name || "").toString().trim();
-          if (!name) continue;
-          if ((r as any).disabled) continue;
-          if ((r as any).getAttribute?.("aria-hidden") === "true") continue;
-          if (!byName.has(name)) byName.set(name, []);
-          byName.get(name)!.push(r);
+      const getRadioOptionText = (input: HTMLInputElement): string => {
+        const id = input.id ? String(input.id) : "";
+        if (id) {
+          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
+          const t = (lab?.textContent || "").trim();
+          if (t) return t;
+        }
+        const wrapLab = input.closest("label") as HTMLElement | null;
+        const t2 = (wrapLab?.textContent || "").trim();
+        if (t2) return t2;
+        // Try closest row container text (common for div-based radios)
+        const row = (input.closest("[role='radio']") ||
+          input.closest("[data-radio]") ||
+          input.closest("[class*='radio']") ||
+          input.closest("div")) as HTMLElement | null;
+        const t3 = (row?.textContent || "").trim();
+        if (t3 && t3.length <= 80) return t3;
+        return (input.value || "").toString().trim();
+      };
+
+      const pickRadioClickTarget = (input: HTMLInputElement): Element => {
+        const id = input.id ? String(input.id) : "";
+        if (id) {
+          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`);
+          if (lab && isVisible(lab)) return lab;
+        }
+        const labWrap = input.closest("label");
+        if (labWrap && isVisible(labWrap)) return labWrap;
+
+        // Prefer a visible "row" wrapper (div option)
+        let el: Element | null =
+          input.closest("[role='radio']") ||
+          input.closest("[data-radio]") ||
+          input.closest("[data-value]") ||
+          input.closest("[class*='radio']") ||
+          input.parentElement;
+
+        // climb until visible + clickable-ish
+        for (let i = 0; i < 6 && el; i++) {
+          const st = window.getComputedStyle(el as any);
+          const clickable =
+            (el as any).onclick ||
+            st.cursor === "pointer" ||
+            (el as any).getAttribute?.("role") === "radio" ||
+            (el as any).getAttribute?.("tabindex") !== null;
+          if (isVisible(el) && clickable) return el;
+          el = (el as any).parentElement || null;
         }
 
-        const getRadioOptionText = (input: HTMLInputElement): string => {
-          const id = input.id ? String(input.id) : "";
-          if (id) {
-            const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
-            const t = (lab?.textContent || "").trim();
-            if (t) return t;
-          }
-          const wrap = input.closest("label") as HTMLElement | null;
-          const t2 = (wrap?.textContent || "").trim();
-          if (t2) return t2;
-          return (input.value || "").toString().trim();
-        };
+        return input;
+      };
 
-        const getRadioOptionSelector = (input: HTMLInputElement): string => {
-          const id = input.id ? String(input.id) : "";
-          if (id) {
-            const labSel = `label[for="${cssEscape(id)}"]`;
-            const lab = document.querySelector(labSel) as HTMLElement | null;
-            if (lab && isVisible(lab)) return labSel;
-            return `#${cssEscape(id)}`;
-          }
-          return getSelector(input);
-        };
-
-        const getRadioGroupLabel = (first: HTMLInputElement): string => {
-          // fieldset/legend first
-          const fs = first.closest("fieldset");
-          if (fs) {
-            const legend = fs.querySelector("legend") as HTMLElement | null;
-            const t = (legend?.textContent || "").trim();
-            if (t) return t;
-          }
-          // walk up and look for previous sibling question text
-          let cur: HTMLElement | null = first.parentElement as HTMLElement | null;
-          for (let i = 0; i < 7 && cur; i++) {
-            const prev = cur.previousElementSibling as HTMLElement | null;
-            if (prev) {
-              const t = (prev.textContent || "").trim();
-              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-              if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
-            }
-            cur = cur.parentElement as HTMLElement | null;
-          }
-          return "";
-        };
-
-        for (const [name, items] of byName) {
-          if (!items || items.length < 2) continue;
-
-          const label = (getRadioGroupLabel(items[0]) || "").trim();
-          const required =
-            items.some((i) => (i as any).required) ||
-            /\*|задължително|required/i.test(label);
-
-          const rawOpts = items
-            .map((i) => ({ text: getRadioOptionText(i), selector: getRadioOptionSelector(i) }))
-            .filter((o) => o.text && o.selector);
-
-          const seen = new Set<string>();
-          const options: Array<{ text: string; selector: string }> = [];
-          for (const o of rawOpts) {
-            const k = o.text.trim().toLowerCase();
-            if (!k || seen.has(k)) continue;
-            seen.add(k);
-            options.push(o);
-          }
-
-          if (options.length < 2) continue;
-
-          choiceGroups.push({
-            name: label || name,
-            label: label || name,
-            required,
-            type: "radio",
-            options,
-          } as any);
+      const getRadioGroupLabel = (first: HTMLInputElement): string => {
+        // fieldset/legend
+        const fs = first.closest("fieldset");
+        if (fs) {
+          const legend = fs.querySelector("legend") as HTMLElement | null;
+          const t = (legend?.textContent || "").trim();
+          if (t) return t;
         }
-      } catch {}
+
+        // Walk up from click target and look for a nearby title node before the options container
+        const ct = pickRadioClickTarget(first) as HTMLElement;
+        let cur: HTMLElement | null = (ct.closest("div") as HTMLElement | null) || (ct.parentElement as HTMLElement | null);
+
+        for (let depth = 0; depth < 8 && cur; depth++) {
+          // Prefer heading/label-like nodes inside current block
+          const localLabel =
+            (cur.querySelector("label") as HTMLElement | null) ||
+            (cur.querySelector("p") as HTMLElement | null) ||
+            (cur.querySelector("h3, h4, h5") as HTMLElement | null);
+          if (localLabel) {
+            const t = (localLabel.textContent || "").trim();
+            const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+            if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
+          }
+
+          const prev = cur.previousElementSibling as HTMLElement | null;
+          if (prev) {
+            const t = (prev.textContent || "").trim();
+            const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+            if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
+          }
+
+          cur = cur.parentElement as HTMLElement | null;
+        }
+
+        return "";
+      };
+
+      for (const [name, items] of radioByName) {
+        if (!items || items.length < 2) continue;
+
+        const label = (getRadioGroupLabel(items[0]) || "").trim();
+        const required =
+          items.some((i) => (i as any).required) ||
+          /\*|задължително|required/i.test(label);
+
+        const rawOptions = items
+          .map((i) => {
+            const text = getRadioOptionText(i);
+            const target = pickRadioClickTarget(i);
+            return { text, selector: getSelector(target) };
+          })
+          .filter((o) => o.text && o.selector);
+
+        // de-dupe by option text
+        const seen = new Set<string>();
+        const options: Array<{ text: string; selector: string }> = [];
+        for (const o of rawOptions) {
+          const key = o.text.trim().toLowerCase();
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          options.push(o);
+        }
+
+        if (options.length < 2) continue;
+
+        choiceGroups.push({
+          name: label || name,
+          label: label || name,
+          required,
+          type: "radio",
+          options,
+        });
+      }
 
       return { fields, choices: btns, choiceGroups };
     });
@@ -1947,7 +1987,7 @@ class HotSessionManager {
         });
 
 
-        // 3) ✅ Unselected native RADIO groups (input[type=radio])
+        // 3) ✅ Unselected RADIO groups (even if inputs are hidden)
         try {
           const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as any[];
           const byName = new Map<string, any[]>();
@@ -1961,36 +2001,84 @@ class HotSessionManager {
             byName.get(name)!.push(r);
           }
 
-          const getRadioGroupLabel = (first: any) => {
+          const isClickableVisible = (el: any) => {
+            if (!el) return false;
+            if (!isVisible(el)) return false;
+            const st = window.getComputedStyle(el);
+            if (!st) return false;
+            return st.cursor === "pointer" || !!el.onclick || el.getAttribute?.("role") === "radio" || el.getAttribute?.("tabindex") !== null;
+          };
+
+          const pickClickTarget = (input: any) => {
+            const id = (input.id || "").toString();
+            if (id) {
+              const lab = document.querySelector(`label[for="${id.replace(/"/g, "")}"]`);
+              if (lab && isVisible(lab)) return lab;
+            }
+            const labWrap = input.closest?.("label");
+            if (labWrap && isVisible(labWrap)) return labWrap;
+
+            let el =
+              input.closest?.("[role='radio']") ||
+              input.closest?.("[data-radio]") ||
+              input.closest?.("[data-value]") ||
+              input.closest?.("[class*='radio']") ||
+              input.parentElement;
+
+            for (let i = 0; i < 6 && el; i++) {
+              if (isClickableVisible(el)) return el;
+              el = el.parentElement;
+            }
+            return input;
+          };
+
+          const getGroupLabel = (first: any) => {
             const fs = first.closest?.("fieldset");
             if (fs) {
               const legend = fs.querySelector?.("legend");
               const t = (legend?.textContent || "").trim();
               if (t) return t;
             }
-            let cur = first.parentElement as any;
-            for (let i = 0; i < 7 && cur; i++) {
-              const prev = cur.previousElementSibling as any;
+
+            const ct = pickClickTarget(first);
+            let cur = (ct?.closest?.("div") as any) || ct?.parentElement;
+
+            for (let depth = 0; depth < 8 && cur; depth++) {
+              const local =
+                (cur.querySelector?.("label") as any) ||
+                (cur.querySelector?.("p") as any) ||
+                (cur.querySelector?.("h3, h4, h5") as any);
+
+              if (local) {
+                const t = (local.textContent || "").trim();
+                const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+                if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
+              }
+
+              const prev = cur.previousElementSibling;
               if (prev) {
                 const t = (prev.textContent || "").trim();
                 const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
                 if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
               }
-              cur = cur.parentElement as any;
+              cur = cur.parentElement;
             }
             return "";
           };
 
-          const getRadioOptionText = (input: any) => {
+          const getOptText = (input: any) => {
             const id = (input.id || "").toString();
             if (id) {
               const lab = document.querySelector(`label[for="${id.replace(/"/g, "")}"]`) as any;
               const t = (lab?.textContent || "").trim();
               if (t) return t;
             }
-            const wrap = input.closest?.("label");
-            const t2 = (wrap?.textContent || "").trim();
+            const wrapLab = input.closest?.("label");
+            const t2 = (wrapLab?.textContent || "").trim();
             if (t2) return t2;
+            const ct = pickClickTarget(input);
+            const t3 = (ct?.textContent || "").trim();
+            if (t3 && t3.length <= 80) return t3;
             return (input.value || "").toString().trim();
           };
 
@@ -2000,8 +2088,12 @@ class HotSessionManager {
             const anyChecked = items.some((r) => Boolean(r.checked));
             if (anyChecked) continue;
 
-            const label = (getRadioGroupLabel(items[0]) || "").trim();
-            const optTexts = items.map(getRadioOptionText).filter(Boolean).slice(0, 6).join("/");
+            // only count if we have a visible clickable target (otherwise it's irrelevant)
+            const hasVisibleTarget = items.some((r) => isClickableVisible(pickClickTarget(r)));
+            if (!hasVisibleTarget) continue;
+
+            const label = (getGroupLabel(items[0]) || "").trim();
+            const optTexts = items.map(getOptText).filter(Boolean).slice(0, 6).join("/");
 
             pending.push(label ? `${label} (${optTexts})` : `Избор: ${optTexts}`);
           }
