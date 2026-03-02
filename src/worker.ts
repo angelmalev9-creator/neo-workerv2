@@ -1,11 +1,12 @@
 /**
- * NEO WORKER v6.0.8-universal-choices+radio+file+customRadio — Universal, deterministic, schema-first
+ * NEO WORKER v6.0.6-universal-choices — Universal, deterministic, schema-first
  *
- * Patch v6.0.8:
- * - Wizard: scanWizardStep detects CUSTOM radio groups (role=radiogroup/role=radio, aria-checked, hidden inputs + visible wrappers)
- * - Wizard: countUnfilledVisibleFields counts unselected custom radio groups as pending
- * - Wizard: getWizardDomSignature includes visible step text snippet to avoid false "same step" loops
- * - Keeps previous v6.0.7 changes (radio + file upload)
+ * Patch v6.0.6-universal-choices:
+ * - Wizard: scanWizardStep detects ALL button choice groups generically (not just gender)
+ * - Wizard: fillWizard matches ANY choice from data by group name/label
+ * - Wizard: buildWizardNeedPayload checks choice groups as missing_required
+ * - Added WizardChoiceGroup type for structured choice group handling
+ * - Does NOT change kind=form flow besides select matching safety
  */
 
 import express, { Request, Response } from "express";
@@ -486,48 +487,48 @@ class HotSessionManager {
 
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
     try {
-      const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
-      const autoSubmit = request.auto_submit !== false;
-      const strictSelect = request.strict_select === true;
+    const { site_id, session_id, form_id, fingerprint, kind, data, confirmed, file } = request;
+    const autoSubmit = request.auto_submit !== false;
+    const strictSelect = request.strict_select === true;
 
-      const session = this.sessions.get(site_id);
-      if (!session) return { success: false, message: "Няма активна сесия" };
+    const session = this.sessions.get(site_id);
+    if (!session) return { success: false, message: "Няма активна сесия" };
 
-      session.lastActivity = Date.now();
+    session.lastActivity = Date.now();
 
-      if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
-        session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
-      }
+    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
+      session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
+    }
 
-      let schema: FormSchemaRow | undefined;
-      if (form_id) schema = session.formSchemas.find(s => s.id === form_id);
-      if (!schema && fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
-      if (!schema && kind) schema = session.formSchemas.find(s => s.kind === kind);
-      if (!schema) schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
+    let schema: FormSchemaRow | undefined;
+    if (form_id) schema = session.formSchemas.find(s => s.id === form_id);
+    if (!schema && fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
+    if (!schema && kind) schema = session.formSchemas.find(s => s.kind === kind);
+    if (!schema) schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
-      if (!schema) {
-        console.log(`[FILL-FORM][NO_SCHEMA] form_id=${form_id || ""} fingerprint=${(fingerprint || "").slice(0, 12)} schemas=${session.formSchemas.length} ids=${session.formSchemas.map(s => s.id).join(",")}`);
-        return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
-      }
+    if (!schema) {
+      console.log(`[FILL-FORM][NO_SCHEMA] form_id=${form_id || ""} fingerprint=${(fingerprint || "").slice(0, 12)} schemas=${session.formSchemas.length} ids=${session.formSchemas.map(s => s.id).join(",")}`);
+      return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
+    }
 
-      console.log(`[FILL-FORM] kind=${schema.kind} form_id=${schema.id} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
+    console.log(`[FILL-FORM] kind=${schema.kind} form_id=${schema.id} fingerprint=${schema.fingerprint.slice(0, 12)}… fields=${schema.schema.fields?.length || 0}`);
 
-      const merged = mergeConfirmedData(data || {}, confirmed as any);
+    const merged = mergeConfirmedData(data || {}, confirmed as any);
 
-      const mergedKeys = Object.keys(merged);
-      const mergedPreview = mergedKeys.slice(0, 12).map(k => `${k}=${summarizeValue(k, (merged as any)[k])}`);
-      console.log(`[FILL-FORM][PAYLOAD] keys=${mergedKeys.join(",")} preview=${mergedPreview.join(" | ")}`);
+    const mergedKeys = Object.keys(merged);
+    const mergedPreview = mergedKeys.slice(0, 12).map(k => `${k}=${summarizeValue(k, (merged as any)[k])}`);
+    console.log(`[FILL-FORM][PAYLOAD] keys=${mergedKeys.join(",")} preview=${mergedPreview.join(" | ")}`);
 
-      await this.ensureOnSchemaUrl(session.page, schema.url);
+    await this.ensureOnSchemaUrl(session.page, schema.url);
 
-      let result: { ok: boolean; message: string; observation?: JsonObj };
-      if (schema.kind === "wizard") {
-        result = await this.fillWizard(session.page, schema, merged, file, autoSubmit, strictSelect);
-      } else {
-        result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
-      }
+    let result: { ok: boolean; message: string; observation?: JsonObj };
+    if (schema.kind === "wizard") {
+      result = await this.fillWizard(session.page, schema, merged, autoSubmit, strictSelect);
+    } else {
+      result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
+    }
 
-      return { success: !!result.ok, message: result.message, observation: result.observation };
+    return { success: !!result.ok, message: result.message, observation: result.observation };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[FILL-FORM][CRASH] ${msg}`, e);
@@ -681,286 +682,448 @@ class HotSessionManager {
     page: Page,
     schema: FormSchemaRow,
     data: Record<string, unknown>,
-    file?: FillFormRequest["file"],
     autoSubmit = true,
     strictSelect = false
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     try {
-      const actions: string[] = [];
-      const maxSteps = 8;
+    const actions: string[] = [];
+    const maxSteps = 8;
 
-      const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
-      const hasFile = !!(file && file.base64 && file.filename);
-      if (!hasAnyData && !hasFile) {
-        const obs = await this.quickObserve(page);
-        (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
-        return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
-      }
+    const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
+    if (!hasAnyData) {
+      const obs = await this.quickObserve(page);
+      (obs as any).wizard = { note: "Missing data payload (no fields to fill)" };
+      return { ok: false, message: "Wizard: липсват данни за попълване (payload е празен)", observation: obs };
+    }
 
-      let didInteract = false;
+    let didInteract = false;
 
-      console.log(`[WIZARD] start url=${page.url()}`);
+    console.log(`[WIZARD] start url=${page.url()}`);
 
-      for (let step = 1; step <= maxSteps; step++) {
-        const beforeSig = await this.getWizardDomSignature(page);
-        const scanned = await this.scanWizardStep(page);
+    for (let step = 1; step <= maxSteps; step++) {
+      const beforeSig = await this.getWizardDomSignature(page);
+      const scanned = await this.scanWizardStep(page);
+
+      console.log(
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} radios=${scanned.radioGroups.length} checkboxes=${scanned.checkboxes.length} files=${scanned.fileUploads.length} sig=${beforeSig.slice(0, 60)}`
+      );
+
+      // 1) Fill visible fields
+      let filled = 0;
+      for (const f of scanned.fields) {
+        const v = this.matchWizardFieldValue(f, data);
+        const matched = v !== undefined && String(v).trim().length > 0;
 
         console.log(
-          `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} groups=${scanned.choiceGroups.length} sig=${beforeSig.slice(0, 60)}`
+          `[WIZARD][FIELD] tag=${f.tag} type=${f.type} name="${f.name}" label="${f.label}" required=${f.required} matched=${matched ? "yes" : "no"}`
         );
 
-        // 0) File upload step
-        if (file) {
-          const up = await this.uploadFileWizard(page, file);
-          if (up) {
-            actions.push(`Файл: ${file.filename}`);
-            didInteract = true;
+        if (!matched) continue;
+        const ok = await this.fillWizardField(page, f, String(v), strictSelect);
+        if (ok) {
+          filled++;
+          actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
+        }
+      }
+      if (filled > 0) didInteract = true;
+
+      // 2) Handle choice button groups (generic — matches any choice from data)
+      for (const group of scanned.choiceGroups) {
+        // Try to find the value for this choice group in data
+        // Look by group name, label, and common aliases
+        const groupNameNorm = normLabel(group.name);
+        let desiredValue = "";
+
+        // Direct lookup by group name/label
+        for (const k of Object.keys(data)) {
+          const kNorm = normLabel(k);
+          if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
+            desiredValue = String((data as any)[k] ?? "").trim();
+            break;
           }
         }
 
-        // 1) Fill visible fields
-        let filled = 0;
-        for (const f of scanned.fields) {
-          if ((f.type || "").toLowerCase() === "file") continue;
-
-          const v = this.matchWizardFieldValue(f, data);
-          const matched = v !== undefined && String(v).trim().length > 0;
-
-          console.log(
-            `[WIZARD][FIELD] tag=${f.tag} type=${f.type} name="${f.name}" label="${f.label}" required=${f.required} matched=${matched ? "yes" : "no"}`
-          );
-
-          if (!matched) continue;
-          const ok = await this.fillWizardField(page, f, String(v), strictSelect);
-          if (ok) {
-            filled++;
-            actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
-          }
-        }
-        if (filled > 0) didInteract = true;
-
-        // 2) Choice groups (button + radio + custom radio)
-        for (const group of scanned.choiceGroups) {
-          const groupNameNorm = normLabel(group.name);
-          let desiredValue = "";
-
+        // Fallback: if no direct key match, check if any data VALUE matches an option text
+        // Only use EXACT match (after normalization) to avoid false positives
+        // e.g. data has "Пол (избор: Мъж / Жена)": "Мъж" — the key won't match group.name directly
+        if (!desiredValue) {
           for (const k of Object.keys(data)) {
-            const kNorm = normLabel(k);
-            if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
-              desiredValue = String((data as any)[k] ?? "").trim();
+            const v = String((data as any)[k] ?? "").trim();
+            if (!v) continue;
+            // Skip values that are clearly not choice options (emails, phones, long strings)
+            if (v.includes("@") || v.length > 40 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+            const vNorm = normLabel(v);
+            if (!vNorm || vNorm.length < 2) continue;
+            // STRICT: only exact match after normalization — no substring matching
+            const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
+            if (optMatch) {
+              desiredValue = v;
               break;
             }
           }
+        }
 
-          if (!desiredValue) {
-            for (const k of Object.keys(data)) {
-              const v = String((data as any)[k] ?? "").trim();
-              if (!v) continue;
-              if (v.includes("@") || v.length > 80 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
-              const vNorm = normLabel(v);
-              if (!vNorm || vNorm.length < 2) continue;
-              const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
-              if (optMatch) {
-                desiredValue = v;
-                break;
-              }
-            }
+        if (!desiredValue) continue;
+
+        const wantedNorm = normLabel(desiredValue);
+        const pick =
+          group.options.find((c) => normLabel(c.text) === wantedNorm) ||
+          group.options.find((c) => {
+            const optNorm = normLabel(c.text);
+            // Only allow substring match if both sides are at least 3 chars
+            if (optNorm.length < 3 || wantedNorm.length < 3) return false;
+            return optNorm.includes(wantedNorm) || wantedNorm.includes(optNorm);
+          });
+
+        if (pick) {
+          const clicked = await this.safeClick(page, pick.selector);
+          console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
+          if (clicked) {
+            actions.push(`${group.name}: ${pick.text}`);
+            didInteract = true;
           }
+        } else {
+          console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
+        }
+      }
 
-          if (!desiredValue) continue;
+      // 2b) Handle radio button groups
+      for (const rg of scanned.radioGroups) {
+        const rgNameNorm = normLabel(rg.label || rg.name);
+        let desiredValue = "";
 
-          const wantedNorm = normLabel(desiredValue);
-          const pick =
-            group.options.find((c) => normLabel(c.text) === wantedNorm) ||
-            group.options.find((c) => {
-              const optNorm = normLabel(c.text);
-              if (optNorm.length < 3 || wantedNorm.length < 3) return false;
-              return optNorm.includes(wantedNorm) || wantedNorm.includes(optNorm);
-            });
-
-          if (pick) {
-            const clicked = await this.safeClick(page, pick.selector);
-            console.log(`[WIZARD][CHOICE] group="${group.name}" type=${group.type} desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
-            if (clicked) {
-              actions.push(`${group.name}: ${pick.text}`);
-              didInteract = true;
-            }
-          } else {
-            console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
+        // Direct key match
+        for (const k of Object.keys(data)) {
+          const kNorm = normLabel(k);
+          if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
+            desiredValue = String((data as any)[k] ?? "").trim();
+            break;
           }
         }
 
-        // 2.5) Missing required: payload-based + DOM verification fallback
-        let needNow = this.buildWizardNeedPayload(scanned, data);
-        if (needNow.missing_required.length > 0) {
-          const domMissing = await this.detectWizardMissingByDom(page, scanned.fields);
-          if (filled > 0 && domMissing.length === 0) {
-            needNow = { ...needNow, missing_required: [] };
-          } else if (domMissing.length > 0) {
-            needNow = {
-              ...needNow,
-              missing_required: needNow.missing_required.filter((m) =>
-                domMissing.some((x) => labelSoftIncludes(x, m.label))
+        // Fallback: check if any data value matches a radio option
+        if (!desiredValue) {
+          for (const k of Object.keys(data)) {
+            const v = String((data as any)[k] ?? "").trim();
+            if (!v || v.includes("@") || v.length > 60) continue;
+            const vNorm = normLabel(v);
+            if (!vNorm || vNorm.length < 2) continue;
+            const optMatch = rg.options.some((o) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm);
+            if (optMatch) { desiredValue = v; break; }
+          }
+        }
+
+        if (!desiredValue) continue;
+
+        const wNorm = normLabel(desiredValue);
+        const pick = rg.options.find((o) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
+          rg.options.find((o) => {
+            const tN = normLabel(o.text);
+            const vN = normLabel(o.value);
+            return (tN.length >= 3 && wNorm.length >= 3 && (tN.includes(wNorm) || wNorm.includes(tN))) ||
+              (vN.length >= 3 && wNorm.length >= 3 && (vN.includes(wNorm) || wNorm.includes(vN)));
+          });
+
+        if (pick) {
+          const clicked = await this.safeClick(page, pick.selector);
+          console.log(`[WIZARD][RADIO] group="${rg.label || rg.name}" desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
+          if (clicked) {
+            actions.push(`${rg.label || rg.name}: ${pick.text}`);
+            didInteract = true;
+          }
+        }
+      }
+
+      // 2c) Handle checkboxes (consent, agreements)
+      for (const cb of scanned.checkboxes) {
+        if (cb.checked) continue; // Already checked
+        const cbLabelNorm = normLabel(cb.label);
+
+        // Auto-check consent checkboxes if autoSubmit is on
+        const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
+
+        // Check if data has a matching key
+        let shouldCheck = false;
+        for (const k of Object.keys(data)) {
+          const kNorm = normLabel(k);
+          if (kNorm === cbLabelNorm || labelSoftIncludes(k, cb.label)) {
+            const v = String((data as any)[k] ?? "").trim().toLowerCase();
+            shouldCheck = ["да", "yes", "true", "1", "on", "checked", "✓"].includes(v);
+            break;
+          }
+        }
+
+        // Auto-check consent if autoSubmit
+        if (!shouldCheck && isConsent && autoSubmit) {
+          shouldCheck = true;
+        }
+
+        if (shouldCheck) {
+          const clicked = await this.safeClick(page, cb.selector);
+          console.log(`[WIZARD][CHECKBOX] label="${cb.label}" consent=${isConsent} clicked=${clicked}`);
+          if (clicked) {
+            actions.push(`✓ ${cb.label}`);
+            didInteract = true;
+          }
+        }
+      }
+
+      // 2d) Log file upload fields (can't fill automatically without actual file)
+      for (const fu of scanned.fileUploads) {
+        console.log(`[WIZARD][FILE] label="${fu.label}" required=${fu.required} accept="${fu.accept}"`);
+        // File uploads require actual file data — for now just skip non-required ones
+        // Required file uploads will be reported as missing in buildWizardNeedPayload
+      }
+
+      // 2.5) Missing required: payload-based + DOM verification fallback
+      let needNow = this.buildWizardNeedPayload(scanned, data);
+      if (needNow.missing_required.length > 0) {
+        const domMissing = await this.detectWizardMissingByDom(page, scanned.fields);
+        if (filled > 0 && domMissing.length === 0) {
+          needNow = { ...needNow, missing_required: [] };
+        } else if (domMissing.length > 0) {
+          needNow = {
+            ...needNow,
+            missing_required: needNow.missing_required.filter((m) =>
+              domMissing.some((x) => labelSoftIncludes(x, m.label))
+            ),
+          };
+        }
+      }
+
+      if (needNow.missing_required.length > 0) {
+        const obs = await this.quickObserve(page);
+        (obs as any).needs_input = true;
+        (obs as any).wizard_next = {
+          ...needNow,
+          step,
+          total_steps: maxSteps,
+          advanced: false,
+          last_clicked: null,
+        };
+        console.log(`[WIZARD] needs_input on current step=${step} missing=${needNow.missing_required.length}`);
+        return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
+      }
+
+      // 3) Decide Next vs Submit
+      const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
+      console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
+
+      if (clicked.clicked) {
+        didInteract = true;
+        actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
+
+        // ✅ Wait and then ALWAYS rescan
+        await this.waitForWizardStepChange(page, beforeSig);
+
+        const afterSig = await this.getWizardDomSignature(page);
+        const nextScanned = await this.scanWizardStep(page);
+
+        // ✅ If next step introduces new required fields -> needs_input (NO fake success)
+        let nextNeed = this.buildWizardNeedPayload(nextScanned, data);
+        if (nextNeed.missing_required.length > 0) {
+          const domMissing2 = await this.detectWizardMissingByDom(page, nextScanned.fields);
+          if (domMissing2.length === 0) {
+            nextNeed = { ...nextNeed, missing_required: [] };
+          } else {
+            nextNeed = {
+              ...nextNeed,
+              missing_required: nextNeed.missing_required.filter((m) =>
+                domMissing2.some((x) => labelSoftIncludes(x, m.label))
               ),
             };
           }
         }
 
-        // Required file check
-        if (!needNow.missing_required.some(m => (m.type || "").toLowerCase() === "file")) {
-          const fileNeeded = await page.evaluate(() => {
-            const isVisible = (el: Element) => {
-              const style = window.getComputedStyle(el as any);
-              if (!style) return false;
-              if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-              const r = (el as any).getBoundingClientRect?.();
-              return !!r && r.width > 0 && r.height > 0;
-            };
-            const inputs = Array.from(document.querySelectorAll('input[type="file"]')) as any[];
-            const vis = inputs.filter(i => isVisible(i) && !i.disabled);
-            if (vis.length === 0) return { needed: false, label: "" };
-            const anyReq = vis.some(i => !!i.required || (i.getAttribute("aria-required") || "").toLowerCase() === "true");
-            if (!anyReq) return { needed: false, label: "" };
-            const i = vis[0];
-            const id = (i.id || "").toString();
-            let label = "";
-            if (id) {
-              const lab = document.querySelector(`label[for="${id}"]`) as any;
-              if (lab && lab.textContent) label = lab.textContent.trim();
-            }
-            return { needed: true, label: label || "Качете файл (задължително)" };
-          });
-
-          if ((fileNeeded as any).needed && !file) {
-            needNow.missing_required.push({
-              label: String((fileNeeded as any).label || "Качете файл (задължително)"),
-              type: "file",
-              selector: 'input[type="file"]',
-            });
-          }
-        }
-
-        if (needNow.missing_required.length > 0) {
+        if (nextNeed.missing_required.length > 0) {
           const obs = await this.quickObserve(page);
           (obs as any).needs_input = true;
           (obs as any).wizard_next = {
-            ...needNow,
-            step,
+            ...nextNeed,
+            step: Math.min(step + 1, maxSteps),
             total_steps: maxSteps,
-            advanced: false,
-            last_clicked: null,
+            advanced: beforeSig !== afterSig,
+            last_clicked: { kind: clicked.kind, text: clicked.text },
           };
-          console.log(`[WIZARD] needs_input on current step=${step} missing=${needNow.missing_required.length}`);
+          console.log(`[WIZARD] needs_input after click step=${step} missing=${nextNeed.missing_required.length}`);
           return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
         }
 
-        // 3) Next vs Submit
-        const clicked = await this.clickWizardNextOrSubmit(page, autoSubmit);
-        console.log(`[WIZARD] step=${step} clicked=${clicked.clicked} kind=${clicked.kind} text="${clicked.text}"`);
+        // ✅ CRITICAL: Before declaring success, check if there are visible EMPTY fields in DOM.
+        // Multi-step wizards show new empty fields after "Напред" — that's a new step, NOT success.
+        const unfilled = await this.countUnfilledVisibleFields(page);
+        if (unfilled.count > 0) {
+          console.log(`[WIZARD] step=${step} after click: ${unfilled.count} unfilled visible fields (${unfilled.labels.join(", ")})`);
 
-        if (clicked.clicked) {
-          didInteract = true;
-          actions.push(clicked.kind === "next" ? "Кликнах Напред" : "Кликнах Изпрати");
+          // Rescan to get full field info for the new step
+          const freshScanned = await this.scanWizardStep(page);
 
-          await this.waitForWizardStepChange(page, beforeSig);
-
-          const afterSig = await this.getWizardDomSignature(page);
-          const nextScanned = await this.scanWizardStep(page);
-
-          let nextNeed = this.buildWizardNeedPayload(nextScanned, data);
-          if (nextNeed.missing_required.length > 0) {
-            const domMissing2 = await this.detectWizardMissingByDom(page, nextScanned.fields);
-            if (domMissing2.length === 0) {
-              nextNeed = { ...nextNeed, missing_required: [] };
-            } else {
-              nextNeed = {
-                ...nextNeed,
-                missing_required: nextNeed.missing_required.filter((m) =>
-                  domMissing2.some((x) => labelSoftIncludes(x, m.label))
-                ),
-              };
+          // Try to fill whatever we can from existing data
+          let filledOnNewStep = 0;
+          for (const f of freshScanned.fields) {
+            const v = this.matchWizardFieldValue(f, data);
+            if (v !== undefined && String(v).trim().length > 0) {
+              const ok = await this.fillWizardField(page, f, String(v), strictSelect);
+              if (ok) {
+                filledOnNewStep++;
+                actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
+              }
             }
           }
 
-          if (nextNeed.missing_required.length > 0) {
-            const obs = await this.quickObserve(page);
-            (obs as any).needs_input = true;
-            (obs as any).wizard_next = {
-              ...nextNeed,
-              step: Math.min(step + 1, maxSteps),
-              total_steps: maxSteps,
-              advanced: beforeSig !== afterSig,
-              last_clicked: { kind: clicked.kind, text: clicked.text },
-            };
-            console.log(`[WIZARD] needs_input after click step=${step} missing=${nextNeed.missing_required.length}`);
-            return { ok: false, message: "Wizard: нужни са още данни", observation: obs };
+          // Try to click any matching choices on the new step
+          for (const group of freshScanned.choiceGroups) {
+            const groupNameNorm = normLabel(group.name);
+            let desiredValue = "";
+            for (const k of Object.keys(data)) {
+              const kNorm = normLabel(k);
+              if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
+                desiredValue = String((data as any)[k] ?? "").trim();
+                break;
+              }
+            }
+            if (!desiredValue) {
+              for (const k of Object.keys(data)) {
+                const v = String((data as any)[k] ?? "").trim();
+                if (!v || v.includes("@") || v.length > 40) continue;
+                const vNorm = normLabel(v);
+                if (!vNorm || vNorm.length < 2) continue;
+                if (group.options.some((o) => normLabel(o.text) === vNorm)) { desiredValue = v; break; }
+              }
+            }
+            if (desiredValue) {
+              const wNorm = normLabel(desiredValue);
+              const pick = group.options.find((c) => normLabel(c.text) === wNorm) ||
+                group.options.find((c) => { const n = normLabel(c.text); return n.length >= 3 && wNorm.length >= 3 && (n.includes(wNorm) || wNorm.includes(n)); });
+              if (pick) {
+                const clicked2 = await this.safeClick(page, pick.selector);
+                if (clicked2) {
+                  filledOnNewStep++;
+                  actions.push(`${group.name}: ${pick.text}`);
+                }
+              }
+            }
           }
 
-          const unfilled = await this.countUnfilledVisibleFields(page);
-          if (unfilled.count > 0) {
-            console.log(`[WIZARD] step=${step} after click: ${unfilled.count} unfilled visible fields (${unfilled.labels.join(", ")})`);
+          // Re-check: are there still unfilled fields?
+          const stillUnfilled = await this.countUnfilledVisibleFields(page);
+          if (stillUnfilled.count > 0) {
+            // Build needs_input with the remaining unfilled fields
+            const freshScanned2 = await this.scanWizardStep(page);
+            const freshNeed = this.buildWizardNeedPayload(freshScanned2, data);
 
-            const obs = await this.quickObserve(page);
-            (obs as any).needs_input = true;
-            (obs as any).wizard_next = {
-              missing_required: unfilled.labels.map((l) => ({ label: l, type: "unknown", selector: "" })),
-              fields: nextScanned.fields,
-              choices: nextScanned.choices,
-              choiceGroups: nextScanned.choiceGroups,
-              step: Math.min(step + 1, maxSteps),
-              total_steps: maxSteps,
-              advanced: true,
-              last_clicked: { kind: clicked.kind, text: clicked.text },
-            };
-            return { ok: false, message: "Wizard: нужни са още данни за следващата стъпка", observation: obs };
+            // Force include all unfilled fields as missing, even if buildWizardNeedPayload thinks data matches
+            // (because the DOM fields are empty — data fuzzy-matching doesn't mean the field is actually filled)
+            const domEmptyLabels = stillUnfilled.labels.map((l) => normLabel(l));
+            for (const f of freshScanned2.fields) {
+              const fLabel = (f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
+              if (!fLabel) continue;
+              const fNorm = normLabel(fLabel);
+              const isStillEmpty = domEmptyLabels.some((dl) => dl === fNorm || dl.includes(fNorm) || fNorm.includes(dl));
+              if (isStillEmpty && !freshNeed.missing_required.some((m) => normLabel(m.label) === fNorm)) {
+                freshNeed.missing_required.push({
+                  label: fLabel,
+                  type: f.type || f.tag,
+                  selector: f.selector,
+                  options: f.options,
+                });
+              }
+            }
+
+            // Also add unfilled choice groups
+            for (const group of freshScanned2.choiceGroups) {
+              const groupDisplayLabel = (group.label && group.label !== "button_choice")
+                ? group.label
+                : group.options.map((o) => o.text).join(" / ");
+              if (!freshNeed.missing_required.some((m) => normLabel(m.label) === normLabel(groupDisplayLabel))) {
+                const groupNameNorm = normLabel(group.name);
+                let hasVal = false;
+                for (const k of Object.keys(data)) {
+                  if (normLabel(k) === groupNameNorm || labelSoftIncludes(k, group.name)) {
+                    if (String((data as any)[k] ?? "").trim()) { hasVal = true; break; }
+                  }
+                }
+                if (!hasVal) {
+                  freshNeed.missing_required.push({
+                    label: groupDisplayLabel,
+                    type: "button_group",
+                    selector: group.options[0]?.selector || "",
+                    options: group.options.map((o) => ({ value: o.text, label: o.text })),
+                  });
+                }
+              }
+            }
+
+            if (freshNeed.missing_required.length > 0) {
+              const obs = await this.quickObserve(page);
+              (obs as any).needs_input = true;
+              (obs as any).wizard_next = {
+                ...freshNeed,
+                step: Math.min(step + 1, maxSteps),
+                total_steps: maxSteps,
+                advanced: true,
+                last_clicked: { kind: clicked.kind, text: clicked.text },
+              };
+              console.log(`[WIZARD] needs_input: new step has ${freshNeed.missing_required.length} missing fields: ${freshNeed.missing_required.map((m) => m.label).join(", ")}`);
+              return { ok: false, message: "Wizard: нужни са още данни за следващата стъпка", observation: obs };
+            }
           }
 
-          if (await this.detectWizardSuccess(page)) {
-            const obs = await this.quickObserve(page);
-            console.log(`[WIZARD] success detected after click at step=${step}`);
-            return {
-              ok: true,
-              message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено",
-              observation: obs
-            };
+          // If we filled everything on the new step, check if there's a Next button to click
+          if (filledOnNewStep > 0) {
+            console.log(`[WIZARD] filled ${filledOnNewStep} fields on new step, continuing loop`);
+            continue;
           }
-
-          if (!autoSubmit) {
-            const obs = await this.quickObserve(page);
-            (obs as any).wizard_next = {
-              ...nextNeed,
-              step: Math.min(step + 1, maxSteps),
-              total_steps: maxSteps,
-              advanced: beforeSig !== afterSig,
-              last_clicked: { kind: clicked.kind, text: clicked.text },
-            };
-            return { ok: false, message: "Wizard: следваща стъпка е готова", observation: obs };
-          }
-
-          continue;
         }
 
-        const invalid = await this.getInvalidFields(page);
-        if (invalid.length) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
+        if (await this.detectWizardSuccess(page)) {
+          const obs = await this.quickObserve(page);
+          console.log(`[WIZARD] success detected after click at step=${step}`);
+          return {
+            ok: true,
+            message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: изпълнено",
+            observation: obs
+          };
+        }
 
-        const obs = await this.quickObserve(page);
-        (obs as any).wizard = {
-          step,
-          filled,
-          invalid_fields: invalid,
-          note: "No next/submit button detected",
-        };
+        if (!autoSubmit) {
+          const obs = await this.quickObserve(page);
+          (obs as any).wizard_next = {
+            ...nextNeed,
+            step: Math.min(step + 1, maxSteps),
+            total_steps: maxSteps,
+            advanced: beforeSig !== afterSig,
+            last_clicked: { kind: clicked.kind, text: clicked.text },
+          };
+          return { ok: false, message: "Wizard: следваща стъпка е готова", observation: obs };
+        }
 
-        return {
-          ok: false,
-          message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон",
-          observation: obs,
-        };
+        continue;
+      }
+
+      const invalid = await this.getInvalidFields(page);
+      if (invalid.length) {
+        actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
       }
 
       const obs = await this.quickObserve(page);
-      (obs as any).wizard = { note: "maxSteps reached" };
-      return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: прекалено много стъпки", observation: obs };
+      (obs as any).wizard = {
+        step,
+        filled,
+        invalid_fields: invalid,
+        note: "No next/submit button detected",
+      };
+
+      return {
+        ok: false,
+        message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: не намерих следващ бутон",
+        observation: obs,
+      };
+    }
+
+    const obs = await this.quickObserve(page);
+    (obs as any).wizard = { note: "maxSteps reached" };
+    return { ok: false, message: actions.length ? `Wizard: ${actions.join(", ")}` : "Wizard: прекалено много стъпки", observation: obs };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[WIZARD][CRASH] ${msg}`, e);
@@ -978,7 +1141,7 @@ class HotSessionManager {
     return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
   }
 
-  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }, data: Record<string, unknown>) {
+  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[]; radioGroups: any[]; checkboxes: any[]; fileUploads: any[] }, data: Record<string, unknown>) {
     const missing_required: Array<{
       label: string;
       type: string;
@@ -988,7 +1151,6 @@ class HotSessionManager {
 
     for (const f of scanned.fields) {
       if (!f.required) continue;
-      if ((f.type || "").toLowerCase() === "file") continue;
       const found = this.matchWizardDataForField(f, data);
       if (!found) {
         missing_required.push({
@@ -1000,6 +1162,7 @@ class HotSessionManager {
       }
     }
 
+    // ✅ Check choice groups for missing required values
     for (const group of scanned.choiceGroups) {
       if (!group.required) continue;
 
@@ -1017,26 +1180,77 @@ class HotSessionManager {
       if (!hasValue) {
         for (const k of Object.keys(data)) {
           const v = String((data as any)[k] ?? "").trim();
-          if (!v) continue;
-          if (v.includes("@") || v.length > 80 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+          if (!v || v.includes("@") || v.length > 40) continue;
           const vNorm = normLabel(v);
           if (!vNorm || vNorm.length < 2) continue;
-          const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
-          if (optMatch) { hasValue = true; break; }
+          if (group.options.some((o) => normLabel(o.text) === vNorm)) { hasValue = true; break; }
         }
       }
 
       if (!hasValue) {
-        const groupDisplayLabel = (group.label && group.label !== "button_choice" && group.label !== "radio_choice")
+        const groupDisplayLabel = (group.label && group.label !== "button_choice")
           ? group.label
           : group.options.map(o => o.text).join(" / ");
         missing_required.push({
           label: groupDisplayLabel,
-          type: group.type,
+          type: "button_group",
           selector: group.options[0]?.selector || "",
           options: group.options.map(o => ({ value: o.text, label: o.text })),
         });
       }
+    }
+
+    // ✅ Check radio groups for missing required values
+    for (const rg of (scanned.radioGroups || [])) {
+      if (!rg.required) continue;
+      const rgNameNorm = normLabel(rg.label || rg.name);
+      let hasValue = false;
+
+      for (const k of Object.keys(data)) {
+        const kNorm = normLabel(k);
+        if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
+          if (String((data as any)[k] ?? "").trim()) { hasValue = true; break; }
+        }
+      }
+      if (!hasValue) {
+        for (const k of Object.keys(data)) {
+          const v = String((data as any)[k] ?? "").trim();
+          if (!v || v.includes("@") || v.length > 60) continue;
+          const vNorm = normLabel(v);
+          if (rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm)) { hasValue = true; break; }
+        }
+      }
+      if (!hasValue) {
+        missing_required.push({
+          label: rg.label || rg.name || rg.options.map((o: any) => o.text).join(" / "),
+          type: "radio_group",
+          selector: rg.options[0]?.selector || "",
+          options: rg.options.map((o: any) => ({ value: o.value || o.text, label: o.text })),
+        });
+      }
+    }
+
+    // ✅ Check unchecked required checkboxes
+    for (const cb of (scanned.checkboxes || [])) {
+      if (!cb.required || cb.checked) continue;
+      const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
+      // Don't report consent checkboxes as missing — they'll be auto-checked
+      if (isConsent) continue;
+      missing_required.push({
+        label: cb.label || "Checkbox",
+        type: "checkbox",
+        selector: cb.selector,
+      });
+    }
+
+    // ✅ Check required file uploads
+    for (const fu of (scanned.fileUploads || [])) {
+      if (!fu.required) continue;
+      missing_required.push({
+        label: fu.label || "Файл",
+        type: "file_upload",
+        selector: fu.selector,
+      });
     }
 
     const fields = scanned.fields.map((f) => ({
@@ -1059,7 +1273,7 @@ class HotSessionManager {
   private async detectWizardMissingByDom(page: Page, fields: WizardScannedField[]): Promise<string[]> {
     try {
       const payload = fields
-        .filter((f) => f.required && (f.type || "").toLowerCase() !== "file")
+        .filter((f) => f.required)
         .map((f) => ({
           label: f.label || f.aria_label || f.placeholder || f.name || f.id || "Поле",
           type: (f.type || f.tag || "").toLowerCase(),
@@ -1316,90 +1530,6 @@ class HotSessionManager {
     return { clicked: false, text: "" };
   }
 
-  // ✅ v6.0.8: stronger signature includes visible wizard text snippet
-  private async getWizardDomSignature(page: Page): Promise<string> {
-    try {
-      return await page.evaluate(() => {
-        const isVisible = (el: Element) => {
-          const style = window.getComputedStyle(el as any);
-          if (!style) return false;
-          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-          const r = (el as any).getBoundingClientRect?.();
-          return !!r && r.width > 0 && r.height > 0;
-        };
-
-        const title = document.title || "";
-        const h1 = (document.querySelector("h1")?.textContent || "").trim();
-        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
-
-        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter((el: any) => isVisible(el))
-          .slice(0, 25)
-          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
-          .join("|");
-
-        // visible section text snippet (captures question text + options)
-        const candidates = Array.from(document.querySelectorAll("main, form, [role='form'], .wizard, .steps, .step, section, article"))
-          .filter(isVisible)
-          .slice(0, 6) as HTMLElement[];
-
-        let snippet = "";
-        for (const c of candidates) {
-          const t = (c.innerText || "").replace(/\s+/g, " ").trim();
-          if (t.length >= 40) { snippet = t.slice(0, 280); break; }
-        }
-
-        return `${location.pathname}||${title}||${h1}||${step}||${inputs}||${snippet}`;
-      });
-    } catch {
-      return `sig:${Date.now()}`;
-    }
-  }
-
-  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
-    try {
-      await page.waitForFunction(
-        (sig: string) => {
-          const isVisible = (el: Element) => {
-            const style = window.getComputedStyle(el as any);
-            if (!style) return false;
-            if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-            const r = (el as any).getBoundingClientRect?.();
-            return !!r && r.width > 0 && r.height > 0;
-          };
-
-          const title = document.title || "";
-          const h1 = (document.querySelector("h1")?.textContent || "").trim();
-          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
-
-          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-            .filter((el: any) => isVisible(el))
-            .slice(0, 25)
-            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
-            .join("|");
-
-          const candidates = Array.from(document.querySelectorAll("main, form, [role='form'], .wizard, .steps, .step, section, article"))
-            .filter(isVisible)
-            .slice(0, 6) as HTMLElement[];
-
-          let snippet = "";
-          for (const c of candidates) {
-            const t = (c.innerText || "").replace(/\s+/g, " ").trim();
-            if (t.length >= 40) { snippet = t.slice(0, 280); break; }
-          }
-
-          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}||${snippet}`;
-          return cur !== sig;
-        },
-        beforeSig,
-        { timeout: 9000 }
-      );
-    } catch {
-      await page.waitForTimeout(900).catch(() => {});
-    }
-  }
-
-  // ✅ v6.0.8: scanWizardStep now detects custom radios robustly
   private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }> {
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
@@ -1433,7 +1563,7 @@ class HotSessionManager {
         let cur: Element | null = el;
         const parts: string[] = [];
         let depth = 0;
-        while (cur && depth < 6) {
+        while (cur && depth < 5) {
           const t = cur.tagName.toLowerCase();
           const par = cur.parentElement as Element | null;
           if (!par) break;
@@ -1497,15 +1627,11 @@ class HotSessionManager {
         return "";
       };
 
-      // 1) Normal fields (input/textarea/select)
       const inputs = Array.from(document.querySelectorAll("input, textarea, select"));
       const fields = inputs
         .filter((el) => {
           const any = el as any;
-
-          // NOTE: for wizard we keep strict "visible" inputs only
           if (!isVisible(el)) return false;
-
           const tag = el.tagName.toLowerCase();
           if (tag === "input") {
             const type = (any.type || "").toLowerCase();
@@ -1548,12 +1674,130 @@ class HotSessionManager {
                   }))
                 : undefined,
           };
+        })
+        // Separate radio/checkbox from fillable fields — they go into radioGroups / checkboxes
+        .filter((f) => f.type !== "radio");
+
+      // ✅ Detect radio button groups: input[type=radio] grouped by name
+      const radioGroups: Array<{
+        name: string;
+        label: string;
+        required: boolean;
+        options: Array<{ value: string; text: string; selector: string }>;
+      }> = [];
+      const radiosByName = new Map<string, Element[]>();
+      document.querySelectorAll("input[type='radio']").forEach((el) => {
+        if (!isVisible(el)) return;
+        const name = (el as any).name || "";
+        if (!name) return;
+        if (!radiosByName.has(name)) radiosByName.set(name, []);
+        radiosByName.get(name)!.push(el);
+      });
+      radiosByName.forEach((radios, name) => {
+        if (radios.length < 2) return;
+        // Find group label from fieldset/legend, parent heading, or first radio's container
+        let groupLabel = "";
+        const firstRadio = radios[0];
+        const fieldset = firstRadio.closest("fieldset");
+        if (fieldset) {
+          const legend = fieldset.querySelector("legend");
+          if (legend) groupLabel = (legend.textContent || "").trim();
+        }
+        if (!groupLabel) {
+          // Look for a heading/label above the radios
+          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], [class*='radio'], div, fieldset");
+          if (container) {
+            const headings = container.querySelectorAll("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title'],[class*='question']");
+            for (const h of Array.from(headings)) {
+              const t = (h.textContent || "").trim();
+              if (t.length >= 3 && t.length <= 120) { groupLabel = t; break; }
+            }
+          }
+        }
+        if (!groupLabel) {
+          // Try parent's previousElementSibling
+          const parent = firstRadio.parentElement?.parentElement;
+          if (parent?.previousElementSibling) {
+            const t = (parent.previousElementSibling.textContent || "").trim();
+            if (t.length >= 3 && t.length <= 120) groupLabel = t;
+          }
+        }
+
+        const isReq = /\*|задължително|required/i.test(groupLabel) || radios.some((r: any) => r.required);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+
+        const options = radios.map((r) => {
+          const rAny = r as any;
+          const value = rAny.value || "";
+          // Get the visible text label for this radio
+          let text = "";
+          const id = rAny.id || "";
+          if (id) {
+            const lab = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
+            if (lab) text = (lab.textContent || "").trim();
+          }
+          if (!text) {
+            const parent = r.parentElement;
+            if (parent) {
+              const lab = parent.querySelector("label") as HTMLElement | null;
+              if (lab) text = (lab.textContent || "").trim();
+              if (!text) text = (parent.textContent || "").trim();
+            }
+          }
+          if (!text) text = value;
+          return { value, text, selector: getSelector(r) };
         });
+
+        radioGroups.push({ name, label: cleanLabel, required: isReq, options });
+      });
+
+      // ✅ Detect standalone checkboxes (consent, agreement, etc.)
+      const checkboxes: Array<{
+        label: string;
+        required: boolean;
+        checked: boolean;
+        selector: string;
+      }> = [];
+      document.querySelectorAll("input[type='checkbox']").forEach((el) => {
+        if (!isVisible(el)) return;
+        const any = el as any;
+        if (any.disabled) return;
+        const label = getLabel(el) || any.value || "";
+        const isReq = !!any.required || /\*|задължително|required/i.test(label);
+        checkboxes.push({
+          label: label.trim(),
+          required: isReq,
+          checked: !!any.checked,
+          selector: getSelector(el),
+        });
+      });
+
+      // ✅ Detect file upload fields
+      const fileUploads: Array<{
+        label: string;
+        required: boolean;
+        accept: string;
+        selector: string;
+      }> = [];
+      document.querySelectorAll("input[type='file']").forEach((el) => {
+        if (!isVisible(el)) return;
+        const any = el as any;
+        const label = getLabel(el) || "";
+        const isReq = !!any.required || /\*|задължително|required/i.test(label);
+        fileUploads.push({
+          label: label.trim() || "Файл",
+          required: isReq,
+          accept: any.accept || "",
+          selector: getSelector(el),
+        });
+      });
 
       const btns: Array<{ text: string; selector: string; groupLabel: string; required: boolean }> = [];
 
+      // Detect button-based choice groups: containers with 2+ sibling buttons
       const seenContainers = new Set<Element>();
       const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+      // Language codes & nav elements to skip
       const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
       const isLangSwitcher = (btns: Element[]) => {
         if (btns.length < 2 || btns.length > 5) return false;
@@ -1563,45 +1807,52 @@ class HotSessionManager {
         });
       };
 
-      // 2) Existing "button group" detector
       document.querySelectorAll("button, [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
         const parent = btn.parentElement;
         if (!parent || seenContainers.has(parent)) return;
 
+        // Get sibling buttons in this container
         const siblingBtns = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
           .filter((b) => isVisible(b));
 
         if (siblingBtns.length < 2) return;
 
+        // Filter out nav/submit buttons
         const optionBtns = siblingBtns.filter((b) => {
           const t = ((b as any).textContent || "").trim();
           return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
         });
 
         if (optionBtns.length < 2) return;
+
+        // Skip language switchers (BG/EN, etc.)
         if (isLangSwitcher(optionBtns)) return;
 
+        // Skip buttons inside nav/header elements
         const closestNav = parent.closest("nav, header, [role='navigation']");
         if (closestNav) return;
 
         seenContainers.add(parent);
 
+        // Find group label from preceding element or parent
         let groupLabel = "";
         const prevSib = parent.previousElementSibling as HTMLElement | null;
         if (prevSib) {
           const t = (prevSib.textContent || "").trim();
+          // Skip labels that look like emails, URLs, or phone numbers
           const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-          if (t.length >= 2 && t.length <= 80 && !looksLikeData) groupLabel = t;
+          if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
         }
         if (!groupLabel) {
+          // Try label inside parent's parent
           const grandParent = parent.parentElement;
           if (grandParent) {
             const lab = grandParent.querySelector("label, [class*='label']") as HTMLElement | null;
             if (lab) {
               const t = (lab.textContent || "").trim();
               const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-              if (t.length >= 2 && t.length <= 80 && !looksLikeData) groupLabel = t;
+              if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
             }
           }
         }
@@ -1620,31 +1871,27 @@ class HotSessionManager {
         });
       });
 
-      // 3) role=radio / aria-pressed quick pass (kept)
+      // Also detect radio-like buttons: [role="radio"], button[aria-pressed]
       document.querySelectorAll('[role="radio"], button[aria-pressed]').forEach((btn) => {
         if (!isVisible(btn)) return;
         const text = ((btn as any).textContent || "").trim();
-        if (!text || text.length < 1 || text.length > 60) return;
+        if (!text || text.length < 1 || text.length > 30) return;
         if (submitRe.test(text)) return;
 
         const parent = btn.parentElement;
         let groupLabel = "";
-        const rg = btn.closest('[role="radiogroup"]') as HTMLElement | null;
-        if (rg) {
-          const aria = (rg.getAttribute("aria-label") || "").trim();
-          if (aria) groupLabel = aria;
-        }
-        if (!groupLabel && parent) {
+        if (parent) {
           const prevSib = parent.previousElementSibling as HTMLElement | null;
           if (prevSib) {
             const t = (prevSib.textContent || "").trim();
-            if (t.length >= 2 && t.length <= 120) groupLabel = t;
+            if (t.length >= 2 && t.length <= 60) groupLabel = t;
           }
         }
 
         const isRequired = /\*|задължително|required/i.test(groupLabel);
         const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
 
+        // Avoid duplicate
         if (btns.some((b) => b.selector === getSelector(btn))) return;
 
         btns.push({
@@ -1655,158 +1902,22 @@ class HotSessionManager {
         });
       });
 
-      // ✅ 4) Robust custom radio groups:
-      // - input[type=radio] even if hidden, as long as a visible option wrapper exists
-      // - role=radiogroup + role=radio
-      // - generic elements with aria-checked and text
-      const choiceGroups: WizardChoiceGroup[] = [];
+      // Group buttons by groupLabel
+      const choiceGroups: Array<{
+        name: string;
+        label: string;
+        required: boolean;
+        type: "button_group";
+        options: Array<{ text: string; selector: string }>;
+      }> = [];
 
-      const addGroup = (name: string, required: boolean, options: Array<{ text: string; selector: string }>) => {
-        const uniq: Record<string, { text: string; selector: string }> = {};
-        for (const o of options) {
-          const key = `${o.text}||${o.selector}`;
-          uniq[key] = o;
-        }
-        const opts = Object.values(uniq).slice(0, 12);
-        if (opts.length < 2) return;
-        choiceGroups.push({
-          name: name || "radio_choice",
-          label: name || "radio_choice",
-          required,
-          type: "radio",
-          options: opts.map(o => ({ text: o.text, selector: o.selector })),
-        });
-      };
-
-      const closestQuestionText = (el: Element): string => {
-        const rg = el.closest("fieldset, section, article, [role='group'], [role='radiogroup'], .step, .wizard, form") as HTMLElement | null;
-        if (!rg) return "";
-        // try legend/header first
-        const legend = rg.querySelector("legend, h2, h3, h4, label") as HTMLElement | null;
-        const t = (legend?.textContent || "").replace(/\s+/g, " ").trim();
-        if (t.length >= 3 && t.length <= 160) return t;
-        // fallback: first strong-ish text line
-        const raw = (rg.innerText || "").replace(/\s+/g, " ").trim();
-        if (!raw) return "";
-        return raw.slice(0, 120);
-      };
-
-      // 4a) role=radiogroup grouping
-      const radioGroups = Array.from(document.querySelectorAll('[role="radiogroup"]')) as HTMLElement[];
-      for (const rg of radioGroups) {
-        if (!isVisible(rg)) continue;
-        const label = (rg.getAttribute("aria-label") || "").trim() || closestQuestionText(rg);
-        const required =
-          (rg.getAttribute("aria-required") || "").toLowerCase() === "true" ||
-          /\*|задължително|required/i.test(label);
-
-        const radios = Array.from(rg.querySelectorAll('[role="radio"]')) as HTMLElement[];
-        const opts: Array<{ text: string; selector: string }> = [];
-        for (const r of radios) {
-          if (!isVisible(r)) continue;
-          const txt = (r.innerText || r.textContent || "").replace(/\s+/g, " ").trim();
-          if (!txt || submitRe.test(txt)) continue;
-          opts.push({ text: txt, selector: getSelector(r) });
-        }
-        addGroup(label.replace(/\s*\*\s*$/, "").trim() || "radio_choice", required, opts);
-      }
-
-      // 4b) input[type=radio] grouping by name (if available) OR by closest question container
-      const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
-      const byKey = new Map<string, HTMLInputElement[]>();
-
-      const visibleOptionSelector = (r: HTMLInputElement): { text: string; selector: string } | null => {
-        const id = (r.getAttribute("id") || "").toString();
-        // label[for=id]
-        if (id) {
-          const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
-          if (lab && isVisible(lab)) {
-            const t = (lab.innerText || lab.textContent || "").replace(/\s+/g, " ").trim();
-            if (t) return { text: t, selector: `label[for="${id.replace(/\"/g, "")}"]` };
-          }
-        }
-        // wrapped by label
-        const wrap = r.closest("label") as HTMLElement | null;
-        if (wrap && isVisible(wrap)) {
-          const t = (wrap.innerText || wrap.textContent || "").replace(/\s+/g, " ").trim();
-          if (t) return { text: t, selector: getSelector(wrap) };
-        }
-        // option row wrapper (common custom UI)
-        const row = r.closest("[role='radio'], li, .option, .radio, .radio-option, .choice, .selectable, .btn") as HTMLElement | null;
-        if (row && isVisible(row)) {
-          const t = (row.innerText || row.textContent || "").replace(/\s+/g, " ").trim();
-          if (t) return { text: t, selector: getSelector(row) };
-        }
-        // last resort: click input itself if visible
-        if (isVisible(r)) {
-          const v = (r.value || "").toString().trim() || "Option";
-          return { text: v, selector: getSelector(r) };
-        }
-        return null;
-      };
-
-      for (const r of radios) {
-        if (r.disabled) continue;
-        const opt = visibleOptionSelector(r);
-        if (!opt) continue;
-
-        const name = (r.getAttribute("name") || "").toString().trim();
-        const q = closestQuestionText(r) || "radio_choice";
-        const key = name ? `name:${name}` : `q:${q}`;
-
-        if (!byKey.has(key)) byKey.set(key, []);
-        byKey.get(key)!.push(r);
-      }
-
-      for (const [key, list] of byKey.entries()) {
-        if (list.length < 2) continue;
-        const label =
-          key.startsWith("q:") ? key.slice(2) :
-          closestQuestionText(list[0]) || "radio_choice";
-
-        const required =
-          list.some(r => r.required) ||
-          list.some(r => (r.getAttribute("aria-required") || "").toLowerCase() === "true") ||
-          /\*|задължително|required/i.test(label);
-
-        const opts: Array<{ text: string; selector: string }> = [];
-        for (const r of list) {
-          const opt = visibleOptionSelector(r);
-          if (!opt) continue;
-          opts.push(opt);
-        }
-        addGroup(label.replace(/\s*\*\s*$/, "").trim() || "radio_choice", required, opts);
-      }
-
-      // 4c) aria-checked generic (some frameworks use divs w/ aria-checked but no role)
-      const genericAria = Array.from(document.querySelectorAll('[aria-checked]')) as HTMLElement[];
-      const tmpByQ = new Map<string, Array<{ text: string; selector: string; required: boolean }>>();
-      for (const el of genericAria) {
-        if (!isVisible(el)) continue;
-        const txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-        if (!txt || txt.length > 80) continue;
-        if (submitRe.test(txt)) continue;
-
-        const q = closestQuestionText(el) || "radio_choice";
-        const required = /\*|задължително|required/i.test(q);
-
-        if (!tmpByQ.has(q)) tmpByQ.set(q, []);
-        tmpByQ.get(q)!.push({ text: txt, selector: getSelector(el), required });
-      }
-      for (const [q, opts] of tmpByQ.entries()) {
-        // avoid duplicating if we already added similar group
-        const already = choiceGroups.some(g => (g.label || "").trim() === q.trim());
-        if (already) continue;
-        addGroup(q.replace(/\s*\*\s*$/, "").trim() || "radio_choice", opts.some(o => o.required), opts);
-      }
-
-      // Convert button group detection into choiceGroups too (kept behavior)
       const groupMap = new Map<string, typeof btns>();
       for (const b of btns) {
         const key = b.groupLabel;
         if (!groupMap.has(key)) groupMap.set(key, []);
         groupMap.get(key)!.push(b);
       }
+
       for (const [name, items] of groupMap) {
         choiceGroups.push({
           name,
@@ -1817,11 +1928,99 @@ class HotSessionManager {
         });
       }
 
-      return { fields, choices: btns, choiceGroups };
+      return { fields, choices: btns, choiceGroups, radioGroups, checkboxes, fileUploads };
     });
   }
 
-  // ✅ v6.0.8: counts custom radio groups as missing
+  private async getWizardDomSignature(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const isVisible = (el: Element) => {
+          const r = (el as any).getBoundingClientRect?.();
+          if (!r || r.width === 0 || r.height === 0) return false;
+          const style = window.getComputedStyle(el);
+          return style.display !== "none" && style.visibility !== "hidden";
+        };
+
+        const title = document.title || "";
+        const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
+          .filter(isVisible)
+          .slice(0, 6)
+          .map((el) => (el.textContent || "").trim().slice(0, 40))
+          .join("~");
+        const stepIndicator = (
+          document.querySelector("[aria-current='step']")?.textContent ||
+          document.querySelector("[class*='stepTitle'], [class*='step-title'], [class*='stъпка']")?.textContent ||
+          ""
+        ).trim();
+        const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+          .filter(isVisible)
+          .slice(0, 25)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+          .join("|");
+        // Include visible labels to differentiate steps with different questions
+        const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
+          .filter(isVisible)
+          .slice(0, 15)
+          .map((el) => (el.textContent || "").trim().slice(0, 30))
+          .join("~");
+        // Include radio/checkbox groups
+        const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
+          .filter(isVisible)
+          .slice(0, 15)
+          .map((el: any) => `${el.name || ""}:${el.value || ""}`)
+          .join("|");
+        // Include file inputs
+        const files = Array.from(document.querySelectorAll("input[type='file']"))
+          .filter(isVisible)
+          .length;
+
+        return `${location.pathname}||${title}||${headings}||${stepIndicator}||${inputs}||${labels}||${radios}||files:${files}`;
+      });
+    } catch {
+      return `sig:${Date.now()}`;
+    }
+  }
+
+  private async waitForWizardStepChange(page: Page, beforeSig: string): Promise<void> {
+    try {
+      await page.waitForFunction(
+        (sig: string) => {
+          const isV = (el: Element) => {
+            const r = (el as any).getBoundingClientRect?.();
+            if (!r || r.width === 0 || r.height === 0) return false;
+            const s = window.getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden";
+          };
+          const title = document.title || "";
+          const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
+            .filter(isV).slice(0, 6).map((el) => (el.textContent || "").trim().slice(0, 40)).join("~");
+          const stepIndicator = (
+            document.querySelector("[aria-current='step']")?.textContent ||
+            document.querySelector("[class*='stepTitle'], [class*='step-title']")?.textContent || ""
+          ).trim();
+          const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
+            .filter(isV).slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+            .join("|");
+          const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
+            .filter(isV).slice(0, 15).map((el) => (el.textContent || "").trim().slice(0, 30)).join("~");
+          const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
+            .filter(isV).slice(0, 15).map((el: any) => `${el.name || ""}:${el.value || ""}`).join("|");
+          const files = Array.from(document.querySelectorAll("input[type='file']")).filter(isV).length;
+          const cur = `${location.pathname}||${title}||${headings}||${stepIndicator}||${inputs}||${labels}||${radios}||files:${files}`;
+          return cur !== sig;
+        },
+        beforeSig,
+        { timeout: 9000 }
+      );
+    } catch {
+      await page.waitForTimeout(900).catch(() => {});
+    }
+  }
+
+  // ✅ Count visible UNFILLED elements in the DOM: empty inputs AND unselected button groups
+  // Used after clicking Next to detect new wizard steps — if anything needs interaction, it's NOT success
   private async countUnfilledVisibleFields(page: Page): Promise<{ count: number; labels: string[] }> {
     try {
       return await page.evaluate(() => {
@@ -1833,18 +2032,28 @@ class HotSessionManager {
           return !!r && r.width > 0 && r.height > 0;
         };
 
-        const getLabelNear = (root: Element) => {
-          const legend = root.querySelector("legend, h2, h3, h4, label") as HTMLElement | null;
-          const t = (legend?.textContent || "").replace(/\s+/g, " ").trim();
-          if (t.length >= 3 && t.length <= 180) return t;
-          const raw = (root as any).innerText ? String((root as any).innerText) : "";
-          const r2 = raw.replace(/\s+/g, " ").trim();
-          return r2.slice(0, 120) || "Избор";
+        const getLabel = (el: Element) => {
+          const any = el as any;
+          const id = any.id ? String(any.id) : "";
+          if (id) {
+            const lab = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
+            if (lab && lab.textContent) return lab.textContent.trim();
+          }
+          let p: Element | null = el;
+          for (let i = 0; i < 3; i++) {
+            if (!p) break;
+            p = p.parentElement;
+            if (p) {
+              const lab = p.querySelector?.("label") as HTMLElement | null;
+              if (lab && lab.textContent) return lab.textContent.trim();
+            }
+          }
+          return any.placeholder || any.name || any.type || "field";
         };
 
         const pending: string[] = [];
 
-        // 1) Empty inputs (exclude radio/checkbox/file)
+        // 1) Empty input / textarea / select fields
         document.querySelectorAll("input, textarea, select").forEach((el: any) => {
           if (!isVisible(el)) return;
           const type = (el.type || "").toLowerCase();
@@ -1852,54 +2061,119 @@ class HotSessionManager {
           if (el.disabled) return;
           if (el.getAttribute?.("aria-hidden") === "true") return;
           const val = (el.value || "").toString().trim();
-          if (!val) pending.push(el.placeholder || el.name || el.getAttribute("aria-label") || "field");
+          if (!val) pending.push(getLabel(el));
         });
 
-        // 2) role=radiogroup without selected aria-checked=true
-        const rgs = Array.from(document.querySelectorAll('[role="radiogroup"]')) as HTMLElement[];
-        for (const rg of rgs) {
-          if (!isVisible(rg)) continue;
-          const radios = Array.from(rg.querySelectorAll('[role="radio"]')) as HTMLElement[];
-          if (radios.length < 2) continue;
-          const anyChecked = radios.some(r => (r.getAttribute("aria-checked") || "").toLowerCase() === "true");
-          if (!anyChecked) {
-            const label = (rg.getAttribute("aria-label") || "").trim() || getLabelNear(rg);
-            pending.push(label);
+        // 2) Unselected button choice groups
+        const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+        const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
+        const seenContainers = new Set<Element>();
+
+        document.querySelectorAll("button, [role='button']").forEach((btn) => {
+          if (!isVisible(btn)) return;
+          const parent = btn.parentElement;
+          if (!parent || seenContainers.has(parent)) return;
+
+          // Skip buttons inside nav/header
+          if (parent.closest("nav, header, [role='navigation']")) return;
+
+          // Find sibling buttons
+          const siblings = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
+            .filter((b) => isVisible(b));
+          if (siblings.length < 2) return;
+
+          // Filter out nav/submit
+          const optBtns = siblings.filter((b) => {
+            const t = ((b as any).textContent || "").trim();
+            return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
+          });
+          if (optBtns.length < 2) return;
+
+          // Skip language switchers (BG/EN, etc.)
+          const allLang = optBtns.every((b) => {
+            const t = ((b as any).textContent || "").trim().toLowerCase();
+            return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
+          });
+          if (allLang) return;
+
+          seenContainers.add(parent);
+
+          // Check if any button in this group is already selected
+          const hasSelected = optBtns.some((b: any) => {
+            // Common selection indicators
+            if (b.getAttribute("aria-pressed") === "true") return true;
+            if (b.getAttribute("aria-checked") === "true") return true;
+            if (b.getAttribute("data-state") === "on" || b.getAttribute("data-state") === "active") return true;
+            const cls = (b.className || "").toLowerCase();
+            if (/\bactive\b|\bselected\b|\bchosen\b|\bchecked\b/.test(cls)) return true;
+            // Check computed style difference — selected buttons often have different bg
+            const style = window.getComputedStyle(b);
+            const bgColor = style.backgroundColor || "";
+            // If button has a non-white/non-transparent bg, it might be selected
+            // But we can't be sure, so also check border/outline
+            if (b.getAttribute("data-selected") === "true") return true;
+            return false;
+          });
+
+          if (!hasSelected) {
+            // Find group label
+            let groupLabel = "";
+            const prevSib = parent.previousElementSibling as HTMLElement | null;
+            if (prevSib) {
+              const t = (prevSib.textContent || "").trim();
+              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+              if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
+            }
+            const optTexts = optBtns.map((b: any) => ((b as any).textContent || "").trim()).join("/");
+            pending.push(groupLabel ? `${groupLabel} (${optTexts})` : `Избор: ${optTexts}`);
           }
-        }
+        });
 
-        // 3) input[type=radio] groups without checked
-        const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
-        const byName = new Map<string, HTMLInputElement[]>();
-        for (const r of radios) {
-          if (r.disabled) continue;
-          // allow hidden input if some wrapper is visible
-          const id = (r.getAttribute("id") || "").toString();
-          let labelEl: HTMLElement | null = null;
-          if (id) labelEl = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
-          const okVisible = isVisible(r) || (labelEl ? isVisible(labelEl) : false);
-          if (!okVisible) continue;
+        // 3) Unselected radio groups
+        const radioNames = new Map<string, Element[]>();
+        document.querySelectorAll("input[type='radio']").forEach((el) => {
+          if (!isVisible(el)) return;
+          const name = (el as any).name || "";
+          if (!name) return;
+          if (!radioNames.has(name)) radioNames.set(name, []);
+          radioNames.get(name)!.push(el);
+        });
+        radioNames.forEach((radios, name) => {
+          if (radios.length < 2) return;
+          const anyChecked = radios.some((r: any) => r.checked);
+          if (anyChecked) return;
+          const firstRadio = radios[0];
+          let label = "";
+          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], fieldset, div");
+          if (container) {
+            const h = container.querySelector("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title']");
+            if (h) label = (h.textContent || "").trim().slice(0, 60);
+          }
+          if (!label) label = name;
+          const optTexts = radios.map((r: any) => {
+            const id = r.id || "";
+            if (id) { const l = document.querySelector(`label[for="${id}"]`); if (l) return (l.textContent || "").trim(); }
+            const p = r.parentElement; return p ? (p.textContent || "").trim() : "";
+          }).filter(Boolean).join("/");
+          pending.push(`${label} (${optTexts.slice(0, 60)})`);
+        });
 
-          const name = (r.getAttribute("name") || "").toString().trim();
-          const key = name || ("q:" + (r.closest("fieldset, section, article, [role='group'], .step, form") as any)?.innerText?.slice(0, 80) || "radio");
-          if (!byName.has(key)) byName.set(key, []);
-          byName.get(key)!.push(r);
-        }
-        for (const [, list] of byName.entries()) {
-          if (list.length < 2) continue;
-          const anyChecked = list.some(r => r.checked);
-          if (anyChecked) continue;
-          const root = (list[0].closest("fieldset, section, article, [role='group'], .step, form") as HTMLElement | null) || list[0].parentElement;
-          pending.push(root ? getLabelNear(root) : "Избор (radio)");
-        }
+        // 4) Unchecked required checkboxes
+        document.querySelectorAll("input[type='checkbox']").forEach((el: any) => {
+          if (!isVisible(el)) return;
+          if (el.checked || el.disabled) return;
+          if (!el.required) return;
+          pending.push(getLabel(el) || "Checkbox");
+        });
 
-        return { count: pending.length, labels: pending.slice(0, 20) };
+        return { count: pending.length, labels: pending.slice(0, 15) };
       });
     } catch {
       return { count: 0, labels: [] };
     }
   }
 
+  // ✅ stricter success: require success keywords AND no visible inputs/selects/textarea OR URL indicates thanks
   private async detectWizardSuccess(page: Page): Promise<boolean> {
     try {
       return await page.evaluate(() => {
@@ -1919,8 +2193,19 @@ class HotSessionManager {
         };
 
         const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter((el: any) => isVisible(el));
+          .filter((el: any) => {
+            if (!isVisible(el)) return false;
+            const tag = (el.tagName || "").toLowerCase();
+            if (tag === "input") {
+              const type = (el.type || "").toLowerCase();
+              if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+            }
+            if (el.disabled) return false;
+            if (el.getAttribute?.("aria-hidden") === "true") return false;
+            return true;
+          });
 
+        // If there are still visible form fields, don't call it success unless URL is clearly a thank-you page
         if (inputs.length > 0 && !urlSuccess) return false;
 
         return Boolean(urlSuccess || textSuccess);
@@ -2046,7 +2331,10 @@ class HotSessionManager {
       return false;
     }
 
-    if (!picked) picked = nonEmpty[0];
+    if (!picked) {
+      picked = nonEmpty[0];
+    }
+
     if (!picked || !String(picked.value || "").trim()) return false;
 
     const ok = await page.evaluate<boolean, { sel: string; v: string }>(
@@ -2092,45 +2380,6 @@ class HotSessionManager {
           const el = await page.$(sel);
           if (!el) continue;
           await (el as any).setInputFiles(tmpPath);
-          try { fs.unlinkSync(tmpPath); } catch {}
-          return true;
-        } catch {}
-      }
-
-      try { fs.unlinkSync(tmpPath); } catch {}
-      return false;
-    } catch {
-      try { fs.unlinkSync(tmpPath); } catch {}
-      return false;
-    }
-  }
-
-  private async uploadFileWizard(
-    page: Page,
-    file: NonNullable<FillFormRequest["file"]>
-  ): Promise<boolean> {
-    const fs = await import("fs");
-    const tmpPath = `/tmp/upload_${Date.now()}_${file.filename}`;
-
-    try {
-      const buffer = Buffer.from(file.base64, "base64");
-      fs.writeFileSync(tmpPath, buffer);
-
-      const selectors: string[] = [];
-      if (file.field_name) selectors.push(`input[type="file"][name="${file.field_name.replace(/\"/g, "")}"]`);
-      selectors.push('input[type="file"]');
-
-      for (const sel of selectors) {
-        try {
-          const loc = page.locator(sel).first();
-          const count = await loc.count().catch(() => 0);
-          if (count <= 0) continue;
-          const visible = await loc.isVisible().catch(() => false);
-          if (!visible) continue;
-
-          await loc.scrollIntoViewIfNeeded().catch(() => {});
-          await (loc as any).setInputFiles(tmpPath);
-          console.log(`[WIZARD][UPLOAD] ok sel=${sel} filename=${file.filename}`);
           try { fs.unlinkSync(tmpPath); } catch {}
           return true;
         } catch {}
@@ -2341,7 +2590,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.8-universal-choices+radio+file+customRadio", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.6-universal-choices", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -2410,7 +2659,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.8-universal-choices+radio+file+customRadio listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.6-universal-choices listening on :${PORT}`);
   });
 
   await manager.start();
