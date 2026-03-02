@@ -2,7 +2,6 @@
  * NEO WORKER v6.0.6-universal-choices — Universal, deterministic, schema-first
  *
  * Patch v6.0.6-universal-choices:
- * - Patch: wizard ALWAYS asks for every visible field/choice; safer label matching
  * - Wizard: scanWizardStep detects ALL button choice groups generically (not just gender)
  * - Wizard: fillWizard matches ANY choice from data by group name/label
  * - Wizard: buildWizardNeedPayload checks choice groups as missing_required
@@ -266,22 +265,6 @@ function labelSoftIncludes(a: string, b: string): boolean {
   const A = normLabel(a);
   const B = normLabel(b);
   if (!A || !B) return false;
-
-  // Prevent false positives like: "пол" matching "получите"
-  // For very short labels, require whole-token match.
-  const tokensA = A.split(/\s+/).filter(Boolean);
-  const tokensB = B.split(/\s+/).filter(Boolean);
-
-  if (B.length <= 3) return tokensA.includes(B);
-  if (A.length <= 3) return tokensB.includes(A);
-
-  // Token containment (order-agnostic)
-  const allIn = (src: string[], needle: string[]) => needle.every((t) => src.includes(t));
-
-  if (allIn(tokensA, tokensB)) return true;
-  if (allIn(tokensB, tokensA)) return true;
-
-  // Last resort
   return A.includes(B) || B.includes(A);
 }
 
@@ -975,7 +958,7 @@ class HotSessionManager {
                 if (!hasVal) {
                   freshNeed.missing_required.push({
                     label: groupDisplayLabel,
-                    type: group.type,
+                    type: "button_group",
                     selector: group.options[0]?.selector || "",
                     options: group.options.map((o) => ({ value: o.text, label: o.text })),
                   });
@@ -1077,7 +1060,9 @@ class HotSessionManager {
       selector: string;
       options?: { value: string; label: string }[];
     }> = [];
+
     for (const f of scanned.fields) {
+      if (!f.required) continue;
       const found = this.matchWizardDataForField(f, data);
       if (!found) {
         missing_required.push({
@@ -1088,8 +1073,10 @@ class HotSessionManager {
         });
       }
     }
-    // ✅ Also check choice groups for missing values (always ask if visible)
+
+    // ✅ Also check choice groups for missing required values
     for (const group of scanned.choiceGroups) {
+      if (!group.required) continue;
 
       const groupNameNorm = normLabel(group.name);
       let hasValue = false;
@@ -1102,13 +1089,26 @@ class HotSessionManager {
         }
       }
 
+      // Fallback: check if any data value EXACTLY matches an option text
+      if (!hasValue) {
+        for (const k of Object.keys(data)) {
+          const v = String((data as any)[k] ?? "").trim();
+          if (!v) continue;
+          if (v.includes("@") || v.length > 40 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+          const vNorm = normLabel(v);
+          if (!vNorm || vNorm.length < 2) continue;
+          const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
+          if (optMatch) { hasValue = true; break; }
+        }
+      }
+
       if (!hasValue) {
         const groupDisplayLabel = (group.label && group.label !== "button_choice")
           ? group.label
           : group.options.map(o => o.text).join(" / ");
         missing_required.push({
           label: groupDisplayLabel,
-          type: group.type,
+          type: "button_group",
           selector: group.options[0]?.selector || "",
           options: group.options.map(o => ({ value: o.text, label: o.text })),
         });
@@ -1653,8 +1653,7 @@ class HotSessionManager {
         name: string;
         label: string;
         required: boolean;
-        // Keep this aligned with WizardChoiceGroup["type"] on the TS side.
-        type: "button_group" | "radio" | "select";
+        type: "button_group";
         options: Array<{ text: string; selector: string }>;
       }> = [];
 
