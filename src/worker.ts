@@ -1497,7 +1497,7 @@ class HotSessionManager {
           const tag = el.tagName.toLowerCase();
           if (tag === "input") {
             const type = (any.type || "").toLowerCase();
-            if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+            if (["hidden", "submit", "button", "image", "reset", "radio", "checkbox"].includes(type)) return false;
           }
           if (any.disabled) return false;
           if (any.getAttribute?.("aria-hidden") === "true") return false;
@@ -1540,127 +1540,19 @@ class HotSessionManager {
 
       const btns: Array<{ text: string; selector: string; groupLabel: string; required: boolean }> = [];
 
-      // Detect choice groups (buttons OR custom radio/option cards)
+      // Detect button-based choice groups: containers with 2+ sibling buttons
       const seenContainers = new Set<Element>();
       const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
-
       // Language codes & nav elements to skip
       const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
-      const isLangSwitcher = (els: Element[]) => {
-        if (els.length < 2 || els.length > 5) return false;
-        return els.every((b) => {
+      const isLangSwitcher = (btns: Element[]) => {
+        if (btns.length < 2 || btns.length > 5) return false;
+        return btns.every((b) => {
           const t = ((b as any).textContent || "").trim().toLowerCase();
           return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
         });
       };
 
-      const looksLikeData = (t: string) => /@/.test(t) || /^https?:/i.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-
-      const cleanGroupLabel = (t: string) => (t || "").replace(/\s*\*\s*$/, "").trim();
-
-      const findGroupLabel = (container: Element): { label: string; required: boolean } => {
-        // Prefer a nearby heading/label BEFORE the container
-        const pick = (el: Element | null) => {
-          if (!el) return "";
-          const txt = (el.textContent || "").trim();
-          if (txt.length < 2 || txt.length > 80) return "";
-          if (looksLikeData(txt)) return "";
-          return txt;
-        };
-
-        let label = "";
-
-        // 1) immediate previous sibling
-        label = pick(container.previousElementSibling);
-
-        // 2) walk up a bit and look for preceding text nodes/headers within the section
-        if (!label) {
-          const section = (container.closest("section, form, main, [role='form'], [role='group']") || container.parentElement) as Element | null;
-          if (section) {
-            const headers = Array.from(section.querySelectorAll("h1,h2,h3,h4,label,[class*='label'],[class*='title']")).filter(isVisible);
-            // choose the closest header that is above the container in the viewport
-            const cRect = (container as any).getBoundingClientRect?.() || { top: 0 };
-            let best: { t: string; dist: number } | null = null;
-            for (const h of headers as any[]) {
-              const t = (h.textContent || "").trim();
-              if (!t || t.length < 2 || t.length > 120) continue;
-              if (looksLikeData(t)) continue;
-              const r = h.getBoundingClientRect?.();
-              if (!r) continue;
-              if (r.bottom <= cRect.top + 10) {
-                const dist = cRect.top - r.bottom;
-                if (dist >= 0 && dist < 260) {
-                  if (!best || dist < best.dist) best = { t, dist };
-                }
-              }
-            }
-            if (best) label = best.t;
-          }
-        }
-
-        const required = /\*|задължително|required/i.test(label);
-        return { label: cleanGroupLabel(label) || "button_choice", required };
-      };
-
-      const isOptionCandidate = (el: Element): boolean => {
-        if (!isVisible(el)) return false;
-        const tag = el.tagName.toLowerCase();
-        if (tag === "script" || tag === "style") return false;
-
-        // exclude obvious navigation/utility areas
-        if (el.closest("nav, header, footer, [role='navigation']")) return false;
-
-        const text = ((el as any).textContent || "").trim();
-        if (!text || text.length < 1 || text.length > 60) return false;
-        if (submitRe.test(text)) return false;
-
-        // exclude language chips like BG/EN
-        const low = text.toLowerCase();
-        if (low.length <= 3 && (langCodes.has(low) || /^[a-z]{2}(-[a-z]{2})?$/.test(low))) return false;
-
-        const any = el as any;
-
-        // must look interactive
-        const role = (any.getAttribute?.("role") || "").toString().toLowerCase();
-        const tabindex = any.getAttribute?.("tabindex");
-        const ariaChecked = any.getAttribute?.("aria-checked");
-        const ariaPressed = any.getAttribute?.("aria-pressed");
-        const ariaSelected = any.getAttribute?.("aria-selected");
-        const dataState = any.getAttribute?.("data-state");
-        const dataChecked = any.getAttribute?.("data-checked");
-        const dataSelected = any.getAttribute?.("data-selected");
-
-        const interactiveAttr =
-          role === "radio" ||
-          role === "option" ||
-          role === "button" ||
-          tabindex === "0" ||
-          ariaChecked !== null ||
-          ariaPressed !== null ||
-          ariaSelected !== null ||
-          dataState !== null ||
-          dataChecked !== null ||
-          dataSelected !== null ||
-          typeof (any as any).onclick === "function" ||
-          any.getAttribute?.("onclick");
-
-        if (tag === "button") return true;
-        if (tag === "a") return true;
-
-        // label wrapping a hidden input is also a common pattern
-        const hasInput = !!el.querySelector("input[type='radio'], input[type='checkbox']");
-        if (hasInput) return true;
-
-        // cursor:pointer is a strong hint
-        try {
-          const cur = window.getComputedStyle(el as any).cursor;
-          if (cur === "pointer") return true;
-        } catch {}
-
-        return !!interactiveAttr;
-      };
-
-      // 1) Detect button-based choice groups: containers with 2+ sibling buttons
       document.querySelectorAll("button, [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
         const parent = btn.parentElement;
@@ -1689,89 +1581,74 @@ class HotSessionManager {
 
         seenContainers.add(parent);
 
-        const gl = findGroupLabel(parent);
+        // Find group label from preceding element or parent
+        let groupLabel = "";
+        const prevSib = parent.previousElementSibling as HTMLElement | null;
+        if (prevSib) {
+          const t = (prevSib.textContent || "").trim();
+          // Skip labels that look like emails, URLs, or phone numbers
+          const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+          if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
+        }
+        if (!groupLabel) {
+          // Try label inside parent's parent
+          const grandParent = parent.parentElement;
+          if (grandParent) {
+            const lab = grandParent.querySelector("label, [class*='label']") as HTMLElement | null;
+            if (lab) {
+              const t = (lab.textContent || "").trim();
+              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+              if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
+            }
+          }
+        }
+
+        const isRequired = /\*|задължително|required/i.test(groupLabel);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+
         optionBtns.forEach((b) => {
           const text = ((b as any).textContent || "").trim();
           btns.push({
             text,
             selector: getSelector(b),
-            groupLabel: gl.label,
-            required: gl.required,
+            groupLabel: cleanLabel || "button_choice",
+            required: isRequired,
           });
         });
       });
 
-      // 2) Also detect explicit radio-like controls: [role="radio"], button[aria-pressed]
+      // Also detect radio-like buttons: [role="radio"], button[aria-pressed]
       document.querySelectorAll('[role="radio"], button[aria-pressed]').forEach((btn) => {
         if (!isVisible(btn)) return;
         const text = ((btn as any).textContent || "").trim();
-        if (!text || text.length < 1 || text.length > 60) return;
+        if (!text || text.length < 1 || text.length > 30) return;
         if (submitRe.test(text)) return;
 
-        // Avoid duplicate
-        const sel = getSelector(btn);
-        if (btns.some((b) => b.selector === sel)) return;
-
         const parent = btn.parentElement;
-        const gl = parent ? findGroupLabel(parent) : { label: "button_choice", required: false };
+        let groupLabel = "";
+        if (parent) {
+          const prevSib = parent.previousElementSibling as HTMLElement | null;
+          if (prevSib) {
+            const t = (prevSib.textContent || "").trim();
+            if (t.length >= 2 && t.length <= 60) groupLabel = t;
+          }
+        }
+
+        const isRequired = /\*|задължително|required/i.test(groupLabel);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+
+        // Avoid duplicate
+        if (btns.some((b) => b.selector === getSelector(btn))) return;
 
         btns.push({
           text,
-          selector: sel,
-          groupLabel: gl.label,
-          required: gl.required,
+          selector: getSelector(btn),
+          groupLabel: cleanLabel || "button_choice",
+          required: isRequired,
         });
       });
 
-      // 3) Custom option cards (NOT buttons): div/li/label/etc grouped by common parent
-      // This catches UI like "radio pills" rendered as divs with circles.
-      const containers = Array.from(document.querySelectorAll("div, ul, ol, section, fieldset, [role='group']"))
-        .filter((c) => isVisible(c))
-        .slice(0, 220);
-
-      for (const c of containers) {
-        if (seenContainers.has(c)) continue;
-        if (c.closest("nav, header, footer, [role='navigation']")) continue;
-
-        // direct-ish children that look like options
-        const kids = Array.from(c.querySelectorAll(":scope > *, :scope > * > *"))
-          .filter((el) => el instanceof Element)
-          .filter((el) => isOptionCandidate(el as Element)) as Element[];
-
-        // We only care about small groups (2..8) to avoid menus/grids
-        const unique = Array.from(new Set(kids));
-        if (unique.length < 2 || unique.length > 8) continue;
-
-        // Ensure options are "similar" sized and close on Y axis
-        const rects = unique.map((el) => (el as any).getBoundingClientRect?.()).filter(Boolean) as any[];
-        if (rects.length !== unique.length) continue;
-
-        const avgH = rects.reduce((a, r) => a + (r.height || 0), 0) / rects.length;
-        if (!avgH || avgH < 18 || avgH > 120) continue;
-
-        const maxH = Math.max(...rects.map((r) => r.height || 0));
-        const minH = Math.min(...rects.map((r) => r.height || 0));
-        if (maxH / Math.max(1, minH) > 2.2) continue;
-
-        seenContainers.add(c);
-
-        const gl = findGroupLabel(c);
-
-        unique.forEach((el) => {
-          const text = ((el as any).textContent || "").trim();
-          if (!text) return;
-          const sel = getSelector(el);
-          if (btns.some((b) => b.selector === sel)) return;
-          btns.push({
-            text,
-            selector: sel,
-            groupLabel: gl.label,
-            required: gl.required,
-          });
-        });
-      }
-
-      // Group buttons/options by groupLabel
+      // Group buttons by groupLabel
       const choiceGroups: Array<{
         name: string;
         label: string;
@@ -1796,6 +1673,111 @@ class HotSessionManager {
           options: items.map((i) => ({ text: i.text, selector: i.selector })),
         });
       }
+
+
+      // ─────────────────────────────────────────────
+      // ✅ Native RADIO groups: input[type=radio] + label (Dentasay style)
+      // ─────────────────────────────────────────────
+      try {
+        const cssEscape = (s: string) => {
+          try {
+            // @ts-ignore
+            return (CSS && (CSS as any).escape) ? (CSS as any).escape(s) : s.replace(/[^\w-]/g, "\\$&");
+          } catch {
+            return s.replace(/[^\w-]/g, "\\$&");
+          }
+        };
+
+        const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
+        const byName = new Map<string, HTMLInputElement[]>();
+
+        for (const r of radios) {
+          const name = (r.name || "").toString().trim();
+          if (!name) continue;
+          if ((r as any).disabled) continue;
+          if ((r as any).getAttribute?.("aria-hidden") === "true") continue;
+          if (!byName.has(name)) byName.set(name, []);
+          byName.get(name)!.push(r);
+        }
+
+        const getRadioOptionText = (input: HTMLInputElement): string => {
+          const id = input.id ? String(input.id) : "";
+          if (id) {
+            const lab = document.querySelector(`label[for="${cssEscape(id)}"]`) as HTMLElement | null;
+            const t = (lab?.textContent || "").trim();
+            if (t) return t;
+          }
+          const wrap = input.closest("label") as HTMLElement | null;
+          const t2 = (wrap?.textContent || "").trim();
+          if (t2) return t2;
+          return (input.value || "").toString().trim();
+        };
+
+        const getRadioOptionSelector = (input: HTMLInputElement): string => {
+          const id = input.id ? String(input.id) : "";
+          if (id) {
+            const labSel = `label[for="${cssEscape(id)}"]`;
+            const lab = document.querySelector(labSel) as HTMLElement | null;
+            if (lab && isVisible(lab)) return labSel;
+            return `#${cssEscape(id)}`;
+          }
+          return getSelector(input);
+        };
+
+        const getRadioGroupLabel = (first: HTMLInputElement): string => {
+          // fieldset/legend first
+          const fs = first.closest("fieldset");
+          if (fs) {
+            const legend = fs.querySelector("legend") as HTMLElement | null;
+            const t = (legend?.textContent || "").trim();
+            if (t) return t;
+          }
+          // walk up and look for previous sibling question text
+          let cur: HTMLElement | null = first.parentElement as HTMLElement | null;
+          for (let i = 0; i < 7 && cur; i++) {
+            const prev = cur.previousElementSibling as HTMLElement | null;
+            if (prev) {
+              const t = (prev.textContent || "").trim();
+              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+              if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
+            }
+            cur = cur.parentElement as HTMLElement | null;
+          }
+          return "";
+        };
+
+        for (const [name, items] of byName) {
+          if (!items || items.length < 2) continue;
+
+          const label = (getRadioGroupLabel(items[0]) || "").trim();
+          const required =
+            items.some((i) => (i as any).required) ||
+            /\*|задължително|required/i.test(label);
+
+          const rawOpts = items
+            .map((i) => ({ text: getRadioOptionText(i), selector: getRadioOptionSelector(i) }))
+            .filter((o) => o.text && o.selector);
+
+          const seen = new Set<string>();
+          const options: Array<{ text: string; selector: string }> = [];
+          for (const o of rawOpts) {
+            const k = o.text.trim().toLowerCase();
+            if (!k || seen.has(k)) continue;
+            seen.add(k);
+            options.push(o);
+          }
+
+          if (options.length < 2) continue;
+
+          choiceGroups.push({
+            name: label || name,
+            label: label || name,
+            required,
+            type: "radio",
+            options,
+          } as any);
+        }
+      } catch {}
 
       return { fields, choices: btns, choiceGroups };
     });
@@ -1964,6 +1946,67 @@ class HotSessionManager {
           }
         });
 
+
+        // 3) ✅ Unselected native RADIO groups (input[type=radio])
+        try {
+          const radios = Array.from(document.querySelectorAll('input[type="radio"]')) as any[];
+          const byName = new Map<string, any[]>();
+
+          for (const r of radios) {
+            const name = (r.name || "").toString().trim();
+            if (!name) continue;
+            if (r.disabled) continue;
+            if (r.getAttribute?.("aria-hidden") === "true") continue;
+            if (!byName.has(name)) byName.set(name, []);
+            byName.get(name)!.push(r);
+          }
+
+          const getRadioGroupLabel = (first: any) => {
+            const fs = first.closest?.("fieldset");
+            if (fs) {
+              const legend = fs.querySelector?.("legend");
+              const t = (legend?.textContent || "").trim();
+              if (t) return t;
+            }
+            let cur = first.parentElement as any;
+            for (let i = 0; i < 7 && cur; i++) {
+              const prev = cur.previousElementSibling as any;
+              if (prev) {
+                const t = (prev.textContent || "").trim();
+                const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+                if (t.length >= 2 && t.length <= 140 && !looksLikeData) return t;
+              }
+              cur = cur.parentElement as any;
+            }
+            return "";
+          };
+
+          const getRadioOptionText = (input: any) => {
+            const id = (input.id || "").toString();
+            if (id) {
+              const lab = document.querySelector(`label[for="${id.replace(/"/g, "")}"]`) as any;
+              const t = (lab?.textContent || "").trim();
+              if (t) return t;
+            }
+            const wrap = input.closest?.("label");
+            const t2 = (wrap?.textContent || "").trim();
+            if (t2) return t2;
+            return (input.value || "").toString().trim();
+          };
+
+          for (const [, items] of byName) {
+            if (!items || items.length < 2) continue;
+
+            const anyChecked = items.some((r) => Boolean(r.checked));
+            if (anyChecked) continue;
+
+            const label = (getRadioGroupLabel(items[0]) || "").trim();
+            const optTexts = items.map(getRadioOptionText).filter(Boolean).slice(0, 6).join("/");
+
+            pending.push(label ? `${label} (${optTexts})` : `Избор: ${optTexts}`);
+          }
+        } catch {}
+
         return { count: pending.length, labels: pending.slice(0, 15) };
       });
     } catch {
@@ -1996,7 +2039,7 @@ class HotSessionManager {
             const tag = (el.tagName || "").toLowerCase();
             if (tag === "input") {
               const type = (el.type || "").toLowerCase();
-              if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
+              if (["hidden", "submit", "button", "image", "reset", "radio", "checkbox"].includes(type)) return false;
             }
             if (el.disabled) return false;
             if (el.getAttribute?.("aria-hidden") === "true") return false;
