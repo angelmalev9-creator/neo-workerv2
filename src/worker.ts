@@ -1653,7 +1653,7 @@ class HotSessionManager {
         name: string;
         label: string;
         required: boolean;
-        type: "button_group";
+        type: "button_group" | "radio" | "select";
         options: Array<{ text: string; selector: string }>;
       }> = [];
 
