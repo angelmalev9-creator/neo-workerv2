@@ -1669,7 +1669,7 @@ class HotSessionManager {
           name,
           label: name,
           required: items.some((i) => i.required),
-          type: \"button_group\",
+          type: "button_group",
           options: items.map((i) => ({ text: i.text, selector: i.selector })),
         });
       }
