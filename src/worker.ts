@@ -808,7 +808,7 @@ class HotSessionManager {
             if (!v || v.includes("@") || v.length > 60) continue;
             const vNorm = normLabel(v);
             if (!vNorm || vNorm.length < 2) continue;
-            const optMatch = rg.options.some((o) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm);
+            const optMatch = rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm);
             if (optMatch) { desiredValue = v; break; }
           }
         }
@@ -816,8 +816,8 @@ class HotSessionManager {
         if (!desiredValue) continue;
 
         const wNorm = normLabel(desiredValue);
-        const pick = rg.options.find((o) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
-          rg.options.find((o) => {
+        const pick = rg.options.find((o: any) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
+          rg.options.find((o: any) => {
             const tN = normLabel(o.text);
             const vN = normLabel(o.value);
             return (tN.length >= 3 && wNorm.length >= 3 && (tN.includes(wNorm) || wNorm.includes(tN))) ||
@@ -1530,7 +1530,7 @@ class HotSessionManager {
     return { clicked: false, text: "" };
   }
 
-  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }> {
+  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[]; radioGroups: any[]; checkboxes: any[]; fileUploads: any[] }> {
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
         const style = window.getComputedStyle(el as any);
