@@ -1,7 +1,7 @@
 /**
- * NEO WORKER v6.0.7-radio-checkbox-file — Universal, deterministic, schema-first
+ * NEO WORKER v6.0.6-universal-choices — Universal, deterministic, schema-first
  *
- * Patch v6.0.7-radio-checkbox-file:
+ * Patch v6.0.6-universal-choices:
  * - Wizard: scanWizardStep detects ALL button choice groups generically (not just gender)
  * - Wizard: fillWizard matches ANY choice from data by group name/label
  * - Wizard: buildWizardNeedPayload checks choice groups as missing_required
@@ -705,7 +705,7 @@ class HotSessionManager {
       const scanned = await this.scanWizardStep(page);
 
       console.log(
-        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} radios=${((scanned as any).radioGroups || []).length} checkboxes=${((scanned as any).checkboxes || []).length} files=${((scanned as any).fileUploads || []).length} sig=${beforeSig.slice(0, 50)}`
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
       );
 
       // 1) Fill visible fields
@@ -785,68 +785,6 @@ class HotSessionManager {
         } else {
           console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
         }
-      }
-
-      // 2b) Handle radio button groups
-      for (const rg of (scanned as any).radioGroups || []) {
-        const rgNameNorm = normLabel(rg.label || rg.name);
-        let desiredValue = "";
-        for (const k of Object.keys(data)) {
-          const kNorm = normLabel(k);
-          if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
-            desiredValue = String((data as any)[k] ?? "").trim();
-            break;
-          }
-        }
-        if (!desiredValue) {
-          for (const k of Object.keys(data)) {
-            const v = String((data as any)[k] ?? "").trim();
-            if (!v || v.includes("@") || v.length > 60) continue;
-            const vNorm = normLabel(v);
-            if (!vNorm || vNorm.length < 2) continue;
-            if (rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm)) { desiredValue = v; break; }
-          }
-        }
-        if (!desiredValue) continue;
-        const wNorm = normLabel(desiredValue);
-        const pick = rg.options.find((o: any) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
-          rg.options.find((o: any) => {
-            const tN = normLabel(o.text); const vN = normLabel(o.value);
-            return (tN.length >= 3 && wNorm.length >= 3 && (tN.includes(wNorm) || wNorm.includes(tN))) ||
-              (vN.length >= 3 && wNorm.length >= 3 && (vN.includes(wNorm) || wNorm.includes(vN)));
-          });
-        if (pick) {
-          const clicked = await this.safeClick(page, pick.selector);
-          console.log(`[WIZARD][RADIO] group="${rg.label || rg.name}" desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
-          if (clicked) { actions.push(`${rg.label || rg.name}: ${pick.text}`); didInteract = true; }
-        }
-      }
-
-      // 2c) Handle checkboxes (consent, agreements)
-      for (const cb of (scanned as any).checkboxes || []) {
-        if (cb.checked) continue;
-        const cbLabelNorm = normLabel(cb.label);
-        const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
-        let shouldCheck = false;
-        for (const k of Object.keys(data)) {
-          const kNorm = normLabel(k);
-          if (kNorm === cbLabelNorm || labelSoftIncludes(k, cb.label)) {
-            const v = String((data as any)[k] ?? "").trim().toLowerCase();
-            shouldCheck = ["да", "yes", "true", "1", "on", "checked"].includes(v);
-            break;
-          }
-        }
-        if (!shouldCheck && isConsent && autoSubmit) shouldCheck = true;
-        if (shouldCheck) {
-          const clicked = await this.safeClick(page, cb.selector);
-          console.log(`[WIZARD][CHECKBOX] label="${cb.label}" consent=${isConsent} clicked=${clicked}`);
-          if (clicked) { actions.push(`✓ ${cb.label}`); didInteract = true; }
-        }
-      }
-
-      // 2d) Log file upload fields
-      for (const fu of (scanned as any).fileUploads || []) {
-        console.log(`[WIZARD][FILE] label="${fu.label}" required=${fu.required} accept="${fu.accept}"`);
       }
 
       // 2.5) Missing required: payload-based + DOM verification fallback
@@ -976,46 +914,6 @@ class HotSessionManager {
                   actions.push(`${group.name}: ${pick.text}`);
                 }
               }
-            }
-          }
-
-          // Also try radio groups on new step
-          for (const rg of (freshScanned as any).radioGroups || []) {
-            const rgNameNorm = normLabel(rg.label || rg.name);
-            let desiredValue = "";
-            for (const k of Object.keys(data)) {
-              const kNorm = normLabel(k);
-              if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
-                desiredValue = String((data as any)[k] ?? "").trim(); break;
-              }
-            }
-            if (!desiredValue) {
-              for (const k of Object.keys(data)) {
-                const v = String((data as any)[k] ?? "").trim();
-                if (!v || v.includes("@") || v.length > 60) continue;
-                const vNorm = normLabel(v);
-                if (!vNorm || vNorm.length < 2) continue;
-                if (rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm)) { desiredValue = v; break; }
-              }
-            }
-            if (desiredValue) {
-              const wNorm = normLabel(desiredValue);
-              const pick = rg.options.find((o: any) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
-                rg.options.find((o: any) => { const tN = normLabel(o.text); return tN.length >= 3 && wNorm.length >= 3 && (tN.includes(wNorm) || wNorm.includes(tN)); });
-              if (pick) {
-                const clicked2 = await this.safeClick(page, pick.selector);
-                if (clicked2) { filledOnNewStep++; actions.push(`${rg.label || rg.name}: ${pick.text}`); }
-              }
-            }
-          }
-
-          // Also try checkboxes on new step
-          for (const cb of (freshScanned as any).checkboxes || []) {
-            if (cb.checked) continue;
-            const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
-            if (isConsent && autoSubmit) {
-              const clicked2 = await this.safeClick(page, cb.selector);
-              if (clicked2) { filledOnNewStep++; actions.push(`✓ ${cb.label}`); }
             }
           }
 
@@ -1230,49 +1128,6 @@ class HotSessionManager {
       selector_candidates: f.selector_candidates,
       options: f.options,
     }));
-
-    // Check radio groups for missing required values
-    for (const rg of (scanned as any).radioGroups || []) {
-      if (!rg.required) continue;
-      const rgNameNorm = normLabel(rg.label || rg.name);
-      let hasValue = false;
-      for (const k of Object.keys(data)) {
-        const kNorm = normLabel(k);
-        if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
-          if (String((data as any)[k] ?? "").trim()) { hasValue = true; break; }
-        }
-      }
-      if (!hasValue) {
-        for (const k of Object.keys(data)) {
-          const v = String((data as any)[k] ?? "").trim();
-          if (!v || v.includes("@") || v.length > 60) continue;
-          const vNorm = normLabel(v);
-          if (rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm)) { hasValue = true; break; }
-        }
-      }
-      if (!hasValue) {
-        missing_required.push({
-          label: rg.label || rg.name || rg.options.map((o: any) => o.text).join(" / "),
-          type: "radio_group",
-          selector: rg.options[0]?.selector || "",
-          options: rg.options.map((o: any) => ({ value: o.value || o.text, label: o.text })),
-        });
-      }
-    }
-
-    // Check unchecked required checkboxes (skip consent — auto-checked)
-    for (const cb of (scanned as any).checkboxes || []) {
-      if (!cb.required || cb.checked) continue;
-      const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
-      if (isConsent) continue;
-      missing_required.push({ label: cb.label || "Checkbox", type: "checkbox", selector: cb.selector });
-    }
-
-    // Check required file uploads
-    for (const fu of (scanned as any).fileUploads || []) {
-      if (!fu.required) continue;
-      missing_required.push({ label: fu.label || "Файл", type: "file_upload", selector: fu.selector });
-    }
 
     return { missing_required, fields, choices: scanned.choices, choiceGroups: scanned.choiceGroups };
   }
@@ -1681,116 +1536,131 @@ class HotSessionManager {
                   }))
                 : undefined,
           };
-        })
-        // Separate radio/checkbox from fillable fields
-        .filter((f) => f.type !== "radio" && f.type !== "checkbox");
-
-      // Detect radio button groups: input[type=radio] grouped by name
-      const radioGroups: Array<{
-        name: string;
-        label: string;
-        required: boolean;
-        options: Array<{ value: string; text: string; selector: string }>;
-      }> = [];
-      const radiosByName = new Map<string, Element[]>();
-      document.querySelectorAll("input[type='radio']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const name = (el as any).name || "";
-        if (!name) return;
-        if (!radiosByName.has(name)) radiosByName.set(name, []);
-        radiosByName.get(name)!.push(el);
-      });
-      radiosByName.forEach((radios, name) => {
-        if (radios.length < 2) return;
-        let groupLabel = "";
-        const firstRadio = radios[0];
-        const fieldset = firstRadio.closest("fieldset");
-        if (fieldset) {
-          const legend = fieldset.querySelector("legend");
-          if (legend) groupLabel = (legend.textContent || "").trim();
-        }
-        if (!groupLabel) {
-          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], [class*='radio'], div, fieldset");
-          if (container) {
-            const headings = container.querySelectorAll("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title'],[class*='question']");
-            for (const h of Array.from(headings)) {
-              const t = (h.textContent || "").trim();
-              if (t.length >= 3 && t.length <= 120) { groupLabel = t; break; }
-            }
-          }
-        }
-        if (!groupLabel) {
-          const parent = firstRadio.parentElement?.parentElement;
-          if (parent?.previousElementSibling) {
-            const t = (parent.previousElementSibling.textContent || "").trim();
-            if (t.length >= 3 && t.length <= 120) groupLabel = t;
-          }
-        }
-        const isReq = /\*|задължително|required/i.test(groupLabel) || radios.some((r: any) => r.required);
-        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
-        const options = radios.map((r) => {
-          const rAny = r as any;
-          const value = rAny.value || "";
-          let text = "";
-          const id = rAny.id || "";
-          if (id) {
-            const lab = document.querySelector('label[for="' + id + '"]') as HTMLElement | null;
-            if (lab) text = (lab.textContent || "").trim();
-          }
-          if (!text) {
-            const parent = r.parentElement;
-            if (parent) {
-              const lab = parent.querySelector("label") as HTMLElement | null;
-              if (lab) text = (lab.textContent || "").trim();
-              if (!text) text = (parent.textContent || "").trim();
-            }
-          }
-          if (!text) text = value;
-          return { value, text, selector: getSelector(r) };
         });
-        radioGroups.push({ name, label: cleanLabel, required: isReq, options });
-      });
-
-      // Detect standalone checkboxes (consent, agreement, etc.)
-      const checkboxes: Array<{
-        label: string; required: boolean; checked: boolean; selector: string;
-      }> = [];
-      document.querySelectorAll("input[type='checkbox']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const any = el as any;
-        if (any.disabled) return;
-        const label = getLabel(el) || any.value || "";
-        const isReq = !!any.required || /\*|задължително|required/i.test(label);
-        checkboxes.push({ label: label.trim(), required: isReq, checked: !!any.checked, selector: getSelector(el) });
-      });
-
-      // Detect file upload fields
-      const fileUploads: Array<{
-        label: string; required: boolean; accept: string; selector: string;
-      }> = [];
-      document.querySelectorAll("input[type='file']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const any = el as any;
-        const label = getLabel(el) || "";
-        const isReq = !!any.required || /\*|задължително|required/i.test(label);
-        fileUploads.push({ label: label.trim() || "Файл", required: isReq, accept: any.accept || "", selector: getSelector(el) });
-      });
 
       const btns: Array<{ text: string; selector: string; groupLabel: string; required: boolean }> = [];
 
-      // Detect button-based choice groups: containers with 2+ sibling buttons
+      // Detect choice groups (buttons OR custom radio/option cards)
       const seenContainers = new Set<Element>();
       const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel|продължи|следва|finish|готово|завърши|потвърди/i;
+
       // Language codes & nav elements to skip
       const langCodes = new Set(["bg", "en", "de", "fr", "es", "it", "ru", "tr", "nl", "pl", "ro", "cs", "el", "pt", "ar", "zh", "ja", "ko"]);
-      const isLangSwitcher = (btns: Element[]) => {
-        if (btns.length < 2 || btns.length > 5) return false;
-        return btns.every((b) => {
+      const isLangSwitcher = (els: Element[]) => {
+        if (els.length < 2 || els.length > 5) return false;
+        return els.every((b) => {
           const t = ((b as any).textContent || "").trim().toLowerCase();
           return t.length <= 3 && (langCodes.has(t) || /^[a-z]{2}(-[a-z]{2})?$/.test(t));
         });
       };
 
+      const looksLikeData = (t: string) => /@/.test(t) || /^https?:/i.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
+
+      const cleanGroupLabel = (t: string) => (t || "").replace(/\s*\*\s*$/, "").trim();
+
+      const findGroupLabel = (container: Element): { label: string; required: boolean } => {
+        // Prefer a nearby heading/label BEFORE the container
+        const pick = (el: Element | null) => {
+          if (!el) return "";
+          const txt = (el.textContent || "").trim();
+          if (txt.length < 2 || txt.length > 80) return "";
+          if (looksLikeData(txt)) return "";
+          return txt;
+        };
+
+        let label = "";
+
+        // 1) immediate previous sibling
+        label = pick(container.previousElementSibling);
+
+        // 2) walk up a bit and look for preceding text nodes/headers within the section
+        if (!label) {
+          const section = (container.closest("section, form, main, [role='form'], [role='group']") || container.parentElement) as Element | null;
+          if (section) {
+            const headers = Array.from(section.querySelectorAll("h1,h2,h3,h4,label,[class*='label'],[class*='title']")).filter(isVisible);
+            // choose the closest header that is above the container in the viewport
+            const cRect = (container as any).getBoundingClientRect?.() || { top: 0 };
+            let best: { t: string; dist: number } | null = null;
+            for (const h of headers as any[]) {
+              const t = (h.textContent || "").trim();
+              if (!t || t.length < 2 || t.length > 120) continue;
+              if (looksLikeData(t)) continue;
+              const r = h.getBoundingClientRect?.();
+              if (!r) continue;
+              if (r.bottom <= cRect.top + 10) {
+                const dist = cRect.top - r.bottom;
+                if (dist >= 0 && dist < 260) {
+                  if (!best || dist < best.dist) best = { t, dist };
+                }
+              }
+            }
+            if (best) label = best.t;
+          }
+        }
+
+        const required = /\*|задължително|required/i.test(label);
+        return { label: cleanGroupLabel(label) || "button_choice", required };
+      };
+
+      const isOptionCandidate = (el: Element): boolean => {
+        if (!isVisible(el)) return false;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "script" || tag === "style") return false;
+
+        // exclude obvious navigation/utility areas
+        if (el.closest("nav, header, footer, [role='navigation']")) return false;
+
+        const text = ((el as any).textContent || "").trim();
+        if (!text || text.length < 1 || text.length > 60) return false;
+        if (submitRe.test(text)) return false;
+
+        // exclude language chips like BG/EN
+        const low = text.toLowerCase();
+        if (low.length <= 3 && (langCodes.has(low) || /^[a-z]{2}(-[a-z]{2})?$/.test(low))) return false;
+
+        const any = el as any;
+
+        // must look interactive
+        const role = (any.getAttribute?.("role") || "").toString().toLowerCase();
+        const tabindex = any.getAttribute?.("tabindex");
+        const ariaChecked = any.getAttribute?.("aria-checked");
+        const ariaPressed = any.getAttribute?.("aria-pressed");
+        const ariaSelected = any.getAttribute?.("aria-selected");
+        const dataState = any.getAttribute?.("data-state");
+        const dataChecked = any.getAttribute?.("data-checked");
+        const dataSelected = any.getAttribute?.("data-selected");
+
+        const interactiveAttr =
+          role === "radio" ||
+          role === "option" ||
+          role === "button" ||
+          tabindex === "0" ||
+          ariaChecked !== null ||
+          ariaPressed !== null ||
+          ariaSelected !== null ||
+          dataState !== null ||
+          dataChecked !== null ||
+          dataSelected !== null ||
+          typeof (any as any).onclick === "function" ||
+          any.getAttribute?.("onclick");
+
+        if (tag === "button") return true;
+        if (tag === "a") return true;
+
+        // label wrapping a hidden input is also a common pattern
+        const hasInput = !!el.querySelector("input[type='radio'], input[type='checkbox']");
+        if (hasInput) return true;
+
+        // cursor:pointer is a strong hint
+        try {
+          const cur = window.getComputedStyle(el as any).cursor;
+          if (cur === "pointer") return true;
+        } catch {}
+
+        return !!interactiveAttr;
+      };
+
+      // 1) Detect button-based choice groups: containers with 2+ sibling buttons
       document.querySelectorAll("button, [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
         const parent = btn.parentElement;
@@ -1819,74 +1689,89 @@ class HotSessionManager {
 
         seenContainers.add(parent);
 
-        // Find group label from preceding element or parent
-        let groupLabel = "";
-        const prevSib = parent.previousElementSibling as HTMLElement | null;
-        if (prevSib) {
-          const t = (prevSib.textContent || "").trim();
-          // Skip labels that look like emails, URLs, or phone numbers
-          const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-          if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
-        }
-        if (!groupLabel) {
-          // Try label inside parent's parent
-          const grandParent = parent.parentElement;
-          if (grandParent) {
-            const lab = grandParent.querySelector("label, [class*='label']") as HTMLElement | null;
-            if (lab) {
-              const t = (lab.textContent || "").trim();
-              const looksLikeData = /@/.test(t) || /^https?:/.test(t) || /^\+?\d[\d\s()-]{6,}$/.test(t);
-              if (t.length >= 2 && t.length <= 60 && !looksLikeData) groupLabel = t;
-            }
-          }
-        }
-
-        const isRequired = /\*|задължително|required/i.test(groupLabel);
-        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
-
+        const gl = findGroupLabel(parent);
         optionBtns.forEach((b) => {
           const text = ((b as any).textContent || "").trim();
           btns.push({
             text,
             selector: getSelector(b),
-            groupLabel: cleanLabel || "button_choice",
-            required: isRequired,
+            groupLabel: gl.label,
+            required: gl.required,
           });
         });
       });
 
-      // Also detect radio-like buttons: [role="radio"], button[aria-pressed]
+      // 2) Also detect explicit radio-like controls: [role="radio"], button[aria-pressed]
       document.querySelectorAll('[role="radio"], button[aria-pressed]').forEach((btn) => {
         if (!isVisible(btn)) return;
         const text = ((btn as any).textContent || "").trim();
-        if (!text || text.length < 1 || text.length > 30) return;
+        if (!text || text.length < 1 || text.length > 60) return;
         if (submitRe.test(text)) return;
 
-        const parent = btn.parentElement;
-        let groupLabel = "";
-        if (parent) {
-          const prevSib = parent.previousElementSibling as HTMLElement | null;
-          if (prevSib) {
-            const t = (prevSib.textContent || "").trim();
-            if (t.length >= 2 && t.length <= 60) groupLabel = t;
-          }
-        }
-
-        const isRequired = /\*|задължително|required/i.test(groupLabel);
-        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
-
         // Avoid duplicate
-        if (btns.some((b) => b.selector === getSelector(btn))) return;
+        const sel = getSelector(btn);
+        if (btns.some((b) => b.selector === sel)) return;
+
+        const parent = btn.parentElement;
+        const gl = parent ? findGroupLabel(parent) : { label: "button_choice", required: false };
 
         btns.push({
           text,
-          selector: getSelector(btn),
-          groupLabel: cleanLabel || "button_choice",
-          required: isRequired,
+          selector: sel,
+          groupLabel: gl.label,
+          required: gl.required,
         });
       });
 
-      // Group buttons by groupLabel
+      // 3) Custom option cards (NOT buttons): div/li/label/etc grouped by common parent
+      // This catches UI like "radio pills" rendered as divs with circles.
+      const containers = Array.from(document.querySelectorAll("div, ul, ol, section, fieldset, [role='group']"))
+        .filter((c) => isVisible(c))
+        .slice(0, 220);
+
+      for (const c of containers) {
+        if (seenContainers.has(c)) continue;
+        if (c.closest("nav, header, footer, [role='navigation']")) continue;
+
+        // direct-ish children that look like options
+        const kids = Array.from(c.querySelectorAll(":scope > *, :scope > * > *"))
+          .filter((el) => el instanceof Element)
+          .filter((el) => isOptionCandidate(el as Element)) as Element[];
+
+        // We only care about small groups (2..8) to avoid menus/grids
+        const unique = Array.from(new Set(kids));
+        if (unique.length < 2 || unique.length > 8) continue;
+
+        // Ensure options are "similar" sized and close on Y axis
+        const rects = unique.map((el) => (el as any).getBoundingClientRect?.()).filter(Boolean) as any[];
+        if (rects.length !== unique.length) continue;
+
+        const avgH = rects.reduce((a, r) => a + (r.height || 0), 0) / rects.length;
+        if (!avgH || avgH < 18 || avgH > 120) continue;
+
+        const maxH = Math.max(...rects.map((r) => r.height || 0));
+        const minH = Math.min(...rects.map((r) => r.height || 0));
+        if (maxH / Math.max(1, minH) > 2.2) continue;
+
+        seenContainers.add(c);
+
+        const gl = findGroupLabel(c);
+
+        unique.forEach((el) => {
+          const text = ((el as any).textContent || "").trim();
+          if (!text) return;
+          const sel = getSelector(el);
+          if (btns.some((b) => b.selector === sel)) return;
+          btns.push({
+            text,
+            selector: sel,
+            groupLabel: gl.label,
+            required: gl.required,
+          });
+        });
+      }
+
+      // Group buttons/options by groupLabel
       const choiceGroups: Array<{
         name: string;
         label: string;
@@ -1912,34 +1797,28 @@ class HotSessionManager {
         });
       }
 
-      return { fields, choices: btns, choiceGroups, radioGroups, checkboxes, fileUploads } as any;
+      return { fields, choices: btns, choiceGroups };
     });
   }
 
   private async getWizardDomSignature(page: Page): Promise<string> {
     try {
       return await page.evaluate(() => {
-        const isV = (el: Element) => {
-          const r = (el as any).getBoundingClientRect?.();
-          if (!r || r.width === 0 || r.height === 0) return false;
-          const style = window.getComputedStyle(el);
-          return style.display !== "none" && style.visibility !== "hidden";
-        };
         const title = document.title || "";
-        const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
-          .filter(isV).slice(0, 6).map((el) => (el.textContent || "").trim().slice(0, 40)).join("~");
-        const stepInd = (document.querySelector("[aria-current='step']")?.textContent ||
-          document.querySelector("[class*='stepTitle'], [class*='step-title']")?.textContent || "").trim();
+        const h1 = (document.querySelector("h1")?.textContent || "").trim();
+        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
         const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter(isV).slice(0, 25)
-          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+          .filter((el: any) => {
+            const r = (el as any).getBoundingClientRect?.();
+            if (!r) return false;
+            const style = window.getComputedStyle(el as any);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            return r.width > 0 && r.height > 0;
+          })
+          .slice(0, 25)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
           .join("|");
-        const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
-          .filter(isV).slice(0, 15).map((el) => (el.textContent || "").trim().slice(0, 30)).join("~");
-        const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
-          .filter(isV).slice(0, 15).map((el: any) => `${el.name || ""}:${el.value || ""}`).join("|");
-        const files = Array.from(document.querySelectorAll("input[type='file']")).filter(isV).length;
-        return `${location.pathname}||${title}||${headings}||${stepInd}||${inputs}||${labels}||${radios}||files:${files}`;
+        return `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
       });
     } catch {
       return `sig:${Date.now()}`;
@@ -1950,27 +1829,21 @@ class HotSessionManager {
     try {
       await page.waitForFunction(
         (sig: string) => {
-          const isV = (el: Element) => {
-            const r = (el as any).getBoundingClientRect?.();
-            if (!r || r.width === 0 || r.height === 0) return false;
-            const s = window.getComputedStyle(el);
-            return s.display !== "none" && s.visibility !== "hidden";
-          };
           const title = document.title || "";
-          const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
-            .filter(isV).slice(0, 6).map((el) => (el.textContent || "").trim().slice(0, 40)).join("~");
-          const stepInd = (document.querySelector("[aria-current='step']")?.textContent ||
-            document.querySelector("[class*='stepTitle'], [class*='step-title']")?.textContent || "").trim();
+          const h1 = (document.querySelector("h1")?.textContent || "").trim();
+          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
           const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-            .filter(isV).slice(0, 25)
-            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+            .filter((el: any) => {
+              const r = (el as any).getBoundingClientRect?.();
+              if (!r) return false;
+              const style = window.getComputedStyle(el as any);
+              if (style.display === "none" || style.visibility === "hidden") return false;
+              return r.width > 0 && r.height > 0;
+            })
+            .slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
             .join("|");
-          const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
-            .filter(isV).slice(0, 15).map((el) => (el.textContent || "").trim().slice(0, 30)).join("~");
-          const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
-            .filter(isV).slice(0, 15).map((el: any) => `${el.name || ""}:${el.value || ""}`).join("|");
-          const files = Array.from(document.querySelectorAll("input[type='file']")).filter(isV).length;
-          const cur = `${location.pathname}||${title}||${headings}||${stepInd}||${inputs}||${labels}||${radios}||files:${files}`;
+          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
           return cur !== sig;
         },
         beforeSig,
@@ -2089,43 +1962,6 @@ class HotSessionManager {
             const optTexts = optBtns.map((b: any) => ((b as any).textContent || "").trim()).join("/");
             pending.push(groupLabel ? `${groupLabel} (${optTexts})` : `Избор: ${optTexts}`);
           }
-        });
-
-        // 3) Unselected radio groups
-        const radioNames = new Map<string, Element[]>();
-        document.querySelectorAll("input[type='radio']").forEach((el) => {
-          if (!isVisible(el)) return;
-          const name = (el as any).name || "";
-          if (!name) return;
-          if (!radioNames.has(name)) radioNames.set(name, []);
-          radioNames.get(name)!.push(el);
-        });
-        radioNames.forEach((radios, rName) => {
-          if (radios.length < 2) return;
-          const anyChecked = radios.some((r: any) => r.checked);
-          if (anyChecked) return;
-          const firstRadio = radios[0];
-          let label = "";
-          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], fieldset, div");
-          if (container) {
-            const h = container.querySelector("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title']");
-            if (h) label = (h.textContent || "").trim().slice(0, 60);
-          }
-          if (!label) label = rName;
-          const optTexts = radios.map((r: any) => {
-            const id = r.id || "";
-            if (id) { const l = document.querySelector('label[for="' + id + '"]'); if (l) return (l.textContent || "").trim(); }
-            const p = r.parentElement; return p ? (p.textContent || "").trim() : "";
-          }).filter(Boolean).join("/");
-          pending.push(label + " (" + optTexts.slice(0, 60) + ")");
-        });
-
-        // 4) Unchecked required checkboxes
-        document.querySelectorAll("input[type='checkbox']").forEach((el: any) => {
-          if (!isVisible(el)) return;
-          if (el.checked || el.disabled) return;
-          if (!el.required) return;
-          pending.push(getLabel(el) || "Checkbox");
         });
 
         return { count: pending.length, labels: pending.slice(0, 15) };
@@ -2552,7 +2388,7 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.0.7-radio-checkbox-file", mode: "schema-first" });
+    res.json({ name: "NEO Worker", version: "6.0.6-universal-choices", mode: "schema-first" });
   });
 
   app.get("/health", (_, res) => {
@@ -2621,7 +2457,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.0.7-radio-checkbox-file listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.0.6-universal-choices listening on :${PORT}`);
   });
 
   await manager.start();
