@@ -705,7 +705,7 @@ class HotSessionManager {
       const scanned = await this.scanWizardStep(page);
 
       console.log(
-        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} radios=${scanned.radioGroups.length} checkboxes=${scanned.checkboxes.length} files=${scanned.fileUploads.length} sig=${beforeSig.slice(0, 60)}`
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
       );
 
       // 1) Fill visible fields
@@ -785,94 +785,6 @@ class HotSessionManager {
         } else {
           console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
         }
-      }
-
-      // 2b) Handle radio button groups
-      for (const rg of scanned.radioGroups) {
-        const rgNameNorm = normLabel(rg.label || rg.name);
-        let desiredValue = "";
-
-        // Direct key match
-        for (const k of Object.keys(data)) {
-          const kNorm = normLabel(k);
-          if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
-            desiredValue = String((data as any)[k] ?? "").trim();
-            break;
-          }
-        }
-
-        // Fallback: check if any data value matches a radio option
-        if (!desiredValue) {
-          for (const k of Object.keys(data)) {
-            const v = String((data as any)[k] ?? "").trim();
-            if (!v || v.includes("@") || v.length > 60) continue;
-            const vNorm = normLabel(v);
-            if (!vNorm || vNorm.length < 2) continue;
-            const optMatch = rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm);
-            if (optMatch) { desiredValue = v; break; }
-          }
-        }
-
-        if (!desiredValue) continue;
-
-        const wNorm = normLabel(desiredValue);
-        const pick = rg.options.find((o: any) => normLabel(o.text) === wNorm || normLabel(o.value) === wNorm) ||
-          rg.options.find((o: any) => {
-            const tN = normLabel(o.text);
-            const vN = normLabel(o.value);
-            return (tN.length >= 3 && wNorm.length >= 3 && (tN.includes(wNorm) || wNorm.includes(tN))) ||
-              (vN.length >= 3 && wNorm.length >= 3 && (vN.includes(wNorm) || wNorm.includes(vN)));
-          });
-
-        if (pick) {
-          const clicked = await this.safeClick(page, pick.selector);
-          console.log(`[WIZARD][RADIO] group="${rg.label || rg.name}" desired="${desiredValue}" picked="${pick.text}" clicked=${clicked}`);
-          if (clicked) {
-            actions.push(`${rg.label || rg.name}: ${pick.text}`);
-            didInteract = true;
-          }
-        }
-      }
-
-      // 2c) Handle checkboxes (consent, agreements)
-      for (const cb of scanned.checkboxes) {
-        if (cb.checked) continue; // Already checked
-        const cbLabelNorm = normLabel(cb.label);
-
-        // Auto-check consent checkboxes if autoSubmit is on
-        const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
-
-        // Check if data has a matching key
-        let shouldCheck = false;
-        for (const k of Object.keys(data)) {
-          const kNorm = normLabel(k);
-          if (kNorm === cbLabelNorm || labelSoftIncludes(k, cb.label)) {
-            const v = String((data as any)[k] ?? "").trim().toLowerCase();
-            shouldCheck = ["да", "yes", "true", "1", "on", "checked", "✓"].includes(v);
-            break;
-          }
-        }
-
-        // Auto-check consent if autoSubmit
-        if (!shouldCheck && isConsent && autoSubmit) {
-          shouldCheck = true;
-        }
-
-        if (shouldCheck) {
-          const clicked = await this.safeClick(page, cb.selector);
-          console.log(`[WIZARD][CHECKBOX] label="${cb.label}" consent=${isConsent} clicked=${clicked}`);
-          if (clicked) {
-            actions.push(`✓ ${cb.label}`);
-            didInteract = true;
-          }
-        }
-      }
-
-      // 2d) Log file upload fields (can't fill automatically without actual file)
-      for (const fu of scanned.fileUploads) {
-        console.log(`[WIZARD][FILE] label="${fu.label}" required=${fu.required} accept="${fu.accept}"`);
-        // File uploads require actual file data — for now just skip non-required ones
-        // Required file uploads will be reported as missing in buildWizardNeedPayload
       }
 
       // 2.5) Missing required: payload-based + DOM verification fallback
@@ -1141,7 +1053,7 @@ class HotSessionManager {
     return `${f.name || ""} ${f.id || ""} ${f.label || ""} ${f.placeholder || ""} ${f.aria_label || ""}`.toLowerCase();
   }
 
-  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[]; radioGroups: any[]; checkboxes: any[]; fileUploads: any[] }, data: Record<string, unknown>) {
+  private buildWizardNeedPayload(scanned: { fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }, data: Record<string, unknown>) {
     const missing_required: Array<{
       label: string;
       type: string;
@@ -1162,7 +1074,7 @@ class HotSessionManager {
       }
     }
 
-    // ✅ Check choice groups for missing required values
+    // ✅ Also check choice groups for missing required values
     for (const group of scanned.choiceGroups) {
       if (!group.required) continue;
 
@@ -1177,13 +1089,16 @@ class HotSessionManager {
         }
       }
 
+      // Fallback: check if any data value EXACTLY matches an option text
       if (!hasValue) {
         for (const k of Object.keys(data)) {
           const v = String((data as any)[k] ?? "").trim();
-          if (!v || v.includes("@") || v.length > 40) continue;
+          if (!v) continue;
+          if (v.includes("@") || v.length > 40 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
           const vNorm = normLabel(v);
           if (!vNorm || vNorm.length < 2) continue;
-          if (group.options.some((o) => normLabel(o.text) === vNorm)) { hasValue = true; break; }
+          const optMatch = group.options.some((o) => normLabel(o.text) === vNorm);
+          if (optMatch) { hasValue = true; break; }
         }
       }
 
@@ -1198,59 +1113,6 @@ class HotSessionManager {
           options: group.options.map(o => ({ value: o.text, label: o.text })),
         });
       }
-    }
-
-    // ✅ Check radio groups for missing required values
-    for (const rg of (scanned.radioGroups || [])) {
-      if (!rg.required) continue;
-      const rgNameNorm = normLabel(rg.label || rg.name);
-      let hasValue = false;
-
-      for (const k of Object.keys(data)) {
-        const kNorm = normLabel(k);
-        if (kNorm === rgNameNorm || labelSoftIncludes(k, rg.label) || labelSoftIncludes(k, rg.name)) {
-          if (String((data as any)[k] ?? "").trim()) { hasValue = true; break; }
-        }
-      }
-      if (!hasValue) {
-        for (const k of Object.keys(data)) {
-          const v = String((data as any)[k] ?? "").trim();
-          if (!v || v.includes("@") || v.length > 60) continue;
-          const vNorm = normLabel(v);
-          if (rg.options.some((o: any) => normLabel(o.text) === vNorm || normLabel(o.value) === vNorm)) { hasValue = true; break; }
-        }
-      }
-      if (!hasValue) {
-        missing_required.push({
-          label: rg.label || rg.name || rg.options.map((o: any) => o.text).join(" / "),
-          type: "radio_group",
-          selector: rg.options[0]?.selector || "",
-          options: rg.options.map((o: any) => ({ value: o.value || o.text, label: o.text })),
-        });
-      }
-    }
-
-    // ✅ Check unchecked required checkboxes
-    for (const cb of (scanned.checkboxes || [])) {
-      if (!cb.required || cb.checked) continue;
-      const isConsent = /съгласие|съгласен|потвърж|consent|agree|terms|privacy|gdpr|условия|политика|приемам|декларирам/i.test(cb.label);
-      // Don't report consent checkboxes as missing — they'll be auto-checked
-      if (isConsent) continue;
-      missing_required.push({
-        label: cb.label || "Checkbox",
-        type: "checkbox",
-        selector: cb.selector,
-      });
-    }
-
-    // ✅ Check required file uploads
-    for (const fu of (scanned.fileUploads || [])) {
-      if (!fu.required) continue;
-      missing_required.push({
-        label: fu.label || "Файл",
-        type: "file_upload",
-        selector: fu.selector,
-      });
     }
 
     const fields = scanned.fields.map((f) => ({
@@ -1530,7 +1392,7 @@ class HotSessionManager {
     return { clicked: false, text: "" };
   }
 
-  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[]; radioGroups: any[]; checkboxes: any[]; fileUploads: any[] }> {
+  private async scanWizardStep(page: Page): Promise<{ fields: WizardScannedField[]; choices: WizardChoiceButton[]; choiceGroups: WizardChoiceGroup[] }> {
     return await page.evaluate(() => {
       const isVisible = (el: Element) => {
         const style = window.getComputedStyle(el as any);
@@ -1674,123 +1536,7 @@ class HotSessionManager {
                   }))
                 : undefined,
           };
-        })
-        // Separate radio/checkbox from fillable fields — they go into radioGroups / checkboxes
-        .filter((f) => f.type !== "radio");
-
-      // ✅ Detect radio button groups: input[type=radio] grouped by name
-      const radioGroups: Array<{
-        name: string;
-        label: string;
-        required: boolean;
-        options: Array<{ value: string; text: string; selector: string }>;
-      }> = [];
-      const radiosByName = new Map<string, Element[]>();
-      document.querySelectorAll("input[type='radio']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const name = (el as any).name || "";
-        if (!name) return;
-        if (!radiosByName.has(name)) radiosByName.set(name, []);
-        radiosByName.get(name)!.push(el);
-      });
-      radiosByName.forEach((radios, name) => {
-        if (radios.length < 2) return;
-        // Find group label from fieldset/legend, parent heading, or first radio's container
-        let groupLabel = "";
-        const firstRadio = radios[0];
-        const fieldset = firstRadio.closest("fieldset");
-        if (fieldset) {
-          const legend = fieldset.querySelector("legend");
-          if (legend) groupLabel = (legend.textContent || "").trim();
-        }
-        if (!groupLabel) {
-          // Look for a heading/label above the radios
-          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], [class*='radio'], div, fieldset");
-          if (container) {
-            const headings = container.querySelectorAll("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title'],[class*='question']");
-            for (const h of Array.from(headings)) {
-              const t = (h.textContent || "").trim();
-              if (t.length >= 3 && t.length <= 120) { groupLabel = t; break; }
-            }
-          }
-        }
-        if (!groupLabel) {
-          // Try parent's previousElementSibling
-          const parent = firstRadio.parentElement?.parentElement;
-          if (parent?.previousElementSibling) {
-            const t = (parent.previousElementSibling.textContent || "").trim();
-            if (t.length >= 3 && t.length <= 120) groupLabel = t;
-          }
-        }
-
-        const isReq = /\*|задължително|required/i.test(groupLabel) || radios.some((r: any) => r.required);
-        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
-
-        const options = radios.map((r) => {
-          const rAny = r as any;
-          const value = rAny.value || "";
-          // Get the visible text label for this radio
-          let text = "";
-          const id = rAny.id || "";
-          if (id) {
-            const lab = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
-            if (lab) text = (lab.textContent || "").trim();
-          }
-          if (!text) {
-            const parent = r.parentElement;
-            if (parent) {
-              const lab = parent.querySelector("label") as HTMLElement | null;
-              if (lab) text = (lab.textContent || "").trim();
-              if (!text) text = (parent.textContent || "").trim();
-            }
-          }
-          if (!text) text = value;
-          return { value, text, selector: getSelector(r) };
         });
-
-        radioGroups.push({ name, label: cleanLabel, required: isReq, options });
-      });
-
-      // ✅ Detect standalone checkboxes (consent, agreement, etc.)
-      const checkboxes: Array<{
-        label: string;
-        required: boolean;
-        checked: boolean;
-        selector: string;
-      }> = [];
-      document.querySelectorAll("input[type='checkbox']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const any = el as any;
-        if (any.disabled) return;
-        const label = getLabel(el) || any.value || "";
-        const isReq = !!any.required || /\*|задължително|required/i.test(label);
-        checkboxes.push({
-          label: label.trim(),
-          required: isReq,
-          checked: !!any.checked,
-          selector: getSelector(el),
-        });
-      });
-
-      // ✅ Detect file upload fields
-      const fileUploads: Array<{
-        label: string;
-        required: boolean;
-        accept: string;
-        selector: string;
-      }> = [];
-      document.querySelectorAll("input[type='file']").forEach((el) => {
-        if (!isVisible(el)) return;
-        const any = el as any;
-        const label = getLabel(el) || "";
-        const isReq = !!any.required || /\*|задължително|required/i.test(label);
-        fileUploads.push({
-          label: label.trim() || "Файл",
-          required: isReq,
-          accept: any.accept || "",
-          selector: getSelector(el),
-        });
-      });
 
       const btns: Array<{ text: string; selector: string; groupLabel: string; required: boolean }> = [];
 
@@ -1928,54 +1674,28 @@ class HotSessionManager {
         });
       }
 
-      return { fields, choices: btns, choiceGroups, radioGroups, checkboxes, fileUploads };
+      return { fields, choices: btns, choiceGroups };
     });
   }
 
   private async getWizardDomSignature(page: Page): Promise<string> {
     try {
       return await page.evaluate(() => {
-        const isVisible = (el: Element) => {
-          const r = (el as any).getBoundingClientRect?.();
-          if (!r || r.width === 0 || r.height === 0) return false;
-          const style = window.getComputedStyle(el);
-          return style.display !== "none" && style.visibility !== "hidden";
-        };
-
         const title = document.title || "";
-        const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
-          .filter(isVisible)
-          .slice(0, 6)
-          .map((el) => (el.textContent || "").trim().slice(0, 40))
-          .join("~");
-        const stepIndicator = (
-          document.querySelector("[aria-current='step']")?.textContent ||
-          document.querySelector("[class*='stepTitle'], [class*='step-title'], [class*='stъпка']")?.textContent ||
-          ""
-        ).trim();
+        const h1 = (document.querySelector("h1")?.textContent || "").trim();
+        const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
         const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-          .filter(isVisible)
+          .filter((el: any) => {
+            const r = (el as any).getBoundingClientRect?.();
+            if (!r) return false;
+            const style = window.getComputedStyle(el as any);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            return r.width > 0 && r.height > 0;
+          })
           .slice(0, 25)
-          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+          .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
           .join("|");
-        // Include visible labels to differentiate steps with different questions
-        const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
-          .filter(isVisible)
-          .slice(0, 15)
-          .map((el) => (el.textContent || "").trim().slice(0, 30))
-          .join("~");
-        // Include radio/checkbox groups
-        const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
-          .filter(isVisible)
-          .slice(0, 15)
-          .map((el: any) => `${el.name || ""}:${el.value || ""}`)
-          .join("|");
-        // Include file inputs
-        const files = Array.from(document.querySelectorAll("input[type='file']"))
-          .filter(isVisible)
-          .length;
-
-        return `${location.pathname}||${title}||${headings}||${stepIndicator}||${inputs}||${labels}||${radios}||files:${files}`;
+        return `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
       });
     } catch {
       return `sig:${Date.now()}`;
@@ -1986,29 +1706,21 @@ class HotSessionManager {
     try {
       await page.waitForFunction(
         (sig: string) => {
-          const isV = (el: Element) => {
-            const r = (el as any).getBoundingClientRect?.();
-            if (!r || r.width === 0 || r.height === 0) return false;
-            const s = window.getComputedStyle(el);
-            return s.display !== "none" && s.visibility !== "hidden";
-          };
           const title = document.title || "";
-          const headings = Array.from(document.querySelectorAll("h1, h2, h3, [class*='step'], [class*='Step']"))
-            .filter(isV).slice(0, 6).map((el) => (el.textContent || "").trim().slice(0, 40)).join("~");
-          const stepIndicator = (
-            document.querySelector("[aria-current='step']")?.textContent ||
-            document.querySelector("[class*='stepTitle'], [class*='step-title']")?.textContent || ""
-          ).trim();
+          const h1 = (document.querySelector("h1")?.textContent || "").trim();
+          const step = (document.querySelector("[aria-current='step']")?.textContent || "").trim();
           const inputs = Array.from(document.querySelectorAll("input, textarea, select"))
-            .filter(isV).slice(0, 25)
-            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${(el.placeholder || "").slice(0, 20)}`)
+            .filter((el: any) => {
+              const r = (el as any).getBoundingClientRect?.();
+              if (!r) return false;
+              const style = window.getComputedStyle(el as any);
+              if (style.display === "none" || style.visibility === "hidden") return false;
+              return r.width > 0 && r.height > 0;
+            })
+            .slice(0, 25)
+            .map((el: any) => `${(el.tagName || "").toLowerCase()}:${(el.type || "").toLowerCase()}:${el.name || ""}:${el.id || ""}`)
             .join("|");
-          const labels = Array.from(document.querySelectorAll("label, legend, [class*='label']"))
-            .filter(isV).slice(0, 15).map((el) => (el.textContent || "").trim().slice(0, 30)).join("~");
-          const radios = Array.from(document.querySelectorAll("input[type='radio'], input[type='checkbox']"))
-            .filter(isV).slice(0, 15).map((el: any) => `${el.name || ""}:${el.value || ""}`).join("|");
-          const files = Array.from(document.querySelectorAll("input[type='file']")).filter(isV).length;
-          const cur = `${location.pathname}||${title}||${headings}||${stepIndicator}||${inputs}||${labels}||${radios}||files:${files}`;
+          const cur = `${location.pathname}||${title}||${h1}||${step}||${inputs}`;
           return cur !== sig;
         },
         beforeSig,
@@ -2127,43 +1839,6 @@ class HotSessionManager {
             const optTexts = optBtns.map((b: any) => ((b as any).textContent || "").trim()).join("/");
             pending.push(groupLabel ? `${groupLabel} (${optTexts})` : `Избор: ${optTexts}`);
           }
-        });
-
-        // 3) Unselected radio groups
-        const radioNames = new Map<string, Element[]>();
-        document.querySelectorAll("input[type='radio']").forEach((el) => {
-          if (!isVisible(el)) return;
-          const name = (el as any).name || "";
-          if (!name) return;
-          if (!radioNames.has(name)) radioNames.set(name, []);
-          radioNames.get(name)!.push(el);
-        });
-        radioNames.forEach((radios, name) => {
-          if (radios.length < 2) return;
-          const anyChecked = radios.some((r: any) => r.checked);
-          if (anyChecked) return;
-          const firstRadio = radios[0];
-          let label = "";
-          const container = firstRadio.closest("[class*='group'], [class*='field'], [class*='question'], fieldset, div");
-          if (container) {
-            const h = container.querySelector("h1,h2,h3,h4,h5,h6,label,legend,[class*='label'],[class*='title']");
-            if (h) label = (h.textContent || "").trim().slice(0, 60);
-          }
-          if (!label) label = name;
-          const optTexts = radios.map((r: any) => {
-            const id = r.id || "";
-            if (id) { const l = document.querySelector(`label[for="${id}"]`); if (l) return (l.textContent || "").trim(); }
-            const p = r.parentElement; return p ? (p.textContent || "").trim() : "";
-          }).filter(Boolean).join("/");
-          pending.push(`${label} (${optTexts.slice(0, 60)})`);
-        });
-
-        // 4) Unchecked required checkboxes
-        document.querySelectorAll("input[type='checkbox']").forEach((el: any) => {
-          if (!isVisible(el)) return;
-          if (el.checked || el.disabled) return;
-          if (!el.required) return;
-          pending.push(getLabel(el) || "Checkbox");
         });
 
         return { count: pending.length, labels: pending.slice(0, 15) };
