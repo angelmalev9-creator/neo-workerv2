@@ -470,6 +470,14 @@ class HotSessionManager {
 
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(400);
+      // ⚡ SPA/hash-based apps (React, Vue, Angular): wait for real content to render
+      if (url.includes("#") || url.includes("spa/") || url.includes("/app/")) {
+        await page.waitForFunction(
+          () => document.body && document.body.innerText.replace(/\s/g, "").length > 100,
+          { timeout: 8000 }
+        ).catch(() => {});
+        await page.waitForTimeout(600);
+      }
 
       const dbSessionId = sessionId || siteId;
       const schemas = await this.loadFormSchemas(dbSessionId);
@@ -597,13 +605,28 @@ class HotSessionManager {
     try {
       const cur = new URL(page.url());
       const target = new URL(schemaUrl);
-      if (cur.pathname === target.pathname) return;
+      // ⚡ For SPA/hash apps compare full href, not just pathname
+      const isSpa = schemaUrl.includes("#") || schemaUrl.includes("spa/");
+      if (isSpa) {
+        if (cur.href === target.href) return;
+      } else {
+        if (cur.pathname === target.pathname) return;
+      }
     } catch {}
 
     try {
       console.log(`[NAV] goto ${schemaUrl}`);
       await page.goto(schemaUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
       await page.waitForTimeout(300);
+      // ⚡ SPA: wait for React/Vue to render
+      const isSpa = schemaUrl.includes("#") || schemaUrl.includes("spa/");
+      if (isSpa) {
+        await page.waitForFunction(
+          () => document.body && document.body.innerText.replace(/\s/g, "").length > 100,
+          { timeout: 8000 }
+        ).catch(() => {});
+        await page.waitForTimeout(600);
+      }
     } catch (e) {
       console.log("[NAV] goto failed:", e);
     }
@@ -684,7 +707,12 @@ class HotSessionManager {
     if (autoSubmit) {
       if (await this.clickAvailabilitySearchButton(page)) {
         actions.push("Търсене");
-        await page.waitForTimeout(1500);
+        // ⚡ SPA apps re-render results — wait for DOM change, not just timeout
+        await page.waitForFunction(
+          () => document.body && document.body.innerText.replace(/\s/g, "").length > 200,
+          { timeout: 6000 }
+        ).catch(() => {});
+        await page.waitForTimeout(800);
       }
     }
 
@@ -840,21 +868,54 @@ class HotSessionManager {
         const isV = (el: Element) => { const s=window.getComputedStyle(el as any); if(s.display==="none"||s.visibility==="hidden") return false; const r=(el as any).getBoundingClientRect?.(); return !!r&&r.width>0&&r.height>0; };
         const rooms: any[] = [];
         const seen = new Set<Element>();
-        for (const sel of ['[class*="room"]','[class*="accommodation"]','[class*="стая"]','[class*="suite"]','[class*="result"]','[class*="card"]','[class*="unit"]','[class*="listing"]','[class*="offer"]']) {
+
+        // ⚡ Clock PMS WBE specific selectors (React SPA)
+        const clockSelectors = [
+          '[class*="room-type"]', '[class*="roomType"]', '[class*="RoomType"]',
+          '[class*="rate-plan"]', '[class*="ratePlan"]',
+          '[class*="wbe-room"]', '[class*="wbeRoom"]',
+          '[class*="accommodation-type"]',
+          '[data-room-type]', '[data-rate-plan]',
+        ];
+        // Generic booking widget selectors
+        const genericSelectors = [
+          '[class*="room"]', '[class*="accommodation"]', '[class*="стая"]',
+          '[class*="suite"]', '[class*="result"]', '[class*="card"]',
+          '[class*="unit"]', '[class*="listing"]', '[class*="offer"]',
+          '[class*="package"]', '[class*="rate"]',
+        ];
+
+        for (const sel of [...clockSelectors, ...genericSelectors]) {
           document.querySelectorAll(sel).forEach(el => {
             if (seen.has(el)||!isV(el)) return;
             const t = el.textContent||"";
-            if (t.length<5||t.length>2000) return;
+            if (t.length<5||t.length>3000) return;
             seen.add(el);
-            const name  = (el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name'],[class*='heading']")?.textContent||"").trim();
-            const price = (el.querySelector("[class*='price'],[class*='цена'],[class*='cost'],[class*='rate'],[class*='amount']")?.textContent||"").trim();
-            if (name||price) rooms.push({ name, price });
+            const nameEl  = el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name'],[class*='heading'],[class*='type']");
+            const priceEl = el.querySelector("[class*='price'],[class*='цена'],[class*='cost'],[class*='rate'],[class*='amount'],[class*='tariff'],[class*='total']");
+            const descEl  = el.querySelector("[class*='desc'],[class*='info'],[class*='detail']");
+            const name  = (nameEl?.textContent  || "").trim();
+            const price = (priceEl?.textContent || "").trim();
+            const desc  = (descEl?.textContent  || "").trim().slice(0, 120);
+            if (name||price) rooms.push({ name, price, ...(desc ? { desc } : {}) });
           });
-          if (rooms.length>=10) break;
+          if (rooms.length>=15) break;
         }
-        return { url: window.location.href, title: document.title, rooms: rooms.slice(0,10), snippet: (document.body?.innerText||"").replace(/\s+/g," ").slice(0,800), submitted: true };
+
+        // ⚡ Fallback: if SPA hasn't rendered results yet, return page text snippet
+        const snippet = (document.body?.innerText||"").replace(/\s+/g," ").slice(0,1200);
+        const hasResults = rooms.length > 0;
+
+        return {
+          url: window.location.href,
+          title: document.title,
+          rooms: rooms.slice(0,15),
+          snippet,
+          submitted: true,
+          spa_rendered: hasResults,
+        };
       });
-    } catch { return { url:"", snippet:"", submitted:false }; }
+    } catch { return { url:"", snippet:"", submitted:false, spa_rendered:false }; }
   }
 
   // ═══════════════════════════════════════════════════════════
