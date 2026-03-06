@@ -1,10 +1,24 @@
 /**
- * NEO WORKER v6.1.0-universal-choices — Universal, deterministic, schema-first
+ * NEO WORKER v6.2.0-availability — Universal, deterministic, schema-first
  *
- * Patch v6.1.0-universal-choices:
- * - scanWizardStep detects ALL interactive choice elements universally:
- *     button groups, [role=radio], real <input type=radio>, styled div choices,
- *     generic clickable containers with 2+ short-text siblings
+ * Patch v6.2.0-availability (over v6.1.0-universal-choices):
+ * - NEW: kind=availability full support — universal calendar widget interaction
+ * - NEW: fillAvailability() — 3-strategy date filling: native → widget → data-attr
+ * - NEW: parseAvailabilityDate() — ISO, DD.MM.YYYY, "8 март 2026", "8 March 2026"
+ * - NEW: openCalendarWidget() — schema selector_candidates + 15 universal fallbacks
+ * - NEW: pickDateInCalendar() — navigates months, clicks correct day universally
+ * - NEW: detectCalendarMonth() — BG + EN month names
+ * - NEW: clickCalendarDay() — data-date attr → text match strategy
+ * - NEW: scrapeAvailabilityResults() — extracts rooms/prices after search
+ * - SPEED: prepareSession waitForTimeout 1200→400
+ * - SPEED: ensureOnSchemaUrl waitForTimeout 900→300
+ * - SPEED: fillWizardField click timeout 1500→500, after-fill wait 80→30
+ * - SPEED: fillSingleField after-fill wait 100→30
+ * - SPEED: trySubmitUniversal after-click wait 700→300
+ * - SPEED: waitForWizardStepChange timeout 9000→4000, fallback 900→300
+ *
+ * v6.1.0-universal-choices original features preserved intact:
+ * - scanWizardStep detects ALL interactive choice elements universally
  * - countUnfilledVisibleFields detects unselected radios + div choices
  * - fillWizard matches ANY choice from data by group name/label
  * - buildWizardNeedPayload checks choice groups as missing_required
@@ -101,6 +115,10 @@ interface FormSchemaRow {
     step_indicators?: string[];
     src?: string;
     vendor?: string;
+    calendar_containers?: Array<{
+      text_hint?: string;
+      selector_candidates?: string[];
+    }>;
   };
   dom_snapshot: string | null;
 }
@@ -451,7 +469,7 @@ class HotSessionManager {
       if (url && !url.startsWith("http")) url = "https://" + url;
 
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(400);
 
       const dbSessionId = sessionId || siteId;
       const schemas = await this.loadFormSchemas(dbSessionId);
@@ -506,6 +524,7 @@ class HotSessionManager {
     if (form_id) schema = session.formSchemas.find(s => s.id === form_id);
     if (!schema && fingerprint) schema = session.formSchemas.find(s => s.fingerprint === fingerprint);
     if (!schema && kind) schema = session.formSchemas.find(s => s.kind === kind);
+    if (!schema) schema = session.formSchemas.find(s => s.kind === "availability");
     if (!schema) schema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
     if (!schema) {
@@ -524,7 +543,9 @@ class HotSessionManager {
     await this.ensureOnSchemaUrl(session.page, schema.url);
 
     let result: { ok: boolean; message: string; observation?: JsonObj };
-    if (schema.kind === "wizard") {
+    if (schema.kind === "availability") {
+      result = await this.fillAvailability(session.page, schema, merged, autoSubmit);
+    } else if (schema.kind === "wizard") {
       result = await this.fillWizard(session.page, schema, merged, autoSubmit, strictSelect);
     } else {
       result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
@@ -582,7 +603,7 @@ class HotSessionManager {
     try {
       console.log(`[NAV] goto ${schemaUrl}`);
       await page.goto(schemaUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await page.waitForTimeout(900);
+      await page.waitForTimeout(300);
     } catch (e) {
       console.log("[NAV] goto failed:", e);
     }
@@ -591,6 +612,254 @@ class HotSessionManager {
   // ─────────────────────────────────────────────────────────
   // Filling logic
   // ─────────────────────────────────────────────────────────
+
+  // ═══════════════════════════════════════════════════════════
+  // ✅ NEW v6.2: AVAILABILITY FILLING
+  // ═══════════════════════════════════════════════════════════
+
+  private parseAvailabilityDate(raw: string): { year: number; month: number; day: number } | null {
+    if (!raw) return null;
+    const s = raw.trim();
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (iso) return { year: +iso[1], month: +iso[2], day: +iso[3] };
+    const dmy = s.match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})$/);
+    if (dmy) return { year: +dmy[3], month: +dmy[2], day: +dmy[1] };
+    const BG_MONTHS: Record<string, number> = {
+      яну:1,фев:2,мар:3,апр:4,май:5,юни:6,юли:7,авг:8,сеп:9,окт:10,ное:11,дек:12,
+      jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12,
+    };
+    const text = s.match(/^(\d{1,2})\s+([а-яa-z]+)\s+(\d{4})$/i);
+    if (text) {
+      const m = BG_MONTHS[text[2].toLowerCase().slice(0, 3)];
+      if (m) return { year: +text[3], month: m, day: +text[1] };
+    }
+    return null;
+  }
+
+  private async fillAvailability(
+    page: Page,
+    schema: FormSchemaRow,
+    data: Record<string, unknown>,
+    autoSubmit = true
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    const actions: string[] = [];
+    const checkInRaw = String(
+      data.check_in || data.checkin || data["Дата на настаняване"] ||
+      data["дата на настаняване"] || data.from || data.arrival || data.start || ""
+    ).trim();
+    const checkOutRaw = String(
+      data.check_out || data.checkout || data["Дата на отпътуване"] ||
+      data["дата на отпътуване"] || data.to || data.departure || data.end || ""
+    ).trim();
+    const adults = String(data.adults || data.възрастни || data.guests || "").trim();
+
+    const checkInDate  = this.parseAvailabilityDate(checkInRaw);
+    const checkOutDate = this.parseAvailabilityDate(checkOutRaw);
+
+    console.log(`[AVAILABILITY] check_in="${checkInRaw}" parsed=${JSON.stringify(checkInDate)}`);
+    console.log(`[AVAILABILITY] check_out="${checkOutRaw}" parsed=${JSON.stringify(checkOutDate)}`);
+
+    const nativeFilled = await this.tryNativeDateInputs(page, checkInRaw, checkOutRaw);
+    if (nativeFilled) {
+      if (checkInRaw)  actions.push(`Настаняване: ${checkInRaw}`);
+      if (checkOutRaw) actions.push(`Отпътуване: ${checkOutRaw}`);
+    } else if (checkInDate) {
+      const calOpened = await this.openCalendarWidget(page, schema);
+      if (calOpened) {
+        await page.waitForTimeout(250);
+        if (await this.pickDateInCalendar(page, checkInDate)) {
+          actions.push(`Настаняване: ${checkInRaw}`);
+          await page.waitForTimeout(150);
+        }
+        if (checkOutDate && await this.pickDateInCalendar(page, checkOutDate)) {
+          actions.push(`Отпътуване: ${checkOutRaw}`);
+        }
+        await page.keyboard.press("Escape").catch(() => {});
+        await page.waitForTimeout(150);
+      }
+    }
+
+    if (adults) { await this.trySetGuestCount(page, adults); actions.push(`Гости: ${adults}`); }
+
+    if (autoSubmit) {
+      if (await this.clickAvailabilitySearchButton(page)) {
+        actions.push("Търсене");
+        await page.waitForTimeout(1500);
+      }
+    }
+
+    const obs = await this.scrapeAvailabilityResults(page);
+    if (actions.length) obs.actions = actions;
+    return { ok: true, message: actions.join(" → ") || "Availability: страница отворена", observation: obs };
+  }
+
+  private async tryNativeDateInputs(page: Page, checkIn: string, checkOut: string): Promise<boolean> {
+    try {
+      const inputs = await page.$$('input[type="date"]');
+      const visible: any[] = [];
+      for (const inp of inputs) { if (await inp.isVisible().catch(() => false)) visible.push(inp); }
+      if (!visible.length) return false;
+      if (checkIn  && visible[0]) await visible[0].fill(checkIn).catch(() => {});
+      if (checkOut && visible[1]) await visible[1].fill(checkOut).catch(() => {});
+      return true;
+    } catch { return false; }
+  }
+
+  private async openCalendarWidget(page: Page, schema: FormSchemaRow): Promise<boolean> {
+    for (const c of (schema.schema.calendar_containers || [])) {
+      for (const sel of (c.selector_candidates || [])) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !await el.isVisible().catch(() => false)) continue;
+          await el.click({ timeout: 500 });
+          console.log(`[AVAILABILITY] opened via schema: ${sel}`);
+          return true;
+        } catch {}
+      }
+    }
+    for (const sel of [
+      'i[class*="calendar"]', '.fa-calendar', '[class*="calendar-icon"]', '[class*="calendarIcon"]',
+      'input[readonly][class*="date"]', 'input[readonly][class*="Date"]',
+      'input[placeholder*="астан"]', 'input[placeholder*="Check"]',
+      'input[placeholder*="дата"]', 'input[placeholder*="date"]',
+      '[class*="daterange"]', '[class*="date-range"]', '[class*="DateRange"]',
+      '[class*="datepicker"]:not(input)', '[class*="date-picker"]:not(input)',
+      '[class*="dateInput"]', '[class*="checkin"]', '[class*="check-in"]',
+      'input[readonly]',
+    ]) {
+      try {
+        const el = await page.$(sel);
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await el.click({ timeout: 500 });
+        console.log(`[AVAILABILITY] opened via universal: ${sel}`);
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  private async pickDateInCalendar(page: Page, target: { year: number; month: number; day: number }): Promise<boolean> {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const current = await this.detectCalendarMonth(page);
+      if (!current) break;
+      const diff = (target.year - current.year) * 12 + (target.month - current.month);
+      if (diff === 0) return await this.clickCalendarDay(page, target.day, target.month, target.year);
+      if (!await this.clickCalendarNav(page, diff > 0 ? "next" : "prev")) break;
+      await page.waitForTimeout(150);
+    }
+    return await this.clickCalendarDay(page, target.day, target.month, target.year);
+  }
+
+  private async detectCalendarMonth(page: Page): Promise<{ year: number; month: number } | null> {
+    try {
+      return await page.evaluate(() => {
+        const M: Record<string, number> = {
+          "януари":1,"февруари":2,"март":3,"април":4,"май":5,"юни":6,
+          "юли":7,"август":8,"септември":9,"октомври":10,"ноември":11,"декември":12,
+          "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+          "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+        };
+        const isV = (el: Element) => { const s = window.getComputedStyle(el as any); if (s.display==="none"||s.visibility==="hidden") return false; const r=(el as any).getBoundingClientRect?.(); return !!r&&r.width>0&&r.height>0; };
+        for (const el of Array.from(document.querySelectorAll('[class*="month"],[class*="Month"],[class*="calendar-title"],[class*="datepicker-title"],[class*="CalendarMonth"],.flatpickr-month,[class*="calendar-header"],[class*="picker-header"]')).filter(isV)) {
+          const txt = (el.textContent||"").trim().toLowerCase();
+          if (!txt||txt.length>80) continue;
+          const yr = txt.match(/\b(202[0-9]|203[0-9])\b/);
+          if (!yr) continue;
+          for (const [n,num] of Object.entries(M)) { if (txt.includes(n.toLowerCase())) return { year:+yr[1], month:num }; }
+          const nm = txt.match(/\b(0?[1-9]|1[0-2])\b/);
+          if (nm) return { year:+yr[1], month:+nm[1] };
+        }
+        return null;
+      });
+    } catch { return null; }
+  }
+
+  private async clickCalendarNav(page: Page, direction: "next" | "prev"): Promise<boolean> {
+    const sels = direction === "next"
+      ? ['button[aria-label*="next" i]','button[aria-label*="напред" i]','button[aria-label*="следващ" i]','[class*="next-month"]','[class*="nextMonth"]','.flatpickr-next-month','[class*="arrow-right"]','button:has-text(">")','button:has-text("→")','button:has-text("»")']
+      : ['button[aria-label*="prev" i]','button[aria-label*="назад" i]','button[aria-label*="предишен" i]','[class*="prev-month"]','[class*="prevMonth"]','.flatpickr-prev-month','[class*="arrow-left"]','button:has-text("<")','button:has-text("←")','button:has-text("«")'];
+    for (const sel of sels) {
+      try {
+        const el = await page.$(sel);
+        if (!el||!await el.isVisible().catch(()=>false)) continue;
+        await el.click({ timeout: 500 });
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  private async clickCalendarDay(page: Page, day: number, month: number, year: number): Promise<boolean> {
+    try {
+      return await page.evaluate(({ day, month, year }) => {
+        const isV = (el: Element) => { const s=window.getComputedStyle(el as any); if(s.display==="none"||s.visibility==="hidden"||s.opacity==="0") return false; const r=(el as any).getBoundingClientRect?.(); return !!r&&r.width>0&&r.height>0; };
+        const mm=String(month).padStart(2,"0"), dd=String(day).padStart(2,"0"), ds=String(day);
+        for (const sel of [`[data-date="${year}-${mm}-${dd}"]`,`[data-date*="${year}-${mm}-${dd}"]`,`[data-day="${day}"]`]) {
+          const el=document.querySelector(sel) as HTMLElement|null;
+          if (el&&isV(el)&&!(el as any).disabled) { const c=(el.className||"").toLowerCase(); if (!c.includes("disabled")&&!c.includes("unavail")) { el.click(); return true; } }
+        }
+        for (const el of Array.from(document.querySelectorAll('[class*="day"]:not([class*="dayname"]):not([class*="day-name"]):not([class*="weekday"]):not([class*="header"]),[class*="date-cell"],[class*="dateCell"],td[class*="day"],td[class*="date"],.flatpickr-day'))) {
+          if (!isV(el)||(el.textContent||"").trim()!==ds) continue;
+          const c=(el.className||"").toLowerCase();
+          if (c.includes("disabled")||c.includes("past")||c.includes("unavail")||c.includes("gray")) continue;
+          if ((el as any).disabled) continue;
+          (el as HTMLElement).click(); return true;
+        }
+        return false;
+      }, { day, month, year });
+    } catch { return false; }
+  }
+
+  private async trySetGuestCount(page: Page, adults: string): Promise<void> {
+    for (const sel of ['select[name*="adult"]','select[name*="guest"]','[class*="adult"] select','[class*="guest"] select','select[aria-label*="възрастн" i]','select[aria-label*="adult" i]']) {
+      try {
+        const el = await page.$(sel);
+        if (!el||!await el.isVisible().catch(()=>false)) continue;
+        await (el as any).selectOption({ label: adults }).catch(async () => { await (el as any).selectOption({ value: adults }).catch(()=>{}); });
+        return;
+      } catch {}
+    }
+  }
+
+  private async clickAvailabilitySearchButton(page: Page): Promise<boolean> {
+    for (const sel of ['button:has-text("Търсене")','button:has-text("Search")','button:has-text("Провери")','button:has-text("Check availability")','button:has-text("Резервирай")','button:has-text("Book")','input[type="submit"][value*="Търс"]','input[type="submit"][value*="Search"]','button[type="submit"]','input[type="submit"]']) {
+      try {
+        const el = await page.$(sel);
+        if (!el||!await el.isVisible().catch(()=>false)) continue;
+        await el.click({ timeout: 1000 });
+        console.log(`[AVAILABILITY] search: ${sel}`);
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  private async scrapeAvailabilityResults(page: Page): Promise<JsonObj> {
+    try {
+      return await page.evaluate(() => {
+        const isV = (el: Element) => { const s=window.getComputedStyle(el as any); if(s.display==="none"||s.visibility==="hidden") return false; const r=(el as any).getBoundingClientRect?.(); return !!r&&r.width>0&&r.height>0; };
+        const rooms: any[] = [];
+        const seen = new Set<Element>();
+        for (const sel of ['[class*="room"]','[class*="accommodation"]','[class*="стая"]','[class*="suite"]','[class*="result"]','[class*="card"]','[class*="unit"]','[class*="listing"]','[class*="offer"]']) {
+          document.querySelectorAll(sel).forEach(el => {
+            if (seen.has(el)||!isV(el)) return;
+            const t = el.textContent||"";
+            if (t.length<5||t.length>2000) return;
+            seen.add(el);
+            const name  = (el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name'],[class*='heading']")?.textContent||"").trim();
+            const price = (el.querySelector("[class*='price'],[class*='цена'],[class*='cost'],[class*='rate'],[class*='amount']")?.textContent||"").trim();
+            if (name||price) rooms.push({ name, price });
+          });
+          if (rooms.length>=10) break;
+        }
+        return { url: window.location.href, title: document.title, rooms: rooms.slice(0,10), snippet: (document.body?.innerText||"").replace(/\s+/g," ").slice(0,800), submitted: true };
+      });
+    } catch { return { url:"", snippet:"", submitted:false }; }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // END v6.2 availability methods
+  // ═══════════════════════════════════════════════════════════
 
   private matchFieldValue(field: FormSchemaField, data: Record<string, unknown>): string | undefined {
     if (field.name && data[field.name] !== undefined) return String(data[field.name]);
@@ -1290,7 +1559,7 @@ class HotSessionManager {
         if (!visible) continue;
 
         await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.click({ timeout: 1500 }).catch(() => {});
+        await loc.click({ timeout: 500 }).catch(() => {});
 
         if (f.tag === "select" || f.type === "select") {
           const ok = await this.smartSelectOption(page, sel, String(value), strictSelect);
@@ -1301,7 +1570,7 @@ class HotSessionManager {
 
         await loc.fill(String(value), { timeout: 3000 });
         await page.keyboard.press("Tab").catch(() => {});
-        await page.waitForTimeout(80).catch(() => {});
+        await page.waitForTimeout(30).catch(() => {});
         console.log(`[WIZARD][FILL][OK] sel=${sel}`);
         return true;
       } catch (e) {
@@ -1875,10 +2144,10 @@ class HotSessionManager {
           return cur !== sig;
         },
         beforeSig,
-        { timeout: 9000 }
+        { timeout: 4000 }
       );
     } catch {
-      await page.waitForTimeout(900).catch(() => {});
+      await page.waitForTimeout(300).catch(() => {});
     }
   }
 
@@ -2154,7 +2423,7 @@ class HotSessionManager {
 
         await page.fill(sel, String(value), { timeout: 3000 });
         await page.keyboard.press("Tab").catch(() => {});
-        await page.waitForTimeout(100).catch(() => {});
+        await page.waitForTimeout(30).catch(() => {});
         console.log(`[FILL][OK] ${sel}`);
         return sel;
       } catch (e) {
@@ -2386,7 +2655,7 @@ class HotSessionManager {
     for (const a of filledSelectors.slice(0, 3)) {
       const ok = await this.clickSubmitWithinClosestForm(page, a, debug);
       if (ok) {
-        await page.waitForTimeout(700).catch(() => {});
+        await page.waitForTimeout(300).catch(() => {});
         return { attempted, clicked: true, method: "closest_form", debug };
       }
     }
@@ -2395,7 +2664,7 @@ class HotSessionManager {
     if (schemaSelectors.length) {
       const ok = await this.clickBySelectors(page, schemaSelectors, debug);
       if (ok) {
-        await page.waitForTimeout(700).catch(() => {});
+        await page.waitForTimeout(300).catch(() => {});
         return { attempted, clicked: true, method: "schema.selector_candidates", debug };
       }
     }
@@ -2404,7 +2673,7 @@ class HotSessionManager {
     if (submitText) {
       const ok = await this.clickByTextHeuristic(page, submitText, debug);
       if (ok) {
-        await page.waitForTimeout(700).catch(() => {});
+        await page.waitForTimeout(300).catch(() => {});
         return { attempted, clicked: true, method: "schema.text", debug };
       }
     }
@@ -2419,7 +2688,7 @@ class HotSessionManager {
     {
       const ok = await this.clickBySelectors(page, universalSelectors, debug);
       if (ok) {
-        await page.waitForTimeout(700).catch(() => {});
+        await page.waitForTimeout(300).catch(() => {});
         return { attempted, clicked: true, method: "universal_selectors", debug };
       }
     }
@@ -2434,7 +2703,7 @@ class HotSessionManager {
 
       if (ok) {
         debug.push("requestSubmit()");
-        await page.waitForTimeout(700).catch(() => {});
+        await page.waitForTimeout(300).catch(() => {});
         return { attempted, clicked: true, method: "requestSubmit", debug };
       }
     } catch {
