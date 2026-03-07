@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v6.1.0-universal-choices — Universal, deterministic, schema-first
+ * NEO WORKER v6.2.0-booking-check — Universal, deterministic, schema-first
  *
  * Patch v6.1.0-universal-choices:
  * - scanWizardStep detects ALL interactive choice elements universally:
@@ -9,6 +9,15 @@
  * - fillWizard matches ANY choice from data by group name/label
  * - buildWizardNeedPayload checks choice groups as missing_required
  * - Handles multi-step wizards where new fields appear after interaction
+ *
+ * Patch v6.2.0-booking-check:
+ * - NEW: POST /check-availability endpoint
+ * - Auto-detects booking widgets (inline forms, iframes, buttons)
+ * - Crawls booking form fields and returns required_fields for Gemini
+ * - Fills check-in/check-out/adults/children/rooms across all frame contexts
+ * - Scrapes availability results: room names, price/night, total price, currency
+ * - Supports: MPHB, Beds24, Sirvoy, Lodgify, Cloudbeds, generic WordPress booking
+ * - Returns only info — does NOT make actual reservations
  */
 
 import express, { Request, Response } from "express";
@@ -139,6 +148,75 @@ interface ExecuteRequest {
   keywords: string[];
   data?: Record<string, unknown>;
 }
+
+// ─────────────────────────────────────────────────────────
+// Booking availability interfaces
+// ─────────────────────────────────────────────────────────
+
+interface CheckAvailabilityRequest {
+  site_id: string;
+  session_id?: string;
+  /** URL override — ако не е подаден взима от form_schemas или siteMap */
+  url?: string;
+  /**
+   * Данни за търсене. Ако не са подадени worker-ът връща needs_input=true
+   * Ключове: check_in, check_out, adults, children, rooms, promo_code
+   */
+  booking_data?: Record<string, string>;
+  /** Само crawl — не попълва формата */
+  crawl_only?: boolean;
+}
+
+interface RequiredBookingField {
+  key: string;
+  label: string;
+  type: string;
+  options?: string[];
+  example?: string;
+  selector?: string;
+}
+
+interface RoomResult {
+  name: string;
+  price_per_night?: string;
+  total_price?: string;
+  currency?: string;
+  availability?: string;
+  description?: string;
+  capacity?: string;
+}
+
+interface AvailabilityResult {
+  success: boolean;
+  needs_input?: boolean;
+  required_fields?: RequiredBookingField[];
+  rooms?: RoomResult[];
+  message: string;
+  source_url?: string;
+  widget_vendor?: string;
+  raw_snippet?: string;
+}
+
+// ─────────────────────────────────────────────────────────
+// Booking widget vendor detection constants
+// ─────────────────────────────────────────────────────────
+
+const BOOKING_IFRAME_VENDORS: Record<string, string> = {
+  "mphb":        "motopress-hotel-booking",
+  "booking.com": "booking.com-widget",
+  "beds24":      "beds24",
+  "eviivo":      "eviivo",
+  "sirvoy":      "sirvoy",
+  "lodgify":     "lodgify",
+  "cloudbeds":   "cloudbeds",
+  "guesty":      "guesty",
+  "hostfully":   "hostfully",
+  "resly":       "resly",
+  "roomcloud":   "roomcloud",
+  "hotel3s":     "hotel3s",
+  "pms365":      "pms365",
+};
+
 
 // ───────────────────────────────────────────────────────────────
 // Logging helpers (PII-safe)
@@ -482,6 +560,720 @@ class HotSessionManager {
     s.formSchemas = schemas;
     return schemas;
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // /check-availability — Booking Widget Handler
+  // ═══════════════════════════════════════════════════════════
+
+  async checkAvailability(req: CheckAvailabilityRequest): Promise<AvailabilityResult> {
+    const { site_id, session_id, url, booking_data, crawl_only } = req;
+
+    const session = this.sessions.get(site_id);
+    if (!session) {
+      return { success: false, message: "Няма активна сесия. Извикай /prepare-session първо." };
+    }
+    session.lastActivity = Date.now();
+
+    // Зареди schemas ако липсват
+    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
+      session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
+    }
+
+    // Определи target URL
+    let targetUrl = url || "";
+    if (!targetUrl) {
+      const bookingSchema = session.formSchemas.find(
+        s => s.kind === "booking_widget" || s.kind === "availability"
+      );
+      targetUrl = bookingSchema?.url || session.siteMap.url || "";
+    }
+    if (targetUrl && !targetUrl.startsWith("http")) targetUrl = "https://" + targetUrl;
+
+    // Навигирай ако е нужно
+    if (targetUrl) {
+      try {
+        const cur = new URL(session.page.url());
+        const tgt = new URL(targetUrl);
+        if (cur.pathname !== tgt.pathname || cur.hostname !== tgt.hostname) {
+          console.log(`[CHECK-AVAIL] Navigating to ${targetUrl}`);
+          await session.page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await session.page.waitForTimeout(1500);
+          await this.dismissCookieBanner(session.page);
+        }
+      } catch (e) {
+        console.log(`[CHECK-AVAIL] Nav error: ${e}`);
+      }
+    }
+
+    // Открий и кликни booking widget
+    const widgetFound = await this.findAndClickBookingWidget(session.page);
+    console.log(`[CHECK-AVAIL] widget_found=${widgetFound.found} vendor=${widgetFound.vendor} method=${widgetFound.method}`);
+
+    // Crawl формата
+    const crawled = await this.scrapeBookingWidgetForm(session.page);
+    console.log(`[CHECK-AVAIL] crawled fields=${crawled.required_fields.length} vendor=${crawled.vendor}`);
+
+    if (crawl_only) {
+      return {
+        success: true,
+        needs_input: crawled.required_fields.length > 0,
+        required_fields: crawled.required_fields,
+        message: "Crawl завършен",
+        source_url: session.page.url(),
+        widget_vendor: crawled.vendor || widgetFound.vendor,
+      };
+    }
+
+    // Ако няма booking_data → върни required_fields за Gemini
+    if (!booking_data || Object.keys(booking_data).length === 0) {
+      return {
+        success: false,
+        needs_input: true,
+        required_fields: crawled.required_fields,
+        message: "Необходими са данни за резервацията",
+        source_url: session.page.url(),
+        widget_vendor: crawled.vendor || widgetFound.vendor,
+      };
+    }
+
+    // Попълни widget-а
+    const fillResult = await this.fillBookingWidget(session.page, booking_data, crawled);
+    console.log(`[CHECK-AVAIL] fill_ok=${fillResult.ok} msg=${fillResult.message}`);
+
+    if (!fillResult.ok) {
+      return {
+        success: false,
+        needs_input: fillResult.needs_more_input,
+        required_fields: fillResult.missing_fields,
+        message: fillResult.message,
+        source_url: session.page.url(),
+        widget_vendor: crawled.vendor || widgetFound.vendor,
+      };
+    }
+
+    // Изчакай и scraпни резултати
+    await session.page.waitForTimeout(2000);
+    await this.dismissCookieBanner(session.page);
+
+    const results = await this.scrapeBookingResults(session.page);
+
+    return {
+      success: true,
+      rooms: results.rooms,
+      message: results.rooms.length > 0
+        ? `Намерени ${results.rooms.length} вид/а стаи`
+        : "Не намерих стаи — провери дали формата е попълнена правилно",
+      source_url: session.page.url(),
+      widget_vendor: crawled.vendor || widgetFound.vendor,
+      raw_snippet: results.rooms.length === 0 ? results.raw_snippet : undefined,
+    };
+  }
+
+  /**
+   * Търси резервационен бутон/widget на текущата страница и го натиска.
+   * Поддържа: inline форми, iframe widgets, бутони с текст.
+   */
+  private async findAndClickBookingWidget(
+    page: Page
+  ): Promise<{ found: boolean; vendor: string; method: string }> {
+
+    // A) Провери дали вече има видима booking форма (inline widget)
+    const hasInlineForm = await page.evaluate(() => {
+      const bookingKeywords = /check.?in|check.?out|настаняване|напускане|arrival|departure|mphb_check|checkin|checkout/i;
+      const inputs = Array.from(document.querySelectorAll("input, select"));
+      return inputs.some(el => {
+        const any = el as any;
+        const combined = `${any.name || ""} ${any.id || ""} ${any.placeholder || ""} ${any.getAttribute?.("aria-label") || ""}`;
+        return bookingKeywords.test(combined);
+      });
+    }).catch(() => false);
+
+    if (hasInlineForm) {
+      console.log("[BOOKING-WIDGET] Inline booking form detected");
+      return { found: true, vendor: "inline", method: "inline_form" };
+    }
+
+    // B) Провери за iframe с познати vendor-и
+    const iframeVendor = await page.evaluate((vendors: Record<string, string>) => {
+      const iframes = Array.from(document.querySelectorAll("iframe"));
+      for (const iframe of iframes) {
+        const src = ((iframe as any).src || iframe.getAttribute("data-src") || "").toLowerCase();
+        for (const [key, name] of Object.entries(vendors)) {
+          if (src.includes(key)) return { name, key };
+        }
+      }
+      return null;
+    }, BOOKING_IFRAME_VENDORS).catch(() => null);
+
+    if (iframeVendor) {
+      console.log(`[BOOKING-WIDGET] iframe vendor detected: ${iframeVendor.name}`);
+      // Scroll iframe into view
+      try {
+        await page.evaluate((key: string) => {
+          const iframes = Array.from(document.querySelectorAll("iframe"));
+          for (const iframe of iframes) {
+            if (((iframe as any).src || "").includes(key)) {
+              (iframe as HTMLElement).scrollIntoView({ behavior: "smooth" });
+            }
+          }
+        }, iframeVendor.key);
+        await page.waitForTimeout(600);
+      } catch {}
+      return { found: true, vendor: iframeVendor.name, method: "iframe_detected" };
+    }
+
+    // C) Търси бутон по познати текстове и атрибути
+    const bookingBtnSelectors = [
+      'button:has-text("Резервация")',
+      'button:has-text("Резервирай")',
+      'button:has-text("Настаняване")',
+      'button:has-text("Провери наличност")',
+      'button:has-text("Свободни стаи")',
+      'button:has-text("Виж стаи")',
+      'button:has-text("Book Now")',
+      'button:has-text("Check Availability")',
+      'button:has-text("Reserve")',
+      'button:has-text("Book")',
+      'a:has-text("Резервация")',
+      'a:has-text("Book Now")',
+      'a:has-text("Reserve")',
+      '[class*="booking-btn"]',
+      '[class*="book-now"]',
+      '[id*="booking-btn"]',
+      '[data-action*="book"]',
+    ];
+
+    for (const sel of bookingBtnSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 3000 });
+        await page.waitForTimeout(1200);
+        console.log(`[BOOKING-WIDGET] Clicked: ${sel}`);
+        return { found: true, vendor: "unknown", method: `button:${sel}` };
+      } catch {}
+    }
+
+    // D) Евристично търсене по keyword matching
+    const heuristic = await page.evaluate(() => {
+      const patterns = [/резерв/i, /настаняване/i, /нощувк/i, /стаи/i, /наличн/i,
+                        /book\s*now/i, /reserv/i, /availab/i, /room/i];
+      const els = Array.from(document.querySelectorAll("button, a, [role='button']"));
+      for (const el of els) {
+        const text = (el.textContent || "").trim();
+        if (!text || text.length > 60) continue;
+        const style = window.getComputedStyle(el as HTMLElement);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        const r = (el as HTMLElement).getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        for (const pat of patterns) {
+          if (pat.test(text)) {
+            (el as HTMLElement).click();
+            return text;
+          }
+        }
+      }
+      return "";
+    }).catch(() => "");
+
+    if (heuristic) {
+      await page.waitForTimeout(1200);
+      console.log(`[BOOKING-WIDGET] Heuristic click: "${heuristic}"`);
+      return { found: true, vendor: "unknown", method: `heuristic:${heuristic}` };
+    }
+
+    console.log("[BOOKING-WIDGET] No booking widget found — proceeding anyway");
+    return { found: false, vendor: "", method: "none" };
+  }
+
+  /**
+   * Crawl-ва booking формата (основен frame + iframes) и
+   * връща required_fields структура за Gemini/клиент
+   */
+  private async scrapeBookingWidgetForm(page: Page): Promise<{
+    required_fields: RequiredBookingField[];
+    vendor: string;
+  }> {
+    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+
+    for (const frame of frames) {
+      try {
+        const result = await frame.evaluate(() => {
+          const vendorHints: string[] = [];
+          const html = document.body?.innerHTML || "";
+          if (html.includes("mphb"))      vendorHints.push("motopress-hotel-booking");
+          if (html.includes("beds24"))    vendorHints.push("beds24");
+          if (html.includes("sirvoy"))    vendorHints.push("sirvoy");
+          if (html.includes("lodgify"))   vendorHints.push("lodgify");
+          if (html.includes("cloudbeds")) vendorHints.push("cloudbeds");
+          if (html.includes("eviivo"))    vendorHints.push("eviivo");
+
+          const isVisible = (el: Element) => {
+            const style = window.getComputedStyle(el as any);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            const r = (el as any).getBoundingClientRect?.();
+            return !!r && r.width > 0 && r.height > 0;
+          };
+
+          const getLabel = (el: Element): string => {
+            const any = el as any;
+            if (any.id) {
+              const lab = document.querySelector(`label[for="${any.id}"]`);
+              if (lab?.textContent) return lab.textContent.trim();
+            }
+            const ariaLabel = any.getAttribute?.("aria-label");
+            if (ariaLabel) return ariaLabel.trim();
+            if (any.placeholder) return any.placeholder.trim();
+            let p: Element | null = el;
+            for (let i = 0; i < 4; i++) {
+              p = p?.parentElement || null;
+              if (!p) break;
+              const lab = p.querySelector("label");
+              if (lab?.textContent) return lab.textContent.trim();
+            }
+            return any.name || any.id || "";
+          };
+
+          const checkInRe  = /check.?in|arrival|настаняване|mphb_check_in|date.?from|start.?date/i;
+          const checkOutRe = /check.?out|departure|напускане|mphb_check_out|date.?to|end.?date/i;
+          const adultsRe   = /adult|възрастн|гост|person|pax/i;
+          const childrenRe = /child|дете|деца|kid/i;
+          const roomsRe    = /\broom\b|стая|стаи|num.?room/i;
+          const promoRe    = /promo|coupon|код.?отстъп|discount/i;
+
+          const fields: any[] = [];
+          const seen = new Set<string>();
+
+          document.querySelectorAll("input, select").forEach((el: any) => {
+            if (!isVisible(el)) return;
+            const type = (el.type || "").toLowerCase();
+            if (["hidden", "submit", "button", "image", "reset"].includes(type)) return;
+            if (el.disabled) return;
+
+            const label = getLabel(el);
+            const name  = el.name || el.id || "";
+            const combined = `${name} ${label}`.toLowerCase();
+
+            let key = "";
+            let fieldType = type || "text";
+            let example = "";
+
+            if (checkInRe.test(combined))  { key = "check_in";  fieldType = "date";   example = "2025-08-10"; }
+            else if (checkOutRe.test(combined)) { key = "check_out"; fieldType = "date";   example = "2025-08-15"; }
+            else if (adultsRe.test(combined))   { key = "adults";    fieldType = "number"; example = "2"; }
+            else if (childrenRe.test(combined)) { key = "children";  fieldType = "number"; example = "0"; }
+            else if (roomsRe.test(combined))    { key = "rooms";     fieldType = "number"; example = "1"; }
+            else if (promoRe.test(combined))    { key = "promo_code"; fieldType = "text";  example = ""; }
+
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+
+            const options = el.tagName.toLowerCase() === "select"
+              ? Array.from(el.options || []).slice(1, 20).map((o: any) => (o.text || "").trim()).filter(Boolean)
+              : [];
+
+            fields.push({
+              key,
+              label: label || name || key,
+              type:  el.tagName.toLowerCase() === "select" ? "select" : fieldType,
+              options: options.length > 0 ? options : undefined,
+              example,
+              selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : ""),
+            });
+          });
+
+          return { fields, vendor: vendorHints[0] || "" };
+        });
+
+        if (result.fields.length > 0) {
+          console.log(`[SCRAPE-WIDGET] ${result.fields.length} booking fields | vendor=${result.vendor} | frame=${frame.url().slice(0, 60)}`);
+          return { required_fields: result.fields, vendor: result.vendor };
+        }
+      } catch (e) {
+        console.log(`[SCRAPE-WIDGET] frame error: ${e}`);
+      }
+    }
+
+    // Fallback — стандартни полета
+    console.log("[SCRAPE-WIDGET] No booking fields found — returning standard fallback fields");
+    return {
+      required_fields: [
+        { key: "check_in",  label: "Дата на настаняване", type: "date",   example: "2025-08-10" },
+        { key: "check_out", label: "Дата на напускане",   type: "date",   example: "2025-08-15" },
+        { key: "adults",    label: "Брой възрастни",      type: "number", example: "2" },
+        { key: "children",  label: "Брой деца",           type: "number", example: "0" },
+      ],
+      vendor: "unknown",
+    };
+  }
+
+  /**
+   * Попълва booking widget-а с booking_data.
+   * Работи с React/Vue/flatpickr чрез native DOM events.
+   */
+  private async fillBookingWidget(
+    page: Page,
+    data: Record<string, string>,
+    crawled: { required_fields: RequiredBookingField[]; vendor: string }
+  ): Promise<{
+    ok: boolean;
+    message: string;
+    needs_more_input?: boolean;
+    missing_fields?: RequiredBookingField[];
+  }> {
+    const MANDATORY = ["check_in", "check_out"];
+    const missing = MANDATORY.filter(k => !data[k]?.trim());
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        message: `Липсват задължителни данни: ${missing.join(", ")}`,
+        needs_more_input: true,
+        missing_fields: crawled.required_fields.filter(f => missing.includes(f.key)),
+      };
+    }
+
+    const normalizeDate = (d: string): string => {
+      if (!d) return "";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(d.trim())) return d.trim();
+      const m = d.trim().match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})$/);
+      if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+      return d.trim();
+    };
+
+    const ci       = normalizeDate(data.check_in  || "");
+    const co       = normalizeDate(data.check_out || "");
+    const adults   = data.adults    || "2";
+    const children = data.children  || "0";
+    const rooms    = data.rooms     || "1";
+    const promo    = data.promo_code || "";
+
+    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+    let totalFilled = 0;
+
+    for (const frame of frames) {
+      try {
+        const filledCount = await frame.evaluate(
+          ({ ci, co, adults, children, rooms, promo }: {
+            ci: string; co: string; adults: string; children: string; rooms: string; promo: string;
+          }) => {
+            let filled = 0;
+
+            const setInput = (el: HTMLInputElement | null, val: string): boolean => {
+              if (!el) return false;
+              try {
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, "value"
+                )?.set;
+                if (nativeSetter) nativeSetter.call(el, val);
+                else el.value = val;
+                el.dispatchEvent(new Event("input",  { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Tab" }));
+                el.dispatchEvent(new KeyboardEvent("keyup",   { bubbles: true, key: "Tab" }));
+                return true;
+              } catch { return false; }
+            };
+
+            const setSelect = (el: HTMLSelectElement | null, val: string): boolean => {
+              if (!el) return false;
+              const num = parseInt(val, 10);
+              for (const opt of Array.from(el.options)) {
+                const ov = parseInt(opt.value, 10);
+                if (opt.value === val || opt.text.trim() === val ||
+                    (!isNaN(num) && !isNaN(ov) && ov === num)) {
+                  el.value = opt.value;
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  return true;
+                }
+              }
+              if (!isNaN(num) && num > 0) {
+                const idx = Math.min(num, el.options.length - 1);
+                if (idx > 0) {
+                  el.selectedIndex = idx;
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  return true;
+                }
+              }
+              return false;
+            };
+
+            const findInput = (keys: string[]): HTMLInputElement | null => {
+              for (const k of keys) {
+                const el = (document.querySelector(`input[name="${k}"]`) ||
+                            document.querySelector(`#${k}`) ||
+                            document.querySelector(`input[id*="${k}"]`) ||
+                            document.querySelector(`input[name*="${k}"]`)) as HTMLInputElement | null;
+                if (el) return el;
+              }
+              return null;
+            };
+
+            const findSelect = (keys: string[]): HTMLSelectElement | null => {
+              for (const k of keys) {
+                const el = (document.querySelector(`select[name="${k}"]`) ||
+                            document.querySelector(`#${k}`) ||
+                            document.querySelector(`select[id*="${k}"]`) ||
+                            document.querySelector(`select[name*="${k}"]`)) as HTMLSelectElement | null;
+                if (el) return el;
+              }
+              return null;
+            };
+
+            // Check-in
+            if (ci) {
+              const inp = findInput(["mphb_check_in_date","check_in","checkin","arrival",
+                                     "check-in","startdate","start_date","date_from","datefrom","from"]);
+              if (inp && setInput(inp, ci)) filled++;
+            }
+
+            // Check-out
+            if (co) {
+              const inp = findInput(["mphb_check_out_date","check_out","checkout","departure",
+                                     "check-out","enddate","end_date","date_to","dateto","to"]);
+              if (inp && setInput(inp, co)) filled++;
+            }
+
+            // Adults — try select first, then input
+            if (adults) {
+              const sel = findSelect(["mphb_adults","adults","adult","guests","pax","num_adults","numadults","persons"]);
+              if (sel && setSelect(sel, adults)) filled++;
+              else {
+                const inp = findInput(["mphb_adults","adults","adult","guests","pax","num_adults"]);
+                if (inp && setInput(inp, adults)) filled++;
+              }
+            }
+
+            // Children
+            if (children && parseInt(children, 10) >= 0) {
+              const sel = findSelect(["mphb_children","children","child","kids","num_children","numchildren"]);
+              if (sel && setSelect(sel, children)) filled++;
+              else {
+                const inp = findInput(["mphb_children","children","child","kids","num_children"]);
+                if (inp && setInput(inp, children)) filled++;
+              }
+            }
+
+            // Rooms
+            if (rooms && parseInt(rooms, 10) > 1) {
+              const sel = findSelect(["rooms","num_rooms","numrooms","room_count","mphb_rooms"]);
+              if (sel && setSelect(sel, rooms)) filled++;
+            }
+
+            // Promo
+            if (promo) {
+              const inp = findInput(["promo_code","coupon","promocode","promo","discount_code","code"]);
+              if (inp && setInput(inp, promo)) filled++;
+            }
+
+            return filled;
+          },
+          { ci, co, adults, children, rooms, promo }
+        );
+
+        totalFilled += filledCount;
+        if (filledCount > 0) {
+          console.log(`[FILL-WIDGET] Filled ${filledCount} fields in frame: ${frame.url().slice(0, 60)}`);
+          break;
+        }
+      } catch (e) {
+        console.log(`[FILL-WIDGET] frame error: ${e}`);
+      }
+    }
+
+    if (totalFilled === 0) {
+      console.log("[FILL-WIDGET] Could not fill any field");
+      return { ok: false, message: "Не успях да попълня нито едно поле в booking widget" };
+    }
+
+    // Submit — натисни Search/Check бутона
+    await page.waitForTimeout(400);
+    const submitted = await this.submitBookingSearch(page);
+    const actions = [`Попълних ${totalFilled} полета`];
+    if (submitted) actions.push("Кликнах Търси/Submit");
+    else actions.push("Не намерих submit бутон");
+
+    return { ok: true, message: actions.join("; ") };
+  }
+
+  /**
+   * Натиска "Търси"/"Search"/"Check Availability" бутона в booking widget
+   */
+  private async submitBookingSearch(page: Page): Promise<boolean> {
+    const selectors = [
+      'button:has-text("Търси")',
+      'button:has-text("Търсене")',
+      'button:has-text("Провери")',
+      'button:has-text("Провери наличност")',
+      'button:has-text("Виж стаи")',
+      'button:has-text("Search")',
+      'button:has-text("Check")',
+      'button:has-text("Find Rooms")',
+      'button:has-text("Check Availability")',
+      'button:has-text("Book")',
+      'input[type="submit"]',
+      'button[type="submit"]',
+    ];
+
+    for (const sel of selectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 3000 });
+        console.log(`[SUBMIT-SEARCH] Clicked: ${sel}`);
+        return true;
+      } catch {}
+    }
+
+    // Iframe fallback
+    for (const frame of page.frames().slice(1)) {
+      try {
+        const ok = await frame.evaluate(() => {
+          const btn = document.querySelector('button[type="submit"], input[type="submit"]') as any;
+          if (!btn) return false;
+          btn.click();
+          return true;
+        });
+        if (ok) { console.log("[SUBMIT-SEARCH] iframe submit"); return true; }
+      } catch {}
+    }
+
+    return false;
+  }
+
+  /**
+   * Scraпва резултатите от booking търсенето.
+   * Извлича: имена на стаи, цена/нощ, обща цена, валута, наличност.
+   */
+  private async scrapeBookingResults(page: Page): Promise<{
+    rooms: RoomResult[];
+    raw_snippet: string;
+  }> {
+    // Изчакай резултатите
+    try {
+      await page.waitForFunction(() => {
+        const body = document.body?.innerText || "";
+        return /\d+\s*(?:лв|bgn|eur|usd|\$|€|£)/i.test(body) ||
+               /available|наличн|свободн/i.test(body) ||
+               /no\s+rooms|няма стаи|не са намерени/i.test(body);
+      }, { timeout: 8000 });
+    } catch {}
+
+    await page.waitForTimeout(600);
+    await this.dismissCookieBanner(page);
+
+    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+
+    for (const frame of frames) {
+      try {
+        const result = await frame.evaluate(() => {
+          const vis = (el: Element) => {
+            const s = window.getComputedStyle(el as HTMLElement);
+            if (s.display === "none" || s.visibility === "hidden") return false;
+            const r = (el as HTMLElement).getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          };
+
+          const extractPricing = (text: string) => {
+            const re = /(\d[\d\s,.]*)\s*(лв\.?|bgn|eur|usd|gbp|\$|€|£)/gi;
+            const nums: number[] = [];
+            const raw: string[] = [];
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(text)) !== null) {
+              const n = parseFloat(m[1].replace(/[\s,]/g, "").replace(",", "."));
+              if (!isNaN(n) && n > 0) { nums.push(n); raw.push(m[0].trim()); }
+            }
+            nums.sort((a, b) => a - b);
+            raw.sort((a, b) => {
+              const na = parseFloat(a.replace(/[^\d.]/g, ""));
+              const nb = parseFloat(b.replace(/[^\d.]/g, ""));
+              return na - nb;
+            });
+            const currency = /лв|bgn/i.test(text) ? "BGN" :
+                             /eur|€/i.test(text)   ? "EUR" :
+                             /usd|\$/i.test(text)  ? "USD" :
+                             /gbp|£/i.test(text)   ? "GBP" : "";
+            return {
+              per_night: raw[0]              || "",
+              total:     raw[raw.length - 1] || raw[0] || "",
+              currency,
+            };
+          };
+
+          const rooms: any[] = [];
+          const seen = new Set<Element>();
+
+          const cardSelectors = [
+            ".mphb-room-type", "[class*='room-type']", "[class*='roomType']",
+            "[class*='accommodation']", "[class*='room-card']",
+            "[class*='rate-plan']", "[class*='room-result']",
+            ".booking-result", "[class*='availab']",
+            "[class*='room']", "[class*='card']",
+          ];
+
+          for (const sel of cardSelectors) {
+            document.querySelectorAll(sel).forEach((el: Element) => {
+              if (!vis(el) || seen.has(el)) return;
+              const text = (el.textContent || "").trim();
+              if (text.length < 10 || text.length > 8000) return;
+              if (!/\d/.test(text) && !/наличн|available|free|свободн/i.test(text)) return;
+
+              seen.add(el);
+
+              const nameEl  = el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name']");
+              const priceEl = el.querySelector("[class*='price'],[class*='cost'],[class*='rate'],[class*='amount'],[class*='цена']");
+              const descEl  = el.querySelector("[class*='desc'],[class*='info'],[class*='feature']");
+              const capEl   = el.querySelector("[class*='guest'],[class*='capacity'],[class*='person'],[class*='adult']");
+
+              const name    = (nameEl?.textContent  || "").trim().replace(/\s+/g, " ").slice(0, 80);
+              const priceRaw = (priceEl?.textContent || text).trim();
+              const pricing  = extractPricing(priceRaw);
+              const desc     = (descEl?.textContent  || "").trim().replace(/\s+/g, " ").slice(0, 150);
+              const cap      = (capEl?.textContent   || "").trim().replace(/\s+/g, " ").slice(0, 50);
+
+              const availability =
+                /наличн|available|свободн|free/i.test(text)       ? "available" :
+                /недостъпн|unavailab|заета|full|sold.?out/i.test(text) ? "unavailable" : "unknown";
+
+              if (name || pricing.per_night) {
+                rooms.push({
+                  name:            name || "Стая",
+                  price_per_night: pricing.per_night || undefined,
+                  total_price:     pricing.total     || undefined,
+                  currency:        pricing.currency  || undefined,
+                  availability,
+                  description:     desc || undefined,
+                  capacity:        cap  || undefined,
+                });
+              }
+            });
+            if (rooms.length >= 12) break;
+          }
+
+          const raw_snippet = rooms.length === 0
+            ? (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2500)
+            : "";
+
+          return { rooms: rooms.slice(0, 12), raw_snippet };
+        });
+
+        if (result.rooms.length > 0 || result.raw_snippet) {
+          console.log(`[SCRAPE-RESULTS] ${result.rooms.length} rooms | frame=${frame.url().slice(0, 60)}`);
+          return result;
+        }
+      } catch (e) {
+        console.log(`[SCRAPE-RESULTS] frame error: ${e}`);
+      }
+    }
+
+    return { rooms: [], raw_snippet: "" };
+  }
+
 
   // ─────────────────────────────────────────────────────────
   // /fill-form
@@ -2731,6 +3523,23 @@ async function main() {
     res.json({ success: true, count: forms.length, forms });
   });
 
+  app.post("/check-availability", async (req: Request, res: Response) => {
+    const body = req.body as CheckAvailabilityRequest;
+    if (!body?.site_id) {
+      return res.json({ success: false, message: "Missing site_id" });
+    }
+
+    console.log(
+      `[HTTP][/check-availability] site_id=${body.site_id} ` +
+      `data_keys=${Object.keys(body.booking_data || {}).join(",")} ` +
+      `crawl_only=${!!body.crawl_only}`
+    );
+
+    const r = await manager.checkAvailability(body);
+    res.json(r);
+  });
+
+
   app.post("/close-session", async (req: Request, res: Response) => {
     const { site_id } = req.body || {};
     if (site_id) await manager.closeSession(String(site_id));
@@ -2738,7 +3547,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.1.0-universal-choices listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.2.0-booking-check listening on :${PORT}`);
   });
 
   await manager.start();
