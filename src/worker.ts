@@ -874,25 +874,50 @@ class HotSessionManager {
     }
 
     // ── E) DOM keyword fallback (без AI) ────────────────────────────
-    const BOOKING_RE = /резерв|настаняван|нощувк|свободни стаи|провери наличн|виж стаи|book\s*now|check\s*avail|reserv|find\s*room/i;
+    // Внимание: "Настаняване" в nav бара е DROPDOWN за типове стаи — НЕ е booking бутон!
+    // Използваме двупасов подход: приоритетни → вторични (само <button>, не <a>)
+    const fallbackClicked = await page.evaluate(() => {
+      const PRIORITY_RE  = /^резервирай$|^book\s*now$|^reserve\s*now$|^check\s*availability$|^направи резервация$|^резервации$/i;
+      const SECONDARY_RE = /резерв[ауи]|booking|наличност|свободни стаи|виж стаи|find rooms/i;
+      const EXCLUDE_RE   = /^настаняване$|конферентн|ресторант|оферт|контакт|начало|галери|за нас|^bg$|^en$/i;
 
-    const fallbackClicked = await page.evaluate((pattern: string) => {
-      const re = new RegExp(pattern, "i");
-      const els = Array.from(document.querySelectorAll("button, a, [role='button']"));
-      for (const el of els) {
-        const text = (el.textContent || "").trim();
-        if (!text || text.length > 60) continue;
+      const isVisible = (el: Element) => {
         const s = window.getComputedStyle(el as HTMLElement);
-        if (s.display === "none" || s.visibility === "hidden") continue;
+        if (s.display === "none" || s.visibility === "hidden") return false;
         const r = (el as HTMLElement).getBoundingClientRect();
-        if (r.width < 10 || r.height < 10) continue;
-        if (re.test(text)) {
+        return r.width > 10 && r.height > 10;
+      };
+
+      const allEls = Array.from(document.querySelectorAll(
+        "button, a, [role='button'], input[type='submit'], input[type='button']"
+      ));
+
+      // Pass 1: точни booking бутони
+      for (const el of allEls) {
+        const text = (el.textContent || "").trim();
+        if (!text || text.length > 40 || !isVisible(el)) continue;
+        if (EXCLUDE_RE.test(text)) continue;
+        if (PRIORITY_RE.test(text)) {
           (el as HTMLElement).click();
-          return text;
+          return `priority:${text}`;
         }
       }
+
+      // Pass 2: само <button> и <input> — не <a> (твърде много false positives в nav)
+      for (const el of allEls) {
+        const tag = el.tagName.toLowerCase();
+        if (tag === "a") continue;
+        const text = (el.textContent || "").trim();
+        if (!text || text.length > 50 || !isVisible(el)) continue;
+        if (EXCLUDE_RE.test(text)) continue;
+        if (SECONDARY_RE.test(text)) {
+          (el as HTMLElement).click();
+          return `secondary:${text}`;
+        }
+      }
+
       return "";
-    }, BOOKING_RE.source).catch(() => "");
+    }).catch(() => "");
 
     if (fallbackClicked) {
       await page.waitForTimeout(1200);
@@ -900,7 +925,7 @@ class HotSessionManager {
       return { found: true, vendor: "dom-keyword", method: `dom:${fallbackClicked}` };
     }
 
-    console.log("[BOOKING-WIDGET] No booking element found — will attempt form fill directly");
+    console.log("[BOOKING-WIDGET] No booking button found — will attempt form fill directly on current page");
     return { found: false, vendor: "", method: "none" };
   }
 
@@ -933,22 +958,32 @@ class HotSessionManager {
       })
       .join("\n");
 
-    const prompt = `You are analyzing a hotel/accommodation website to find the booking or reservation button.
+    const prompt = `You are analyzing a Bulgarian hotel website to find the BOOKING SEARCH button — the one that opens a date picker or leads to a room availability search form.
 
 Page: "${pageContext.title}" | H1: "${pageContext.h1}" | URL: ${pageContext.url}
 
-Here are all visible clickable elements on the page:
+Visible clickable elements:
 ${elementList}
 
-Task: Which element index is most likely a booking/reservation/availability check button?
-Look for: "Резервация", "Резервирай", "Настаняване", "Book Now", "Check Availability", "Reserve", "Booking", navigation links to booking pages, etc.
+TASK: Find the element that triggers a booking/availability search form (date picker, check-in/check-out form).
 
-Rules:
-- Prefer buttons/links that open a date picker or booking form
-- Avoid: language switchers, login, social media, newsletter, search, contact
-- If NO element looks like a booking button, return index -1
+PREFER (highest priority first):
+1. Button labeled "РЕЗЕРВИРАЙ", "Book Now", "Check Availability", "Reserve" that is visually prominent (large, colored)
+2. A link/button directly labeled "Резервации" or "Booking" that goes to a booking page (not a dropdown)
+3. A search/submit button inside a booking widget (e.g. "Търси", "Search")
 
-Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
+AVOID (these are NOT what we want):
+- Navigation dropdown items like "Настаняване ▸" that open a sub-menu with room descriptions
+- Language switchers (BG/EN)
+- "Контакти", "Оферти", "Ресторант", "Конферентна зала" nav links
+- Login, social media, newsletter links
+
+IMPORTANT: "Настаняване" in a top navigation bar is a DROPDOWN MENU for room types — NOT a booking button. Skip it.
+The real booking button is usually a visually distinct button (different color, often top-right) labeled "РЕЗЕРВИРАЙ" or similar.
+
+If NO element is a booking button, return index -1.
+
+Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
 
     try {
       const apiKey = (process.env.GEMINI_API_KEY || "").trim();
@@ -958,7 +993,7 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
       }
 
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -994,8 +1029,10 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
   }
 
   /**
-   * Crawl-ва booking формата (основен frame + iframes) и
-   * връща required_fields структура за Gemini/клиент
+   * Crawl-ва booking формата (основен frame + iframes).
+   * Важно: MPHB и много booking системи използват СКРИТИ inputs
+   * (display:none) с flatpickr/custom picker отгоре.
+   * Затова сканираме ВСИЧКИ inputs — и скрити, и видими.
    */
   private async scrapeBookingWidgetForm(page: Page): Promise<{
     required_fields: RequiredBookingField[];
@@ -1015,24 +1052,19 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           if (html.includes("cloudbeds")) vendorHints.push("cloudbeds");
           if (html.includes("eviivo"))    vendorHints.push("eviivo");
 
-          const isVisible = (el: Element) => {
-            const style = window.getComputedStyle(el as any);
-            if (style.display === "none" || style.visibility === "hidden") return false;
-            const r = (el as any).getBoundingClientRect?.();
-            return !!r && r.width > 0 && r.height > 0;
-          };
-
+          // Не проверяваме visibility — MPHB скрива реалните inputs!
+          // Само пропускаме disabled и type=hidden/submit/button/image/reset
           const getLabel = (el: Element): string => {
             const any = el as any;
             if (any.id) {
-              const lab = document.querySelector(`label[for="${any.id}"]`);
+              const lab = document.querySelector(`label[for="${CSS.escape(any.id)}"]`);
               if (lab?.textContent) return lab.textContent.trim();
             }
             const ariaLabel = any.getAttribute?.("aria-label");
             if (ariaLabel) return ariaLabel.trim();
             if (any.placeholder) return any.placeholder.trim();
             let p: Element | null = el;
-            for (let i = 0; i < 4; i++) {
+            for (let i = 0; i < 5; i++) {
               p = p?.parentElement || null;
               if (!p) break;
               const lab = p.querySelector("label");
@@ -1041,8 +1073,8 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
             return any.name || any.id || "";
           };
 
-          const checkInRe  = /check.?in|arrival|настаняване|mphb_check_in|date.?from|start.?date/i;
-          const checkOutRe = /check.?out|departure|напускане|mphb_check_out|date.?to|end.?date/i;
+          const checkInRe  = /check.?in|arrival|настаняване|пристигане|mphb_check_in|date.?from|start.?date/i;
+          const checkOutRe = /check.?out|departure|напускане|заминаване|mphb_check_out|date.?to|end.?date/i;
           const adultsRe   = /adult|възрастн|гост|person|pax/i;
           const childrenRe = /child|дете|деца|kid/i;
           const roomsRe    = /\broom\b|стая|стаи|num.?room/i;
@@ -1051,10 +1083,10 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           const fields: any[] = [];
           const seen = new Set<string>();
 
+          // Сканирай ВСИЧКИ inputs и select-и — включително скрити (flatpickr pattern)
           document.querySelectorAll("input, select").forEach((el: any) => {
-            if (!isVisible(el)) return;
             const type = (el.type || "").toLowerCase();
-            if (["hidden", "submit", "button", "image", "reset"].includes(type)) return;
+            if (["submit", "button", "image", "reset", "file", "checkbox", "radio"].includes(type)) return;
             if (el.disabled) return;
 
             const label = getLabel(el);
@@ -1065,18 +1097,20 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
             let fieldType = type || "text";
             let example = "";
 
-            if (checkInRe.test(combined))  { key = "check_in";  fieldType = "date";   example = "2025-08-10"; }
-            else if (checkOutRe.test(combined)) { key = "check_out"; fieldType = "date";   example = "2025-08-15"; }
-            else if (adultsRe.test(combined))   { key = "adults";    fieldType = "number"; example = "2"; }
-            else if (childrenRe.test(combined)) { key = "children";  fieldType = "number"; example = "0"; }
-            else if (roomsRe.test(combined))    { key = "rooms";     fieldType = "number"; example = "1"; }
-            else if (promoRe.test(combined))    { key = "promo_code"; fieldType = "text";  example = ""; }
+            if (checkInRe.test(combined))       { key = "check_in";   fieldType = "date";   example = "2025-08-10"; }
+            else if (checkOutRe.test(combined)) { key = "check_out";  fieldType = "date";   example = "2025-08-15"; }
+            else if (adultsRe.test(combined))   { key = "adults";     fieldType = "number"; example = "2"; }
+            else if (childrenRe.test(combined)) { key = "children";   fieldType = "number"; example = "0"; }
+            else if (roomsRe.test(combined))    { key = "rooms";      fieldType = "number"; example = "1"; }
+            else if (promoRe.test(combined))    { key = "promo_code"; fieldType = "text";   example = ""; }
 
             if (!key || seen.has(key)) return;
             seen.add(key);
 
             const options = el.tagName.toLowerCase() === "select"
-              ? Array.from(el.options || []).slice(1, 20).map((o: any) => (o.text || "").trim()).filter(Boolean)
+              ? Array.from(el.options || []).slice(0, 20)
+                  .map((o: any) => (o.text || "").trim())
+                  .filter((t: string) => t.length > 0)
               : [];
 
             fields.push({
@@ -1085,7 +1119,11 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
               type:  el.tagName.toLowerCase() === "select" ? "select" : fieldType,
               options: options.length > 0 ? options : undefined,
               example,
-              selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : ""),
+              selector: el.id ? `#${CSS.escape(el.id)}` : (el.name ? `[name="${el.name}"]` : ""),
+              hidden: (() => {
+                const s = window.getComputedStyle(el);
+                return s.display === "none" || s.visibility === "hidden";
+              })(),
             });
           });
 
@@ -1165,18 +1203,31 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           }) => {
             let filled = 0;
 
+            /**
+             * setInput — работи и за скрити inputs (flatpickr/MPHB pattern).
+             * Използва native value setter + всички нужни events.
+             */
             const setInput = (el: HTMLInputElement | null, val: string): boolean => {
               if (!el) return false;
               try {
+                // Native setter за React/framework controlled inputs
                 const nativeSetter = Object.getOwnPropertyDescriptor(
                   window.HTMLInputElement.prototype, "value"
                 )?.set;
                 if (nativeSetter) nativeSetter.call(el, val);
                 else el.value = val;
+
+                // Изстрелвай всички events за да засечат flatpickr/Vue/React
                 el.dispatchEvent(new Event("input",  { bubbles: true }));
                 el.dispatchEvent(new Event("change", { bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Tab" }));
-                el.dispatchEvent(new KeyboardEvent("keyup",   { bubbles: true, key: "Tab" }));
+                el.dispatchEvent(new Event("blur",   { bubbles: true }));
+
+                // Ако flatpickr — forcе update чрез _flatpickr instance
+                const fp = (el as any)._flatpickr;
+                if (fp && typeof fp.setDate === "function") {
+                  fp.setDate(val, true);
+                }
+
                 return true;
               } catch { return false; }
             };
@@ -1184,6 +1235,7 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
             const setSelect = (el: HTMLSelectElement | null, val: string): boolean => {
               if (!el) return false;
               const num = parseInt(val, 10);
+              // Опитай точно match по value или text
               for (const opt of Array.from(el.options)) {
                 const ov = parseInt(opt.value, 10);
                 if (opt.value === val || opt.text.trim() === val ||
@@ -1193,6 +1245,7 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
                   return true;
                 }
               }
+              // Fallback: избери по числов индекс (1 → втора опция, защото 0 е placeholder)
               if (!isNaN(num) && num > 0) {
                 const idx = Math.min(num, el.options.length - 1);
                 if (idx > 0) {
@@ -1204,71 +1257,115 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
               return false;
             };
 
+            /**
+             * findInput — търси по множество name/id варианти.
+             * НЕ проверява visibility — скритите MPHB inputs са валидни.
+             */
             const findInput = (keys: string[]): HTMLInputElement | null => {
               for (const k of keys) {
-                const el = (document.querySelector(`input[name="${k}"]`) ||
-                            document.querySelector(`#${k}`) ||
-                            document.querySelector(`input[id*="${k}"]`) ||
-                            document.querySelector(`input[name*="${k}"]`)) as HTMLInputElement | null;
-                if (el) return el;
+                const el = (
+                  document.querySelector(`input[name="${k}"]`) ||
+                  document.querySelector(`#${k}`) ||
+                  document.querySelector(`input[name*="${k}"]`) ||
+                  document.querySelector(`input[id*="${k}"]`)
+                ) as HTMLInputElement | null;
+                if (el && !el.disabled) return el;
               }
               return null;
             };
 
             const findSelect = (keys: string[]): HTMLSelectElement | null => {
               for (const k of keys) {
-                const el = (document.querySelector(`select[name="${k}"]`) ||
-                            document.querySelector(`#${k}`) ||
-                            document.querySelector(`select[id*="${k}"]`) ||
-                            document.querySelector(`select[name*="${k}"]`)) as HTMLSelectElement | null;
-                if (el) return el;
+                const el = (
+                  document.querySelector(`select[name="${k}"]`) ||
+                  document.querySelector(`select#${k}`) ||
+                  document.querySelector(`select[name*="${k}"]`) ||
+                  document.querySelector(`select[id*="${k}"]`)
+                ) as HTMLSelectElement | null;
+                if (el && !el.disabled) return el;
               }
               return null;
             };
 
-            // Check-in
+            // ── Check-in ──────────────────────────────────────────────
             if (ci) {
-              const inp = findInput(["mphb_check_in_date","check_in","checkin","arrival",
-                                     "check-in","startdate","start_date","date_from","datefrom","from"]);
-              if (inp && setInput(inp, ci)) filled++;
+              const inp = findInput([
+                "mphb_check_in_date", "check_in", "checkin", "arrival",
+                "check-in", "startdate", "start_date", "date_from", "datefrom",
+                "from", "date-from", "date_start", "arrivaldate",
+              ]);
+              if (inp && setInput(inp, ci)) {
+                filled++;
+                console.log(`[FILL-WIDGET] check_in="${ci}" → ${inp.name || inp.id}`);
+              }
             }
 
-            // Check-out
+            // ── Check-out ─────────────────────────────────────────────
             if (co) {
-              const inp = findInput(["mphb_check_out_date","check_out","checkout","departure",
-                                     "check-out","enddate","end_date","date_to","dateto","to"]);
-              if (inp && setInput(inp, co)) filled++;
+              const inp = findInput([
+                "mphb_check_out_date", "check_out", "checkout", "departure",
+                "check-out", "enddate", "end_date", "date_to", "dateto",
+                "to", "date-to", "date_end", "departuredate",
+              ]);
+              if (inp && setInput(inp, co)) {
+                filled++;
+                console.log(`[FILL-WIDGET] check_out="${co}" → ${inp.name || inp.id}`);
+              }
             }
 
-            // Adults — try select first, then input
+            // ── Adults ────────────────────────────────────────────────
             if (adults) {
-              const sel = findSelect(["mphb_adults","adults","adult","guests","pax","num_adults","numadults","persons"]);
-              if (sel && setSelect(sel, adults)) filled++;
-              else {
-                const inp = findInput(["mphb_adults","adults","adult","guests","pax","num_adults"]);
-                if (inp && setInput(inp, adults)) filled++;
+              const sel = findSelect([
+                "mphb_adults", "adults", "adult", "guests", "pax",
+                "num_adults", "numadults", "persons", "num-adults",
+              ]);
+              if (sel && setSelect(sel, adults)) {
+                filled++;
+                console.log(`[FILL-WIDGET] adults="${adults}" → select ${sel.name || sel.id}`);
+              } else {
+                const inp = findInput([
+                  "mphb_adults", "adults", "adult", "guests", "pax", "num_adults",
+                ]);
+                if (inp && setInput(inp, adults)) {
+                  filled++;
+                  console.log(`[FILL-WIDGET] adults="${adults}" → input ${inp.name || inp.id}`);
+                }
               }
             }
 
-            // Children
-            if (children && parseInt(children, 10) >= 0) {
-              const sel = findSelect(["mphb_children","children","child","kids","num_children","numchildren"]);
-              if (sel && setSelect(sel, children)) filled++;
-              else {
-                const inp = findInput(["mphb_children","children","child","kids","num_children"]);
-                if (inp && setInput(inp, children)) filled++;
+            // ── Children ──────────────────────────────────────────────
+            if (children) {
+              const sel = findSelect([
+                "mphb_children", "children", "child", "kids",
+                "num_children", "numchildren", "num-children",
+              ]);
+              if (sel && setSelect(sel, children)) {
+                filled++;
+                console.log(`[FILL-WIDGET] children="${children}" → select ${sel.name || sel.id}`);
+              } else {
+                const inp = findInput([
+                  "mphb_children", "children", "child", "kids", "num_children",
+                ]);
+                if (inp && setInput(inp, children)) {
+                  filled++;
+                  console.log(`[FILL-WIDGET] children="${children}" → input ${inp.name || inp.id}`);
+                }
               }
             }
 
-            // Rooms
+            // ── Rooms ─────────────────────────────────────────────────
             if (rooms && parseInt(rooms, 10) > 1) {
-              const sel = findSelect(["rooms","num_rooms","numrooms","room_count","mphb_rooms"]);
+              const sel = findSelect([
+                "rooms", "num_rooms", "numrooms", "room_count", "mphb_rooms",
+              ]);
               if (sel && setSelect(sel, rooms)) filled++;
             }
 
-            // Promo
+            // ── Promo code ────────────────────────────────────────────
             if (promo) {
-              const inp = findInput(["promo_code","coupon","promocode","promo","discount_code","code"]);
+              const inp = findInput([
+                "promo_code", "coupon", "promocode", "promo", "discount_code", "code",
+              ]);
               if (inp && setInput(inp, promo)) filled++;
             }
 
@@ -1288,7 +1385,19 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     }
 
     if (totalFilled === 0) {
-      console.log("[FILL-WIDGET] Could not fill any field");
+      console.log("[FILL-WIDGET] Could not fill any field — trying direct fillAvailability approach");
+      // Последен опит: директно чрез fillAvailability (MPHB-aware)
+      const fakeSchema: any = { kind: "availability", url: page.url(), schema: {} };
+      const directResult = await this.fillAvailability(page, fakeSchema, {
+        mphb_check_in_date:  ci,
+        mphb_check_out_date: co,
+        mphb_adults:   adults,
+        mphb_children: children,
+      }, true);
+
+      if (directResult.ok) {
+        return { ok: true, message: `fillAvailability fallback: ${directResult.message}` };
+      }
       return { ok: false, message: "Не успях да попълня нито едно поле в booking widget" };
     }
 
