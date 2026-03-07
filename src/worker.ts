@@ -675,17 +675,23 @@ class HotSessionManager {
 
     // ── След клик: провери дали се е отворил нов таб или cross-origin iframe ──
     // Ако има cross-origin booking iframe (quendoo, beds24, etc.) → навигирай директно към него
-    await session.page.waitForTimeout(1200);
+    await session.page.waitForTimeout(2000); // Изчакай iframe-а да се зареди
     const bookingIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
     if (bookingIframeUrl) {
       console.log(`[CHECK-AVAIL] Cross-origin booking iframe detected: ${bookingIframeUrl}`);
       console.log(`[CHECK-AVAIL] Navigating directly to iframe URL for full DOM access`);
       try {
-        await session.page.goto(bookingIframeUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+        await session.page.goto(bookingIframeUrl, { waitUntil: "networkidle", timeout: 25000 });
         await session.page.waitForTimeout(1500);
         await this.dismissCookieBanner(session.page);
+        console.log(`[CHECK-AVAIL] Now on: ${session.page.url()}`);
       } catch (e) {
         console.log(`[CHECK-AVAIL] iframe nav error: ${e}`);
+        // Опитай с domcontentloaded ако networkidle timeout-не
+        try {
+          await session.page.goto(bookingIframeUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await session.page.waitForTimeout(2000);
+        } catch {}
       }
     }
 
@@ -1077,34 +1083,50 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
         return { index: -1, reason: "no_api_key" };
       }
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-001:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 120, temperature: 0 },
-          }),
+      // Пробвай модели по ред — от най-евтин към по-скъп
+      // При 404 "no longer available" минава на следващия
+      const MODELS = [
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-flash-8b-001",
+        "gemini-1.5-flash-latest",
+        "gemini-2.0-flash",
+      ];
+
+      for (const model of MODELS) {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { maxOutputTokens: 120, temperature: 0 },
+            }),
+          }
+        );
+
+        if (response.status === 404) {
+          console.log(`[AI-BOOKING] Model ${model} not available, trying next...`);
+          continue;
         }
-      );
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        console.log(`[AI-BOOKING] Gemini API error: ${response.status} ${errText.slice(0, 100)}`);
-        return { index: -1, reason: "api_error" };
-      }
+        if (!response.ok) {
+          const errText = await response.text().catch(() => "");
+          console.log(`[AI-BOOKING] Gemini error ${response.status} on ${model}: ${errText.slice(0, 80)}`);
+          return { index: -1, reason: "api_error" };
+        }
 
-      const data = await response.json() as any;
-      const rawText = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-      console.log(`[AI-BOOKING] Gemini response: ${rawText}`);
+        const data = await response.json() as any;
+        const rawText = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+        console.log(`[AI-BOOKING] ${model} → ${rawText}`);
 
-      // Parse JSON — strip possible markdown fences
-      const clean = rawText.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
-
-      if (typeof parsed?.index === "number") {
-        return { index: parsed.index, reason: parsed.reason || "" };
+        const clean  = rawText.replace(/```json|```/g, "").trim();
+        const parsed = JSON.parse(clean);
+        if (typeof parsed?.index === "number") {
+          return { index: parsed.index, reason: parsed.reason || "" };
+        }
+        break;
       }
     } catch (e) {
       console.log(`[AI-BOOKING] Parse/fetch error: ${e}`);
@@ -1747,10 +1769,10 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           };
           // Изгради human-readable summary на стаите за Gemini
           const roomSummary = availResult.rooms.map((r: any) =>
-            `${r.name || "Стая"}` +
+            `• ${r.name || "Стая"}` +
             (r.price_per_night ? ` — ${r.price_per_night}/нощ` : "") +
             (r.total_price && r.total_price !== r.price_per_night ? ` (общо: ${r.total_price})` : "") +
-            (r.availability === "available" ? " ✅" : r.availability === "unavailable" ? " ❌" : "")
+            (r.availability === "available" ? " ✅ свободна" : r.availability === "unavailable" ? " ❌ заета" : "")
           ).join("\n");
           obs.rooms_summary = roomSummary;
           obs.rooms_count   = availResult.rooms.length;
@@ -1761,12 +1783,21 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           obs.required_fields = availResult.required_fields || [];
         }
 
-        // message трябва да е информативно — не само "success"
-        const msg = availResult.rooms && availResult.rooms.length > 0
-          ? `Намерени ${availResult.rooms.length} вид/а стаи. Виж rooms_summary и availability в observation.`
-          : availResult.raw_snippet
-            ? `Наличността е проверена. Виж page_content в observation за резултата.`
-            : availResult.message;
+        // message съдържа РЕАЛНИТЕ данни директно — Gemini чете message преди observation
+        let msg: string;
+        if (availResult.rooms && availResult.rooms.length > 0) {
+          const roomLines = availResult.rooms.map((r: any) =>
+            `• ${r.name || "Стая"}` +
+            (r.price_per_night ? ` — ${r.price_per_night}/нощ` : "") +
+            (r.total_price && r.total_price !== r.price_per_night ? ` (общо: ${r.total_price})` : "") +
+            (r.availability === "available" ? " ✅" : r.availability === "unavailable" ? " ❌ заета" : "")
+          ).join("\n");
+          msg = `НАЛИЧНОСТ ПРОВЕРЕНА — намерени ${availResult.rooms.length} вид/а стаи:\n${roomLines}\n\nИзпрати тази информация на клиента на неговия език. НЕ казвай "запитването е изпратено".`;
+        } else if (availResult.raw_snippet && availResult.raw_snippet.length > 50) {
+          msg = `НАЛИЧНОСТ ПРОВЕРЕНА — резултат от сайта:\n${availResult.raw_snippet.slice(0, 800)}\n\nПреразкажи тази информация на клиента. НЕ казвай "запитването е изпратено".`;
+        } else {
+          msg = availResult.message || "Не намерих информация за наличност.";
+        }
 
         return {
           success:     availResult.success,
