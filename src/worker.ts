@@ -679,20 +679,41 @@ class HotSessionManager {
     const bookingIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
     if (bookingIframeUrl) {
       console.log(`[CHECK-AVAIL] Cross-origin booking iframe detected: ${bookingIframeUrl}`);
-      console.log(`[CHECK-AVAIL] Navigating directly to iframe URL for full DOM access`);
+      // Инжектирай датите директно в URL — пропуска date picker стъпката
+      const iframeWithDates = booking_data
+        ? this.injectDatesIntoBookingUrl(bookingIframeUrl, booking_data)
+        : bookingIframeUrl;
+      console.log(`[CHECK-AVAIL] Navigating to: ${iframeWithDates}`);
       try {
-        await session.page.goto(bookingIframeUrl, { waitUntil: "networkidle", timeout: 25000 });
-        await session.page.waitForTimeout(1500);
+        await session.page.goto(iframeWithDates, { waitUntil: "networkidle", timeout: 25000 });
+        await session.page.waitForTimeout(2000);
         await this.dismissCookieBanner(session.page);
         console.log(`[CHECK-AVAIL] Now on: ${session.page.url()}`);
       } catch (e) {
         console.log(`[CHECK-AVAIL] iframe nav error: ${e}`);
-        // Опитай с domcontentloaded ако networkidle timeout-не
         try {
-          await session.page.goto(bookingIframeUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-          await session.page.waitForTimeout(2000);
+          await session.page.goto(iframeWithDates, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await session.page.waitForTimeout(2500);
         } catch {}
       }
+    }
+
+    // Изчакай резултатите да се заредят (Quendoo и др. зареждат стаи динамично)
+    if (booking_data && (booking_data.check_in || booking_data.mphb_check_in_date)) {
+      console.log(`[CHECK-AVAIL] Waiting for room results to load...`);
+      try {
+        await session.page.waitForFunction(() => {
+          const text = document.body?.innerText || "";
+          // Чакаме да се появят цени или стаи — не просто initial state
+          return /\d+[\s\u00a0]*(?:лв|bgn|eur|usd|\$|€|£)/i.test(text) ||
+                 /нощ|night|per night|available|налично/i.test(text) ||
+                 /no.*room|няма.*стаи|not.*available/i.test(text);
+        }, { timeout: 10000 });
+        console.log(`[CHECK-AVAIL] Room results loaded`);
+      } catch {
+        console.log(`[CHECK-AVAIL] Timeout waiting for results — scraping current state`);
+      }
+      await session.page.waitForTimeout(1000);
     }
 
     // Crawl формата (сега сме на правилната страница)
@@ -1000,7 +1021,73 @@ class HotSessionManager {
    *
    * Връща URL-а на iframe-а ако е booking-свързан, иначе "".
    */
-  private async detectCrossOriginBookingIframe(page: Page): Promise<string> {
+  /**
+   * Инжектира дати и гости директно в URL на booking системата.
+   * Поддържа: Quendoo, Beds24, Sirvoy, Lodgify, generic query params.
+   * Това позволява да пропуснем date picker и да видим директно наличните стаи.
+   */
+  private injectDatesIntoBookingUrl(baseUrl: string, bookingData: Record<string, string>): string {
+    const ci = bookingData.check_in  || bookingData.mphb_check_in_date  || "";
+    const co = bookingData.check_out || bookingData.mphb_check_out_date || "";
+    const adults   = bookingData.adults   || bookingData.mphb_adults   || "2";
+    const children = bookingData.children || bookingData.mphb_children || "0";
+
+    if (!ci || !co) return baseUrl;
+
+    try {
+      const url = new URL(baseUrl);
+      const host = url.hostname.toLowerCase();
+
+      if (host.includes("quendoo.com")) {
+        // Quendoo: /hotel-xxx/?checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD&adults=2&children=0
+        url.searchParams.set("checkIn",   ci);
+        url.searchParams.set("checkOut",  co);
+        url.searchParams.set("adults",    adults);
+        url.searchParams.set("children",  children);
+        console.log(`[INJECT-DATES] Quendoo URL: ${url.toString()}`);
+        return url.toString();
+      }
+
+      if (host.includes("beds24.com")) {
+        // Beds24: ?checkin=YYYYMMDD&checkout=YYYYMMDD&numadult=2&numchild=0
+        const toCompact = (d: string) => d.replace(/-/g, "");
+        url.searchParams.set("checkin",  toCompact(ci));
+        url.searchParams.set("checkout", toCompact(co));
+        url.searchParams.set("numadult", adults);
+        url.searchParams.set("numchild", children);
+        return url.toString();
+      }
+
+      if (host.includes("sirvoy.com")) {
+        // Sirvoy: ?arrival=YYYY-MM-DD&departure=YYYY-MM-DD&adults=2
+        url.searchParams.set("arrival",   ci);
+        url.searchParams.set("departure", co);
+        url.searchParams.set("adults",    adults);
+        url.searchParams.set("children",  children);
+        return url.toString();
+      }
+
+      if (host.includes("lodgify.com")) {
+        url.searchParams.set("arrival",   ci);
+        url.searchParams.set("departure", co);
+        url.searchParams.set("guests",    adults);
+        return url.toString();
+      }
+
+      // Generic fallback — опитай най-честите param имена
+      url.searchParams.set("checkIn",    ci);
+      url.searchParams.set("checkOut",   co);
+      url.searchParams.set("adults",     adults);
+      url.searchParams.set("children",   children);
+      return url.toString();
+
+    } catch (e) {
+      console.log(`[INJECT-DATES] URL parse error: ${e}`);
+      return baseUrl;
+    }
+  }
+
+    private async detectCrossOriginBookingIframe(page: Page): Promise<string> {
     // Знаем vendors чийто iframe URL-ове са cross-origin booking системи
     const BOOKING_IFRAME_URL_RE = /quendoo|beds24|sirvoy|lodgify|cloudbeds|eviivo|guesty|hostfully|resly|roomcloud|hotel3s|pms365|booking\.com\/hotel|reservations\./i;
 
@@ -1588,42 +1675,47 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     rooms: RoomResult[];
     raw_snippet: string;
   }> {
-    // Изчакай резултатите
+    // Изчакай страницата да зареди цени/стаи (по-дълго за бавни booking системи)
     try {
       await page.waitForFunction(() => {
-        const body = document.body?.innerText || "";
-        return /\d+\s*(?:лв|bgn|eur|usd|\$|€|£)/i.test(body) ||
-               /available|наличн|свободн/i.test(body) ||
-               /no\s+rooms|няма стаи|не са намерени/i.test(body);
-      }, { timeout: 8000 });
+        const text = document.body?.innerText || "";
+        return /\d+[\s\u00a0]*(?:лв|bgn|eur|usd|\$|€|£)/i.test(text) ||
+               /нощ|night|per night/i.test(text) ||
+               /no.*room|няма.*стаи|not.*available|no availability/i.test(text);
+      }, { timeout: 10000 });
     } catch {}
 
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(800);
     await this.dismissCookieBanner(page);
 
-    const frames = this.getBookingFrames(page);
+    // Опит 1: директно от текущата страница (ако сме навигирали към booking URL)
+    const mainText = await page.evaluate(() =>
+      (document.body?.innerText || "").replace(/\s+/g, " ").trim()
+    ).catch(() => "");
 
+    if (mainText && mainText.length > 50) {
+      console.log(`[SCRAPE-RESULTS] raw_text_len=${mainText.length} | frame=${page.url().slice(0, 60)}`);
+      console.log(`[SCRAPE-RESULTS] preview: ${mainText.slice(0, 300)}`);
+      return { rooms: [], raw_snippet: mainText.slice(0, 4000) };
+    }
+
+    // Опит 2: iframes (ако сме на главния сайт с embedded booking)
+    const frames = this.getBookingFrames(page);
     for (const frame of frames) {
       try {
-        // ПРОСТО: взимаме целия текст от frame-а — Gemini ще го прочете и разбере
         const rawText = await frame.evaluate(() =>
           (document.body?.innerText || "").replace(/\s+/g, " ").trim()
         );
-
-        if (!rawText || rawText.length < 20) continue;
-
-        console.log(`[SCRAPE-RESULTS] raw_text_len=${rawText.length} | frame=${frame.url().slice(0, 60)}`);
-        console.log(`[SCRAPE-RESULTS] preview: ${rawText.slice(0, 200)}`);
-
-        // Върни като raw_snippet — Gemini ще го прочете директно
+        if (!rawText || rawText.length < 50) continue;
+        console.log(`[SCRAPE-RESULTS] iframe raw_text_len=${rawText.length} | frame=${frame.url().slice(0, 60)}`);
+        console.log(`[SCRAPE-RESULTS] preview: ${rawText.slice(0, 300)}`);
         return { rooms: [], raw_snippet: rawText.slice(0, 4000) };
-
       } catch (e) {
         console.log(`[SCRAPE-RESULTS] frame error: ${e}`);
       }
     }
 
-    return { rooms: [], raw_snippet: "" };
+    return { rooms: [], raw_snippet: mainText.slice(0, 4000) };
   }
 
 
