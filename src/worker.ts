@@ -19,10 +19,11 @@
  *
  * Patch v6.3.0-smart-booking:
  * - URL resolution: form_schemas.url (any row) → demo_sessions.url by session id → siteMap.url
- * - AI-powered booking button detection: screenshot → Claude vision → click by coordinates
+ * - AI-powered booking button detection via Gemini 2.0 Flash Lite (cheapest Google LLM)
  * - No hardcoded selectors — works on ANY site universally
  * - LLM scores ALL visible clickable elements, picks the most booking-relevant one
  * - Falls back gracefully: AI → DOM keyword scan → proceed without click
+ * - ENV: GEMINI_API_KEY required for AI detection
  */
 
 import express, { Request, Response } from "express";
@@ -948,24 +949,33 @@ Rules:
 Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
 
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 120,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
+      const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+      if (!apiKey) {
+        console.log("[AI-BOOKING] GEMINI_API_KEY not set — skipping AI detection");
+        return { index: -1, reason: "no_api_key" };
+      }
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 120, temperature: 0 },
+          }),
+        }
+      );
 
       if (!response.ok) {
-        console.log(`[AI-BOOKING] API error: ${response.status}`);
+        const errText = await response.text().catch(() => "");
+        console.log(`[AI-BOOKING] Gemini API error: ${response.status} ${errText.slice(0, 100)}`);
         return { index: -1, reason: "api_error" };
       }
 
       const data = await response.json() as any;
-      const rawText = (data?.content?.[0]?.text || "").trim();
-      console.log(`[AI-BOOKING] Raw response: ${rawText}`);
+      const rawText = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+      console.log(`[AI-BOOKING] Gemini response: ${rawText}`);
 
       // Parse JSON — strip possible markdown fences
       const clean = rawText.replace(/```json|```/g, "").trim();
