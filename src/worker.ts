@@ -1036,17 +1036,24 @@ class HotSessionManager {
       if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
     }
 
-    // ⚡ POST-SUBMIT BOOKING LOOP
-    // After clicking submit, wait for results and try to click "Book/Резервирай"
-    // Keep looping until: confirmation page OR payment page OR max attempts
-    let bookingResult: JsonObj = {};
+    // ⚡ After submit — wait for results to load, then scrape room/price data
+    // NEO will read the results and inform the client verbally (no button clicking)
+    let availabilityResult: JsonObj = {};
     if (autoSubmit && submitClicked) {
-      bookingResult = await this.postSubmitBookingLoop(page, actions);
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(1500);
+        await this.dismissCookieBanner(page);
+        availabilityResult = await this.scrapeAvailabilityResults(page);
+        console.log(`[AVAILABILITY] scraped ${(availabilityResult.rooms as any[])?.length || 0} rooms from ${page.url().slice(0, 80)}`);
+      } catch (e: any) {
+        console.log(`[AVAILABILITY] scrape error: ${e?.message}`);
+      }
     }
 
     const obs = await this.quickObserve(page);
     obs.submit = submitInfo;
-    if (Object.keys(bookingResult).length > 0) obs.booking = bookingResult;
+    if (Object.keys(availabilityResult).length > 0) obs.availability = availabilityResult;
 
     return {
       ok: autoSubmit ? submitClicked : true,
@@ -1105,6 +1112,25 @@ class HotSessionManager {
 
       const currentUrl = page.url();
       console.log(`[BOOKING-LOOP] step=${step} url=${currentUrl.slice(0, 80)} text=${pageText.slice(0, 120)}`);
+
+      // ⚡ Diagnostic: log all book-like elements and their parent tags
+      const bookDiag = await page.evaluate(() => {
+        const results: string[] = [];
+        const texts = ["Резервирай", "Резервация", "Book", "Избери", "Select"];
+        for (const t of texts) {
+          document.querySelectorAll(`a, button`).forEach((el: Element) => {
+            if ((el.textContent || "").trim().toUpperCase().includes(t.toUpperCase())) {
+              const tag = el.tagName.toLowerCase();
+              const parent = el.parentElement?.tagName?.toLowerCase() || "";
+              const grandParent = el.parentElement?.parentElement?.tagName?.toLowerCase() || "";
+              const cls = (el.className || "").slice(0, 40);
+              results.push(`${tag}[${cls}] in ${grandParent}>${parent} text="${(el.textContent||"").trim().slice(0,30)}"`);
+            }
+          });
+        }
+        return results.slice(0, 8);
+      }).catch(() => [] as string[]);
+      if (bookDiag.length) console.log(`[BOOKING-LOOP][DIAG] book elements: ${bookDiag.join(" | ")}`);
 
       // ── DETECT: Confirmation page ──
       const isConfirmed = /потвърд|confirm|успешн|резервац.*изврш|booking.*confirm|thank|благодар|reservation.*success|order.*complete/i.test(pageText);
@@ -1194,20 +1220,23 @@ class HotSessionManager {
         for (const el of els) {
           if (!await el.isVisible().catch(() => false)) continue;
 
-          // Skip if inside a cookie/consent banner
-          const inBanner = await el.evaluate((node: Element) => {
+          // ⚡ Skip nav/header/footer/cookie — these are site-wide links not room buttons
+          const shouldSkip = await el.evaluate((node: Element) => {
             let p: Element | null = node;
             while (p) {
+              const tag = (p.tagName || "").toLowerCase();
               const id = (p.id || "").toLowerCase();
               const cls = (p.className || "").toLowerCase();
+              if (tag === "header" || tag === "nav" || tag === "footer") return true;
+              if (/\bnav\b|navbar|navigation|site-header|main-header|topbar|menubar/.test(id + cls)) return true;
               if (/cookie|consent|gdpr|banner|popup|overlay/.test(id + cls)) return true;
               p = p.parentElement;
             }
             return false;
           }).catch(() => false);
 
-          if (inBanner) {
-            console.log(`[BOOKING-LOOP][SKIP-BANNER] ${sel}`);
+          if (shouldSkip) {
+            console.log(`[BOOKING-LOOP][SKIP-NAV] ${sel}`);
             continue;
           }
 
