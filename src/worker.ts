@@ -743,26 +743,40 @@ class HotSessionManager {
 
     const results = await this.scrapeBookingResults(session.page);
 
-    // Винаги scraпвай текста от страницата — дори да няма структурирани стаи
-    // Gemini трябва да вижда реалния резултат, не "запитването е изпратено"
-    const pageText = await session.page.evaluate(() =>
-      (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000)
-    ).catch(() => "");
+    // raw_snippet вече идва от правилния frame (Quendoo/iframe) в scrapeBookingResults
+    // НЕ взимаме pageText от session.page — може да сме навигирани към друг URL
+    const rawSnippet = results.raw_snippet || "";
+
+    // Допълнителен лог за debugging
+    console.log(`[CHECK-AVAIL] rooms=${results.rooms.length} raw_snippet_len=${rawSnippet.length} current_url=${session.page.url().slice(0, 80)}`);
+    if (results.rooms.length > 0) {
+      results.rooms.forEach((r, i) => console.log(`[ROOM-${i}] name="${r.name}" price="${r.price_per_night}" total="${r.total_price}"`));
+    } else if (rawSnippet) {
+      console.log(`[RAW-SNIPPET] ${rawSnippet.slice(0, 300)}`);
+    }
 
     const hasRooms = results.rooms.length > 0;
+
+    // Ако нямаме нито структурирани стаи нито raw_snippet от iframe → взимаме page text
+    let finalSnippet = rawSnippet;
+    if (!finalSnippet) {
+      finalSnippet = await session.page.evaluate(() =>
+        (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000)
+      ).catch(() => "");
+      console.log(`[CHECK-AVAIL] fallback pageText len=${finalSnippet.length}`);
+    }
 
     return {
       success: true,
       rooms: results.rooms,
       message: hasRooms
         ? `Намерени ${results.rooms.length} вид/а стаи`
-        : pageText
+        : finalSnippet
           ? "Проверих наличността — виж raw_snippet за резултата"
           : "Не намерих стаи — провери дали формата е попълнена правилно",
       source_url: session.page.url(),
       widget_vendor: crawled.vendor || widgetFound.vendor,
-      // Винаги включвай page text за Gemini — дори когато има стаи
-      raw_snippet: pageText,
+      raw_snippet: finalSnippet,
     };
   }
 
@@ -1591,101 +1605,19 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
 
     for (const frame of frames) {
       try {
-        const result = await frame.evaluate(() => {
-          const vis = (el: Element) => {
-            const s = window.getComputedStyle(el as HTMLElement);
-            if (s.display === "none" || s.visibility === "hidden") return false;
-            const r = (el as HTMLElement).getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-          };
+        // ПРОСТО: взимаме целия текст от frame-а — Gemini ще го прочете и разбере
+        const rawText = await frame.evaluate(() =>
+          (document.body?.innerText || "").replace(/\s+/g, " ").trim()
+        );
 
-          const extractPricing = (text: string) => {
-            const re = /(\d[\d\s,.]*)\s*(лв\.?|bgn|eur|usd|gbp|\$|€|£)/gi;
-            const nums: number[] = [];
-            const raw: string[] = [];
-            let m: RegExpExecArray | null;
-            while ((m = re.exec(text)) !== null) {
-              const n = parseFloat(m[1].replace(/[\s,]/g, "").replace(",", "."));
-              if (!isNaN(n) && n > 0) { nums.push(n); raw.push(m[0].trim()); }
-            }
-            nums.sort((a, b) => a - b);
-            raw.sort((a, b) => {
-              const na = parseFloat(a.replace(/[^\d.]/g, ""));
-              const nb = parseFloat(b.replace(/[^\d.]/g, ""));
-              return na - nb;
-            });
-            const currency = /лв|bgn/i.test(text) ? "BGN" :
-                             /eur|€/i.test(text)   ? "EUR" :
-                             /usd|\$/i.test(text)  ? "USD" :
-                             /gbp|£/i.test(text)   ? "GBP" : "";
-            return {
-              per_night: raw[0]              || "",
-              total:     raw[raw.length - 1] || raw[0] || "",
-              currency,
-            };
-          };
+        if (!rawText || rawText.length < 20) continue;
 
-          const rooms: any[] = [];
-          const seen = new Set<Element>();
+        console.log(`[SCRAPE-RESULTS] raw_text_len=${rawText.length} | frame=${frame.url().slice(0, 60)}`);
+        console.log(`[SCRAPE-RESULTS] preview: ${rawText.slice(0, 200)}`);
 
-          const cardSelectors = [
-            ".mphb-room-type", "[class*='room-type']", "[class*='roomType']",
-            "[class*='accommodation']", "[class*='room-card']",
-            "[class*='rate-plan']", "[class*='room-result']",
-            ".booking-result", "[class*='availab']",
-            "[class*='room']", "[class*='card']",
-          ];
+        // Върни като raw_snippet — Gemini ще го прочете директно
+        return { rooms: [], raw_snippet: rawText.slice(0, 4000) };
 
-          for (const sel of cardSelectors) {
-            document.querySelectorAll(sel).forEach((el: Element) => {
-              if (!vis(el) || seen.has(el)) return;
-              const text = (el.textContent || "").trim();
-              if (text.length < 10 || text.length > 8000) return;
-              if (!/\d/.test(text) && !/наличн|available|free|свободн/i.test(text)) return;
-
-              seen.add(el);
-
-              const nameEl  = el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name']");
-              const priceEl = el.querySelector("[class*='price'],[class*='cost'],[class*='rate'],[class*='amount'],[class*='цена']");
-              const descEl  = el.querySelector("[class*='desc'],[class*='info'],[class*='feature']");
-              const capEl   = el.querySelector("[class*='guest'],[class*='capacity'],[class*='person'],[class*='adult']");
-
-              const name    = (nameEl?.textContent  || "").trim().replace(/\s+/g, " ").slice(0, 80);
-              const priceRaw = (priceEl?.textContent || text).trim();
-              const pricing  = extractPricing(priceRaw);
-              const desc     = (descEl?.textContent  || "").trim().replace(/\s+/g, " ").slice(0, 150);
-              const cap      = (capEl?.textContent   || "").trim().replace(/\s+/g, " ").slice(0, 50);
-
-              const availability =
-                /наличн|available|свободн|free/i.test(text)       ? "available" :
-                /недостъпн|unavailab|заета|full|sold.?out/i.test(text) ? "unavailable" : "unknown";
-
-              if (name || pricing.per_night) {
-                rooms.push({
-                  name:            name || "Стая",
-                  price_per_night: pricing.per_night || undefined,
-                  total_price:     pricing.total     || undefined,
-                  currency:        pricing.currency  || undefined,
-                  availability,
-                  description:     desc || undefined,
-                  capacity:        cap  || undefined,
-                });
-              }
-            });
-            if (rooms.length >= 12) break;
-          }
-
-          const raw_snippet = rooms.length === 0
-            ? (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2500)
-            : "";
-
-          return { rooms: rooms.slice(0, 12), raw_snippet };
-        });
-
-        if (result.rooms.length > 0 || result.raw_snippet) {
-          console.log(`[SCRAPE-RESULTS] ${result.rooms.length} rooms | frame=${frame.url().slice(0, 60)}`);
-          return result;
-        }
       } catch (e) {
         console.log(`[SCRAPE-RESULTS] frame error: ${e}`);
       }
@@ -2424,19 +2356,36 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
       await this.dismissCookieBanner(page);
     }
 
-    const scraped = await this.scrapeAvailabilityResults(page);
-    const rc = (scraped.rooms as any[])?.length || 0;
-    console.log(`[AVAILABILITY] ${rc} rooms from ${page.url().slice(0, 80)}`);
-    if (rc === 0) {
-      scraped.snippet = await page.evaluate(() =>
-        (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2000)
-      ).catch(() => "");
-    }
-    Object.assign(scraped, { check_in: ci, check_out: co, adults: ad, children: ch });
+    const scraped = await this.scrapeBookingResults(page);
+    const rc = scraped.rooms.length;
+    console.log(`[AVAILABILITY] ${rc} rooms | snippet_len=${scraped.raw_snippet.length} | url=${page.url().slice(0, 80)}`);
+
+    const roomsSummary = rc > 0 ? scraped.rooms.map(r =>
+      `• ${r.name || "Стая"}` +
+      (r.price_per_night ? ` — ${r.price_per_night}/нощ` : "") +
+      (r.total_price && r.total_price !== r.price_per_night ? ` (общо: ${r.total_price})` : "") +
+      (r.availability === "available" ? " ✅" : r.availability === "unavailable" ? " ❌" : "")
+    ).join("\n") : "";
+
+    const snippetForObs = scraped.raw_snippet || "";
+
     return {
       ok: true,
-      message: actions.join(" → ") || "Availability търсено",
-      observation: { availability: scraped },
+      message: rc > 0
+        ? `НАЛИЧНОСТ ПРОВЕРЕНА — намерени ${rc} вид/а стаи:\n${roomsSummary}\n\nИзпрати тази информация на клиента. НЕ казвай "запитването е изпратено".`
+        : snippetForObs
+          ? `НАЛИЧНОСТ ПРОВЕРЕНА — резултат от сайта:\n${snippetForObs.slice(0, 800)}\n\nПреразкажи тази информация на клиента. НЕ казвай "запитването е изпратено".`
+          : "Availability търсено — " + actions.join(" → "),
+      observation: {
+        availability: {
+          url: page.url(),
+          rooms: scraped.rooms,
+          rooms_summary: roomsSummary,
+          raw_snippet: snippetForObs,
+          submitted: true,
+          check_in: ci, check_out: co, adults: ad, children: ch,
+        }
+      },
     };
   }
 
