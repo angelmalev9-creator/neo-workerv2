@@ -3020,11 +3020,13 @@ async function main() {
       if (session) {
         const injected: FormSchemaRow[] = capabilities.map((cap: any) => ({
           id: cap.fingerprint || `cap_${Math.random().toString(36).slice(2)}`,
+          session_id: session_id || String(site_id),
           fingerprint: cap.fingerprint || "",
           url: cap.url || site_map.url || "",
+          domain: (() => { try { return new URL(cap.url || site_map.url || "").hostname; } catch { return ""; } })(),
           kind: cap.kind || "form",
           schema: cap.schema || {},
-          updated_at: new Date().toISOString(),
+          dom_snapshot: null,
         }));
         // Merge: injected capabilities take priority, then DB schemas
         const existing = session.formSchemas.filter(
