@@ -672,6 +672,7 @@ class HotSessionManager {
     // ── Стъпка 1: Провери за booking iframe ОЩЕ ПРЕДИ клик ──
     // Quendoo и др. са вградени в страницата — можем директно да навигираме с дати
     const preClickIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
+    let widgetFound: { found: boolean; vendor: string; method: string } = { found: false, vendor: "", method: "" };
 
     if (preClickIframeUrl && booking_data && Object.keys(booking_data).length > 0) {
       // ✅ Директна навигация с дати — пропускаме date picker изцяло
@@ -691,7 +692,7 @@ class HotSessionManager {
       }
     } else {
       // Кликни booking бутон (сайтове без вграден iframe)
-      const widgetFound = await this.findAndClickBookingWidget(session.page);
+      widgetFound = await this.findAndClickBookingWidget(session.page);
       console.log(`[CHECK-AVAIL] widget_found=${widgetFound.found} vendor=${widgetFound.vendor} method=${widgetFound.method}`);
 
       // След клик — провери дали се появи iframe
