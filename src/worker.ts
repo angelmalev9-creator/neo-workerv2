@@ -1058,7 +1058,28 @@ class HotSessionManager {
       const host = url.hostname.toLowerCase();
 
       if (host.includes("quendoo.com")) {
-        // Quendoo: /hotel-xxx/?checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD&adults=2&children=0
+        // fe-widgets URL → конвертирай към реалния booking URL
+        // /fe-widgets/booking-calendar/?key=SqYnmeSOhL&referrer=https://jasminhotel.com/
+        // → https://booking.quendoo.com/hotel-zhasmin-SqYnmeSOhL/?checkIn=...
+        if (url.pathname.includes("fe-widgets") || url.pathname.includes("booking-calendar")) {
+          const key = url.searchParams.get("key") || "";
+          const lng = url.searchParams.get("lng") || "bg-BG";
+          const currency = url.searchParams.get("currency") || "BGN";
+
+          // Quendoo стандартен search URL с key
+          // booking.quendoo.com/search/?key=XXX&checkIn=...&checkOut=...&adults=...
+          const searchUrl = new URL("https://booking.quendoo.com/search/");
+          searchUrl.searchParams.set("key",      key);
+          searchUrl.searchParams.set("checkIn",  ci);
+          searchUrl.searchParams.set("checkOut", co);
+          searchUrl.searchParams.set("adults",   adults);
+          searchUrl.searchParams.set("children", children);
+          searchUrl.searchParams.set("lng",      lng);
+          searchUrl.searchParams.set("currency", currency);
+          console.log(`[INJECT-DATES] Quendoo search URL: ${searchUrl.toString()}`);
+          return searchUrl.toString();
+        }
+        // Вече е booking URL — само добави датите
         url.searchParams.set("checkIn",   ci);
         url.searchParams.set("checkOut",  co);
         url.searchParams.set("adults",    adults);
@@ -1127,18 +1148,30 @@ class HotSessionManager {
     }
 
     // Провери и Playwright frame обектите (може да са lazy-loaded)
+    // Предпочитаме frame URL пред DOM iframe src — може да е различен (widget vs booking)
     for (const frame of page.frames()) {
       const frameUrl = frame.url();
       if (!frameUrl || frameUrl === "about:blank" || frameUrl === page.url()) continue;
-      // Пропускай reCAPTCHA, Google Analytics, Facebook и др.
       if (/recaptcha|google\.com\/recaptcha|gstatic|facebook|analytics|gtm\.js|doubleclick/i.test(frameUrl)) continue;
       if (BOOKING_IFRAME_URL_RE.test(frameUrl)) {
-        console.log(`[IFRAME-DETECT] Found booking iframe via Playwright frames: ${frameUrl.slice(0, 80)}`);
-        return frameUrl;
+        // За Quendoo — предпочитай /hotel-xxx/ URL пред /fe-widgets/ URL
+        if (frameUrl.includes("quendoo.com") && !frameUrl.includes("fe-widgets")) {
+          console.log(`[IFRAME-DETECT] Found Quendoo booking frame: ${frameUrl.slice(0, 80)}`);
+          return frameUrl;
+        }
+        if (!frameUrl.includes("fe-widgets") && !frameUrl.includes("widget")) {
+          console.log(`[IFRAME-DETECT] Found booking iframe via Playwright frames: ${frameUrl.slice(0, 80)}`);
+          return frameUrl;
+        }
+        // Widget URL — запази като fallback
+        if (!iframeSrc) {
+          console.log(`[IFRAME-DETECT] Found widget iframe (fallback): ${frameUrl.slice(0, 80)}`);
+          return frameUrl;
+        }
       }
     }
 
-    return "";
+    return iframeSrc; // вече е намерен по-горе от DOM
   }
 
   /**
@@ -1694,38 +1727,47 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     rooms: RoomResult[];
     raw_snippet: string;
   }> {
-    // Изчакай страницата да зареди цени/стаи (по-дълго за бавни booking системи)
-    try {
-      await page.waitForFunction(() => {
-        const text = document.body?.innerText || "";
-        return /\d+[\s\u00a0]*(?:лв|bgn|eur|usd|\$|€|£)/i.test(text) ||
-               /нощ|night|per night/i.test(text) ||
-               /no.*room|няма.*стаи|not.*available|no availability/i.test(text);
-      }, { timeout: 10000 });
-    } catch {}
+    // Изчакай страницата да зареди цени/стаи — Quendoo е SPA, зарежда динамично
+    const waitForContent = async (p: import("playwright").Page | import("playwright").Frame, label: string) => {
+      try {
+        await (p as any).waitForFunction(() => {
+          const text = document.body?.innerText || "";
+          // Цена или "няма стаи" — знак че SPA-то е заредило резултатите
+          return (/\d+[\s ]*(?:лв|bgn|eur|usd|\$|€|£)/i.test(text) ||
+                  /нощ|night|per night/i.test(text) ||
+                  /no.*room|няма.*стаи|not.*available/i.test(text)) &&
+                 text.length > 100; // не initial loader state
+        }, { timeout: 15000 });
+        console.log(`[SCRAPE-RESULTS] ${label} content loaded`);
+      } catch {
+        console.log(`[SCRAPE-RESULTS] ${label} timeout — scraping current state`);
+      }
+    };
 
-    await page.waitForTimeout(800);
+    await waitForContent(page, "main");
+    await page.waitForTimeout(1000);
     await this.dismissCookieBanner(page);
 
-    // Опит 1: директно от текущата страница (ако сме навигирали към booking URL)
+    // Опит 1: директно от текущата страница
     const mainText = await page.evaluate(() =>
       (document.body?.innerText || "").replace(/\s+/g, " ").trim()
     ).catch(() => "");
 
-    if (mainText && mainText.length > 50) {
-      console.log(`[SCRAPE-RESULTS] raw_text_len=${mainText.length} | frame=${page.url().slice(0, 60)}`);
+    if (mainText && mainText.length > 100) {
+      console.log(`[SCRAPE-RESULTS] raw_text_len=${mainText.length} | url=${page.url().slice(0, 60)}`);
       console.log(`[SCRAPE-RESULTS] preview: ${mainText.slice(0, 300)}`);
       return { rooms: [], raw_snippet: mainText.slice(0, 4000) };
     }
 
-    // Опит 2: iframes (ако сме на главния сайт с embedded booking)
+    // Опит 2: iframes — изчакай всеки frame да зареди
     const frames = this.getBookingFrames(page);
     for (const frame of frames) {
       try {
+        await waitForContent(frame, `frame:${frame.url().slice(0, 40)}`);
         const rawText = await frame.evaluate(() =>
           (document.body?.innerText || "").replace(/\s+/g, " ").trim()
         );
-        if (!rawText || rawText.length < 50) continue;
+        if (!rawText || rawText.length < 100) continue;
         console.log(`[SCRAPE-RESULTS] iframe raw_text_len=${rawText.length} | frame=${frame.url().slice(0, 60)}`);
         console.log(`[SCRAPE-RESULTS] preview: ${rawText.slice(0, 300)}`);
         return { rooms: [], raw_snippet: rawText.slice(0, 4000) };
