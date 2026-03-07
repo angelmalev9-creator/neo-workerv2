@@ -524,7 +524,9 @@ class HotSessionManager {
     await this.ensureOnSchemaUrl(session.page, schema.url);
 
     let result: { ok: boolean; message: string; observation?: JsonObj };
-    if (schema.kind === "wizard") {
+    if (schema.kind === "availability") {
+      result = await this.fillAvailability(session.page, schema, merged, autoSubmit);
+    } else if (schema.kind === "wizard") {
       result = await this.fillWizard(session.page, schema, merged, autoSubmit, strictSelect);
     } else {
       result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
@@ -670,8 +672,30 @@ class HotSessionManager {
       if (invalid.length > 0) actions.push(`VALIDATION BLOCKED: ${invalid.join(", ")}`);
     }
 
+    // ⚡ After submit — wait for results then scrape availability
+    let availResult: JsonObj = {};
+    if (autoSubmit && submitClicked) {
+      try {
+        await page.waitForURL("**/search-results/**", { timeout: 6000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+        await this.dismissCookieBanner(page);
+        const scraped = await this.scrapeAvailabilityResults(page);
+        const roomCount = (scraped.rooms as any[])?.length || 0;
+        console.log(`[AVAILABILITY] scraped ${roomCount} rooms from ${page.url().slice(0, 80)}`);
+        if (roomCount === 0) {
+          scraped.snippet = await page.evaluate(() =>
+            (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2000)
+          ).catch(() => "");
+        }
+        availResult = scraped;
+      } catch (e: any) {
+        console.log(`[AVAILABILITY] scrape error: ${e?.message}`);
+      }
+    }
+
     const obs = await this.quickObserve(page);
     obs.submit = submitInfo;
+    if (Object.keys(availResult).length > 0) obs.availability = availResult;
 
     return {
       ok: autoSubmit ? submitClicked : true,
@@ -679,6 +703,228 @@ class HotSessionManager {
       observation: obs,
     };
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // AVAILABILITY — fill search form, scrape results
+  // ═══════════════════════════════════════════════════════════
+
+  private async fillAvailability(
+    page: Page,
+    schema: FormSchemaRow,
+    data: Record<string, unknown>,
+    autoSubmit = true
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    const actions: string[] = [];
+
+    const checkInRaw = String(
+      data.mphb_check_in_date || data.check_in || data.checkin ||
+      data["Настаняване"] || data.from || data.arrival || data.start || ""
+    ).trim();
+    const checkOutRaw = String(
+      data.mphb_check_out_date || data.check_out || data.checkout ||
+      data["Напускане"] || data.to || data.departure || data.end || ""
+    ).trim();
+    const adults = String(data.mphb_adults || data.adults || data["Възрастни"] || "").trim();
+    const children = String(data.mphb_children || data.children || data["Деца"] || "").trim();
+
+    console.log(`[AVAILABILITY] check_in="${checkInRaw}" check_out="${checkOutRaw}" adults=${adults} children=${children}`);
+
+    // Fill dates — try input[name] directly (flatpickr-aware)
+    const fillDateInput = async (name: string, value: string): Promise<boolean> => {
+      for (const sel of [`input[name="${name}"]`, `#${name}`]) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !await el.isVisible().catch(() => false)) continue;
+          // Native setter for flatpickr
+          await page.evaluate(({ sel, val }: { sel: string; val: string }) => {
+            const input = document.querySelector(sel) as HTMLInputElement | null;
+            if (!input) return;
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+            if (nativeSetter) nativeSetter.call(input, val);
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }, { sel, val: value });
+          // Keyboard fallback
+          await el.click().catch(() => {});
+          await page.keyboard.press("Control+a");
+          await page.keyboard.type(value);
+          await page.keyboard.press("Tab");
+          console.log(`[AVAILABILITY] filled ${name}=${value}`);
+          return true;
+        } catch {}
+      }
+      return false;
+    };
+
+    if (checkInRaw) {
+      const ok = await fillDateInput("mphb_check_in_date", checkInRaw);
+      if (ok) actions.push(`Настаняване: ${checkInRaw}`);
+    }
+    if (checkOutRaw) {
+      const ok = await fillDateInput("mphb_check_out_date", checkOutRaw);
+      if (ok) actions.push(`Напускане: ${checkOutRaw}`);
+    }
+
+    // Adults select
+    if (adults) {
+      for (const sel of ['select[name="mphb_adults"]', 'select[name*="adult"]', 'select[name*="guest"]']) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !await el.isVisible().catch(() => false)) continue;
+          await (el as any).selectOption({ value: adults }).catch(async () => {
+            await (el as any).selectOption({ label: adults }).catch(() => {});
+          });
+          actions.push(`Възрастни: ${adults}`);
+          console.log(`[AVAILABILITY] adults=${adults} via ${sel}`);
+          break;
+        } catch {}
+      }
+    }
+
+    // Children select
+    if (children) {
+      for (const sel of ['select[name="mphb_children"]', 'select[name*="child"]', 'select[name*="kids"]']) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !await el.isVisible().catch(() => false)) continue;
+          await (el as any).selectOption({ value: children }).catch(async () => {
+            await (el as any).selectOption({ label: children }).catch(() => {});
+          });
+          actions.push(`Деца: ${children}`);
+          console.log(`[AVAILABILITY] children=${children} via ${sel}`);
+          break;
+        } catch {}
+      }
+    }
+
+    if (autoSubmit) {
+      // Click search button
+      for (const sel of ['button:has-text("Търсене")','button:has-text("Search")','button[type="submit"]','input[type="submit"]']) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !await el.isVisible().catch(() => false)) continue;
+          await el.click({ timeout: 2000 });
+          actions.push("Търсене");
+          console.log(`[AVAILABILITY] search clicked: ${sel}`);
+          break;
+        } catch {}
+      }
+
+      // Wait for search-results navigation
+      try {
+        await page.waitForURL("**/search-results/**", { timeout: 8000 });
+        console.log(`[AVAILABILITY] navigated → ${page.url().slice(0, 80)}`);
+      } catch {
+        // Fallback: wait for result elements
+        await page.waitForFunction(() => {
+          return !!(
+            document.querySelector('.mphb-rooms-available') ||
+            document.querySelector('[class*="search-result"]') ||
+            document.querySelector('[class*="room-type"]')
+          );
+        }, { timeout: 6000 }).catch(() => {});
+      }
+
+      await page.waitForTimeout(1200);
+      await this.dismissCookieBanner(page);
+    }
+
+    // Scrape results
+    const scraped = await this.scrapeAvailabilityResults(page);
+    const roomCount = (scraped.rooms as any[])?.length || 0;
+    console.log(`[AVAILABILITY] returning ${roomCount} rooms from ${page.url().slice(0, 80)}`);
+
+    if (roomCount === 0) {
+      scraped.snippet = await page.evaluate(() =>
+        (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2000)
+      ).catch(() => "");
+    }
+
+    scraped.check_in = checkInRaw;
+    scraped.check_out = checkOutRaw;
+    scraped.adults = adults;
+    scraped.children = children;
+
+    return {
+      ok: true,
+      message: actions.join(" → ") || "Availability: търсене изпълнено",
+      observation: { availability: scraped },
+    };
+  }
+
+  private async scrapeAvailabilityResults(page: Page): Promise<JsonObj> {
+    try {
+      return await page.evaluate(() => {
+        const isV = (el: Element) => {
+          const s = window.getComputedStyle(el as HTMLElement);
+          if (s.display === "none" || s.visibility === "hidden") return false;
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+        const rooms: any[] = [];
+        const seen = new Set<Element>();
+
+        const selectors = [
+          '[class*="room-type"]', '[class*="roomType"]', '[class*="RoomType"]',
+          '[class*="rate-plan"]', '[class*="ratePlan"]',
+          '[class*="wbe-room"]', '[class*="accommodation-type"]',
+          '[data-room-type]', '[data-rate-plan]',
+          '.mphb-room-type', '[class*="mphb_room"]',
+          '[class*="room"]', '[class*="accommodation"]',
+          '[class*="result"]', '[class*="card"]',
+          '[class*="unit"]', '[class*="offer"]', '[class*="rate"]',
+        ];
+
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach((el: Element) => {
+            if (seen.has(el) || !isV(el)) return;
+            const t = el.textContent || "";
+            if (t.length < 5 || t.length > 3000) return;
+            seen.add(el);
+            const nameEl  = el.querySelector("h1,h2,h3,h4,[class*='title'],[class*='name'],[class*='heading']");
+            const priceEl = el.querySelector("[class*='price'],[class*='цена'],[class*='cost'],[class*='rate'],[class*='amount'],[class*='total']");
+            const descEl  = el.querySelector("[class*='desc'],[class*='info'],[class*='detail']");
+            const name  = (nameEl?.textContent  || "").trim();
+            const price = (priceEl?.textContent || "").trim();
+            const desc  = (descEl?.textContent  || "").trim().slice(0, 120);
+            if (name || price) rooms.push({ name, price, ...(desc ? { desc } : {}) });
+          });
+          if (rooms.length >= 15) break;
+        }
+
+        return {
+          url: window.location.href,
+          title: document.title,
+          rooms: rooms.slice(0, 15),
+          submitted: true,
+        };
+      });
+    } catch {
+      return { url: "", rooms: [], submitted: false };
+    }
+  }
+
+  private async dismissCookieBanner(page: Page): Promise<void> {
+    for (const sel of [
+      'button:has-text("Приемам")', 'button:has-text("Accept")',
+      'button:has-text("OK")', 'button:has-text("Разбрах")',
+      '.cc-accept', '#onetrust-accept-btn-handler',
+      '[class*="cookie-accept"]', '[id*="cookie-accept"]',
+      '[class*="cookie"] button', '[id*="consent"] button',
+    ]) {
+      try {
+        const el = await page.$(sel);
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await el.click({ timeout: 1000 });
+        console.log(`[COOKIE] Dismissed banner via: ${sel}`);
+        return;
+      } catch {}
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // END availability methods
+  // ═══════════════════════════════════════════════════════════
 
   private async fillWizard(
     page: Page,
