@@ -1015,6 +1015,7 @@ class HotSessionManager {
     return "";
   }
 
+  /**
    * LLM анализира текстовете и избира кой е booking/reservation бутонът.
    * Не разчита на screenshot — само на текст + атрибути (бързо и надеждно).
    */
