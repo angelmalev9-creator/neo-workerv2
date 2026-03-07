@@ -1086,11 +1086,11 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
       // Пробвай модели по ред — от най-евтин към по-скъп
       // При 404 "no longer available" минава на следващия
       const MODELS = [
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash-8b",
-        "gemini-1.5-flash-8b-001",
-        "gemini-1.5-flash-latest",
+        "gemini-2.5-flash-preview-04-17",
         "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
       ];
 
       for (const model of MODELS) {
@@ -1695,9 +1695,334 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
   }
 
 
-  // ─────────────────────────────────────────────────────────
-  // /fill-form
-  // ─────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════
+  // /make-booking — Попълва резервационната форма
+  // ═══════════════════════════════════════════════════════════
+
+  /**
+   * Scraпва страницата с резултати за booking форма/бутон "Резервирай".
+   * Ако намери форма → попълва я с данните на клиента.
+   * Ако няма форма → връща contact_email за изпращане на имейл.
+   */
+  async makeBooking(req: {
+    site_id: string;
+    session_id?: string;
+    room_name?: string;
+    booking_data: Record<string, string>;
+    client_data: Record<string, string>; // name, email, phone, message
+  }): Promise<{
+    success: boolean;
+    method: "form_filled" | "email_required" | "button_clicked" | "no_action";
+    message: string;
+    contact_email?: string;
+    form_fields?: Array<{ key: string; label: string; type: string; required: boolean }>;
+    needs_client_data?: boolean;
+    missing_client_fields?: string[];
+  }> {
+    const { site_id, session_id, room_name, booking_data, client_data } = req;
+
+    const session = this.sessions.get(site_id);
+    if (!session) {
+      return { success: false, method: "no_action", message: "Няма активна сесия. Извикай /prepare-session първо." };
+    }
+    session.lastActivity = Date.now();
+
+    // Провери дали имаме нужните данни на клиента
+    const missingClientFields: string[] = [];
+    if (!client_data.name?.trim()) missingClientFields.push("Три имена");
+    if (!client_data.email?.trim()) missingClientFields.push("Имейл");
+    if (!client_data.phone?.trim()) missingClientFields.push("Телефон");
+
+    if (missingClientFields.length > 0) {
+      return {
+        success: false,
+        method: "no_action",
+        needs_client_data: true,
+        missing_client_fields: missingClientFields,
+        message: `Нужни са данни от клиента: ${missingClientFields.join(", ")}`,
+      };
+    }
+
+    // Опитай да намериш "Резервирай" бутон до избраната стая
+    const bookingBtnClicked = await this.clickRoomBookingButton(session.page, room_name);
+    console.log(`[MAKE-BOOKING] booking_btn_clicked=${bookingBtnClicked} room=${room_name || "any"}`);
+
+    if (bookingBtnClicked) {
+      await session.page.waitForTimeout(2000);
+      await this.dismissCookieBanner(session.page);
+    }
+
+    // Провери дали се е отворила резервационна форма с лични данни
+    const reservationForm = await this.scrapeReservationForm(session.page);
+    console.log(`[MAKE-BOOKING] reservation_form_fields=${reservationForm.fields.length} has_submit=${!!reservationForm.submit_selector}`);
+
+    if (reservationForm.fields.length > 0) {
+      // Попълни формата
+      const fillData: Record<string, string> = {
+        ...client_data,
+        ...booking_data,
+      };
+
+      const filledCount = await this.fillReservationForm(session.page, reservationForm, fillData);
+      console.log(`[MAKE-BOOKING] filled ${filledCount} fields`);
+
+      if (filledCount > 0 && reservationForm.submit_selector) {
+        // Submit
+        await session.page.waitForTimeout(500);
+        try {
+          const submitEl = await session.page.$(reservationForm.submit_selector);
+          if (submitEl && await submitEl.isVisible().catch(() => false)) {
+            await submitEl.click({ timeout: 3000 });
+            await session.page.waitForTimeout(2000);
+            console.log(`[MAKE-BOOKING] form submitted via ${reservationForm.submit_selector}`);
+          }
+        } catch (e) {
+          console.log(`[MAKE-BOOKING] submit error: ${e}`);
+        }
+
+        // Провери за success
+        const isSuccess = await this.detectWizardSuccess(session.page);
+        return {
+          success: isSuccess,
+          method: "form_filled",
+          message: isSuccess
+            ? `Резервацията е изпратена успешно за ${room_name || "стаята"}!`
+            : `Попълних формата за ${room_name || "стаята"} — моля проверете страницата`,
+        };
+      }
+
+      return {
+        success: false,
+        method: "form_filled",
+        message: "Намерих форма но не успях да я изпрати",
+        form_fields: reservationForm.fields,
+      };
+    }
+
+    // Няма форма → намери contact email от страницата
+    const contactEmail = await this.extractContactEmail(session.page);
+    console.log(`[MAKE-BOOKING] no_form → contact_email=${contactEmail || "not_found"}`);
+
+    return {
+      success: false,
+      method: "email_required",
+      contact_email: contactEmail || undefined,
+      message: contactEmail
+        ? `Резервацията изисква имейл към ${contactEmail}`
+        : "Не намерих форма за резервация. Свържете се директно с хотела.",
+    };
+  }
+
+  /**
+   * Кликва "Резервирай" бутона за конкретна стая в резултатите
+   */
+  private async clickRoomBookingButton(page: Page, roomName?: string): Promise<boolean> {
+    // Опит 1: намери бутон до стаята по име
+    if (roomName) {
+      try {
+        const clicked = await page.evaluate((rName: string) => {
+          const rooms = Array.from(document.querySelectorAll("[class*='room'], [class*='card'], [class*='result']"));
+          for (const room of rooms) {
+            const text = (room.textContent || "").toLowerCase();
+            if (text.includes(rName.toLowerCase())) {
+              // Намери booking бутон вътре в тази стая
+              const btn = room.querySelector("a[href*='book'], a[href*='reserv'], button") as HTMLElement | null;
+              if (btn) { btn.click(); return true; }
+            }
+          }
+          return false;
+        }, roomName);
+        if (clicked) return true;
+      } catch {}
+    }
+
+    // Опит 2: намери първия "Резервирай" / "Book" бутон
+    for (const sel of [
+      'a[href*="book"]', 'a[href*="reserv"]', 'a[href*="checkout"]',
+      'button:has-text("Резервирай")', 'a:has-text("Резервирай")',
+      'button:has-text("Book")', 'a:has-text("Book Now")',
+      '[class*="book-btn"]', '[class*="reserve-btn"]',
+    ]) {
+      try {
+        const el = await page.$(sel);
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ timeout: 3000 });
+        return true;
+      } catch {}
+    }
+
+    return false;
+  }
+
+  /**
+   * Scraпва резервационна форма с лични данни (не availability форма)
+   */
+  private async scrapeReservationForm(page: Page): Promise<{
+    fields: Array<{ key: string; label: string; selector: string; type: string; required: boolean }>;
+    submit_selector: string;
+  }> {
+    try {
+      const result = await page.evaluate(() => {
+        const getLabel = (el: Element): string => {
+          const any = el as any;
+          if (any.id) {
+            const lab = document.querySelector(`label[for="${CSS.escape(any.id)}"]`);
+            if (lab?.textContent) return lab.textContent.trim();
+          }
+          const aria = any.getAttribute?.("aria-label");
+          if (aria) return aria.trim();
+          if (any.placeholder) return any.placeholder.trim();
+          return any.name || any.id || "";
+        };
+
+        const nameRe   = /name|ime|имена|три имена|first|last/i;
+        const emailRe  = /email|imeil|имейл|e-mail|mail/i;
+        const phoneRe  = /phone|tel|telefon|телефон|gsm/i;
+        const msgRe    = /message|съобщ|забел|note|comment|zabelejka/i;
+        const dateRe   = /check.?in|check.?out|arrival|departure|дата|date/i;
+
+        const fields: any[] = [];
+        const seen = new Set<string>();
+
+        document.querySelectorAll("input, textarea, select").forEach((el: any) => {
+          const type = (el.type || "").toLowerCase();
+          if (["submit", "button", "image", "reset", "hidden"].includes(type)) return;
+          if (el.disabled) return;
+
+          const label = getLabel(el);
+          const name = el.name || el.id || "";
+          const combined = `${name} ${label}`.toLowerCase();
+
+          let key = "";
+          if (nameRe.test(combined))  key = "name";
+          else if (emailRe.test(combined)) key = "email";
+          else if (phoneRe.test(combined)) key = "phone";
+          else if (msgRe.test(combined)) key = "message";
+          else if (dateRe.test(combined)) key = combined.includes("out") || combined.includes("depart") ? "check_out" : "check_in";
+
+          if (!key || seen.has(key)) return;
+          seen.add(key);
+
+          const selector = el.id ? `#${CSS.escape(el.id)}` : el.name ? `[name="${el.name}"]` : "";
+          if (!selector) return;
+
+          fields.push({
+            key,
+            label: label || name || key,
+            selector,
+            type: el.tagName.toLowerCase() === "textarea" ? "textarea" : type || "text",
+            required: !!el.required || el.getAttribute("aria-required") === "true",
+          });
+        });
+
+        // Намери submit бутон
+        const submitCandidates = [
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button:last-of-type',
+        ];
+        let submitSel = "";
+        for (const s of submitCandidates) {
+          const btn = document.querySelector(s);
+          if (!btn) continue;
+          const r = (btn as HTMLElement).getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            const id = (btn as any).id;
+            submitSel = id ? `#${CSS.escape(id)}` : s;
+            break;
+          }
+        }
+
+        return { fields, submit_selector: submitSel };
+      });
+
+      // Филтрирай само ако намерихме поне ime/email/phone (за да не вземем availability форма)
+      const hasPersonalData = result.fields.some((f: any) => ["name", "email", "phone"].includes(f.key));
+      if (!hasPersonalData) return { fields: [], submit_selector: "" };
+
+      return result;
+    } catch {
+      return { fields: [], submit_selector: "" };
+    }
+  }
+
+  /**
+   * Попълва резервационна форма с данните на клиента
+   */
+  private async fillReservationForm(
+    page: Page,
+    form: { fields: Array<{ key: string; label: string; selector: string; type: string; required: boolean }> },
+    data: Record<string, string>
+  ): Promise<number> {
+    const keyMap: Record<string, string[]> = {
+      name:     ["name", "full_name", "client_name"],
+      email:    ["email", "e_mail"],
+      phone:    ["phone", "tel", "telephone"],
+      message:  ["message", "note", "comment"],
+      check_in: ["check_in", "mphb_check_in_date"],
+      check_out: ["check_out", "mphb_check_out_date"],
+    };
+
+    let filled = 0;
+    for (const field of form.fields) {
+      const candidates = keyMap[field.key] || [field.key];
+      let value = "";
+      for (const k of candidates) {
+        if (data[k]?.trim()) { value = data[k].trim(); break; }
+      }
+      if (!value) continue;
+
+      try {
+        const el = await page.$(field.selector);
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        if (field.type === "textarea") {
+          await (el as any).fill(value);
+        } else {
+          await page.fill(field.selector, value);
+        }
+        await page.keyboard.press("Tab").catch(() => {});
+        filled++;
+        console.log(`[FILL-RESERVATION] ${field.key}=${value.slice(0, 20)}`);
+      } catch (e) {
+        console.log(`[FILL-RESERVATION] failed ${field.selector}: ${e}`);
+      }
+    }
+    return filled;
+  }
+
+  /**
+   * Извлича contact email от страницата (footer, contact section и т.н.)
+   */
+  private async extractContactEmail(page: Page): Promise<string> {
+    try {
+      // Опитай от DB session structured_data
+      const dbSessionId = page.url(); // fallback
+      const emailFromPage = await page.evaluate(() => {
+        const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+        const body = document.body?.innerText || "";
+        // Предпочитай emails в footer или contact секция
+        const footer = document.querySelector("footer")?.innerText || "";
+        const contact = document.querySelector("[class*='contact'], [id*='contact']")?.textContent || "";
+        const priority = footer + " " + contact;
+        const priorityMatch = priority.match(emailRe);
+        if (priorityMatch) return priorityMatch[0];
+        const allMatch = body.match(emailRe);
+        if (allMatch) {
+          // Пропусни noreply, spam и т.н.
+          const clean = allMatch.filter(e => !e.includes("noreply") && !e.includes("example") && !e.includes("resend"));
+          if (clean.length) return clean[0];
+        }
+        return "";
+      });
+      return emailFromPage;
+    } catch {
+      return "";
+    }
+  }
+
+
 
   async executeFillForm(request: FillFormRequest): Promise<{ success: boolean; message: string; observation?: JsonObj }> {
     try {
@@ -4044,7 +4369,28 @@ async function main() {
   });
 
 
-  app.post("/close-session", async (req: Request, res: Response) => {
+  app.post("/make-booking", async (req: Request, res: Response) => {
+    const body = req.body;
+    if (!body?.site_id) {
+      return res.json({ success: false, message: "Missing site_id" });
+    }
+
+    console.log(
+      `[HTTP][/make-booking] site_id=${body.site_id} room=${body.room_name || "any"} ` +
+      `client_keys=${Object.keys(body.client_data || {}).join(",")}`
+    );
+
+    const r = await manager.makeBooking({
+      site_id: String(body.site_id),
+      session_id: body.session_id ? String(body.session_id) : undefined,
+      room_name: body.room_name ? String(body.room_name) : undefined,
+      booking_data: (body.booking_data || {}) as Record<string, string>,
+      client_data: (body.client_data || {}) as Record<string, string>,
+    });
+    res.json(r);
+  });
+
+
     const { site_id } = req.body || {};
     if (site_id) await manager.closeSession(String(site_id));
     res.json({ success: true });
