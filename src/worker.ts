@@ -1,14 +1,14 @@
 /**
- * NEO WORKER v6.1.0-universal-choices — Universal, deterministic, schema-first
+ * NEO WORKER v6.2.0-availability — Universal, deterministic, schema-first
  *
- * Patch v6.1.0-universal-choices:
- * - scanWizardStep detects ALL interactive choice elements universally:
- *     button groups, [role=radio], real <input type=radio>, styled div choices,
- *     generic clickable containers with 2+ short-text siblings
- * - countUnfilledVisibleFields detects unselected radios + div choices
- * - fillWizard matches ANY choice from data by group name/label
- * - buildWizardNeedPayload checks choice groups as missing_required
- * - Handles multi-step wizards where new fields appear after interaction
+ * Patch v6.2.0-availability:
+ * - checkAvailability(): universal hotel availability check
+ *     fills check-in/check-out dates universally across any hotel site
+ *     clicks search button, waits for results, takes screenshot
+ *     returns screenshot_base64 for Gemini Vision parsing in proxy
+ * - /check-availability endpoint added
+ * - executeFillForm: new branch for kind=availability
+ * - All existing form/wizard logic unchanged
  */
 
 import express, { Request, Response } from "express";
@@ -526,6 +526,9 @@ class HotSessionManager {
     let result: { ok: boolean; message: string; observation?: JsonObj };
     if (schema.kind === "wizard") {
       result = await this.fillWizard(session.page, schema, merged, autoSubmit, strictSelect);
+    } else if (schema.kind === "availability") {
+      // Availability check — fill dates, click search, take screenshot, return for vision parsing
+      result = await this.checkAvailability(session.page, schema, merged);
     } else {
       result = await this.fillFormSchema(session.page, schema, merged, file, autoSubmit, strictSelect);
     }
@@ -2469,6 +2472,302 @@ class HotSessionManager {
     }
     return null;
   }
+
+  // ─────────────────────────────────────────────────────────
+  // checkAvailability — universal hotel availability check
+  // Fills date fields, clicks search, waits, returns screenshot
+  // ─────────────────────────────────────────────────────────
+
+  async checkAvailability(
+    page: Page,
+    schema: FormSchemaRow,
+    data: Record<string, unknown>
+  ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
+    const t0 = Date.now();
+    console.log(`[AVAIL] Starting availability check for ${schema.url}`);
+
+    try {
+      // ── 1. Extract dates and guests from data ──────────────────
+      const checkin  = this.resolveAvailDate(data, ["check_in","checkin","check-in","arrival","date_from","from","от","дата_от","пристигане"]);
+      const checkout = this.resolveAvailDate(data, ["check_out","checkout","check-out","departure","date_to","to","до","дата_до","заминаване"]);
+      const guests   = String(data["guests"] || data["adults"] || data["гости"] || data["възрастни"] || "2");
+      const rooms    = String(data["rooms"] || data["стаи"] || "1");
+
+      console.log(`[AVAIL] check_in=${checkin} check_out=${checkout} guests=${guests} rooms=${rooms}`);
+
+      if (!checkin || !checkout) {
+        return { ok: false, message: "Липсват дати за проверка на наличност" };
+      }
+
+      // ── 2. Navigate to availability URL ───────────────────────
+      await this.ensureOnSchemaUrl(page, schema.url);
+      await page.waitForTimeout(1200);
+
+      // ── 3. Try to fill date fields universally ─────────────────
+      const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+      console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
+
+      // ── 4. Click Search / Check button ────────────────────────
+      const clicked = await this.clickAvailabilitySearch(page);
+      console.log(`[AVAIL] clickSearch=${clicked}`);
+
+      if (!clicked) {
+        // If we can't click search, still take screenshot — maybe page already shows results
+        console.log("[AVAIL] Could not click search button, proceeding to screenshot anyway");
+      }
+
+      // ── 5. Wait for results to load ────────────────────────────
+      await this.waitForAvailabilityResults(page);
+
+      // ── 6. Take full-page screenshot ───────────────────────────
+      const screenshotBase64 = await this.takeAvailabilityScreenshot(page);
+
+      const timing = Date.now() - t0;
+      console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars`);
+
+      return {
+        ok: true,
+        message: "availability_screenshot_ready",
+        observation: {
+          type: "availability_check",
+          check_in: checkin,
+          check_out: checkout,
+          guests,
+          rooms,
+          screenshot_base64: screenshotBase64,
+          url: page.url(),
+          timing_ms: timing,
+          fill_result: filled,
+          search_clicked: clicked,
+        },
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[AVAIL] Error: ${msg}`);
+      // Still try to take screenshot for partial results
+      try {
+        const screenshotBase64 = await this.takeAvailabilityScreenshot(page);
+        return {
+          ok: true,
+          message: "availability_screenshot_partial",
+          observation: {
+            type: "availability_check",
+            screenshot_base64: screenshotBase64,
+            error: msg,
+            url: page.url(),
+          },
+        };
+      } catch {
+        return { ok: false, message: `Availability check failed: ${msg}` };
+      }
+    }
+  }
+
+  private resolveAvailDate(data: Record<string, unknown>, keys: string[]): string {
+    for (const k of keys) {
+      const v = String(data[k] || "").trim();
+      if (v) return v;
+    }
+    // Also check case-insensitive
+    const lower = Object.fromEntries(Object.entries(data).map(([k, v]) => [k.toLowerCase(), v]));
+    for (const k of keys) {
+      const v = String(lower[k.toLowerCase()] || "").trim();
+      if (v) return v;
+    }
+    return "";
+  }
+
+  private async fillAvailabilityDates(
+    page: Page,
+    checkin: string,
+    checkout: string,
+    guests: string,
+    rooms: string
+  ): Promise<{ checkin: boolean; checkout: boolean; guests: boolean }> {
+    const result = { checkin: false, checkout: false, guests: false };
+
+    // ── Date input selectors (ordered by specificity) ──────────
+    const checkinSelectors = [
+      'input[name*="check_in"]', 'input[name*="checkin"]', 'input[name*="check-in"]',
+      'input[name*="arrival"]', 'input[name*="from"]', 'input[name*="date_from"]',
+      'input[name*="start"]', 'input[id*="check_in"]', 'input[id*="checkin"]',
+      'input[id*="arrival"]', 'input[id*="from"]', 'input[id*="dateFrom"]',
+      'input[placeholder*="Check-in"]', 'input[placeholder*="Arrival"]',
+      'input[placeholder*="Пристигане"]', 'input[placeholder*="От"]',
+      '[data-testid*="checkin"]', '[data-testid*="check-in"]', '[data-testid*="arrival"]',
+    ];
+    const checkoutSelectors = [
+      'input[name*="check_out"]', 'input[name*="checkout"]', 'input[name*="check-out"]',
+      'input[name*="departure"]', 'input[name*="to"]', 'input[name*="date_to"]',
+      'input[name*="end"]', 'input[id*="check_out"]', 'input[id*="checkout"]',
+      'input[id*="departure"]', 'input[id*="to"]', 'input[id*="dateTo"]',
+      'input[placeholder*="Check-out"]', 'input[placeholder*="Departure"]',
+      'input[placeholder*="Заминаване"]', 'input[placeholder*="До"]',
+      '[data-testid*="checkout"]', '[data-testid*="check-out"]', '[data-testid*="departure"]',
+    ];
+    const guestSelectors = [
+      'input[name*="guest"]', 'input[name*="adult"]', 'input[name*="person"]',
+      'input[name*="pax"]', 'input[id*="guest"]', 'input[id*="adult"]',
+      'select[name*="guest"]', 'select[name*="adult"]', 'select[id*="guest"]',
+      'input[placeholder*="Guests"]', 'input[placeholder*="Adults"]',
+      'input[placeholder*="Гости"]', 'input[placeholder*="Възрастни"]',
+    ];
+
+    // Helper: try to fill a date input
+    const tryFillDate = async (selectors: string[], value: string): Promise<boolean> => {
+      for (const sel of selectors) {
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          const isVisible = await el.isVisible().catch(() => false);
+          if (!isVisible) continue;
+
+          // Clear and fill
+          await el.click({ clickCount: 3 });
+          await page.waitForTimeout(80);
+          await el.fill(value);
+          await page.waitForTimeout(100);
+
+          // Some pickers need Tab or Enter to confirm
+          await page.keyboard.press("Tab");
+          await page.waitForTimeout(150);
+
+          // Verify value was accepted
+          const filled = await el.inputValue().catch(() => "");
+          if (filled && filled !== "") {
+            console.log(`[AVAIL] Filled ${sel} = ${filled}`);
+            return true;
+          }
+
+          // Try type instead of fill (for masked inputs)
+          await el.click({ clickCount: 3 });
+          await page.keyboard.type(value, { delay: 30 });
+          await page.keyboard.press("Tab");
+          await page.waitForTimeout(150);
+          const filled2 = await el.inputValue().catch(() => "");
+          if (filled2 && filled2 !== "") {
+            console.log(`[AVAIL] Typed ${sel} = ${filled2}`);
+            return true;
+          }
+        } catch {}
+      }
+      return false;
+    };
+
+    result.checkin  = await tryFillDate(checkinSelectors, checkin);
+    await page.waitForTimeout(200);
+    result.checkout = await tryFillDate(checkoutSelectors, checkout);
+    await page.waitForTimeout(200);
+
+    // Guests (optional — don't block if fails)
+    for (const sel of guestSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const isVisible = await el.isVisible().catch(() => false);
+        if (!isVisible) continue;
+        const tag = await el.evaluate((e: any) => e.tagName.toLowerCase());
+        if (tag === "select") {
+          await el.selectOption(guests).catch(() => {});
+        } else {
+          await el.click({ clickCount: 3 });
+          await el.fill(guests);
+        }
+        await page.waitForTimeout(100);
+        result.guests = true;
+        break;
+      } catch {}
+    }
+
+    return result;
+  }
+
+  private async clickAvailabilitySearch(page: Page): Promise<boolean> {
+    const searchSelectors = [
+      // Specific search/check buttons
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Search")',
+      'button:has-text("Check")',
+      'button:has-text("Check availability")',
+      'button:has-text("Book")',
+      'button:has-text("Търси")',
+      'button:has-text("Провери")',
+      'button:has-text("Провери наличност")',
+      'button:has-text("Провери свободните стаи")',
+      'button:has-text("Резервирай")',
+      'button:has-text("Покажи")',
+      '[data-testid*="search"]',
+      '[data-testid*="submit"]',
+      '.search-btn', '.check-btn', '.availability-btn',
+      '#search-btn', '#check-availability',
+    ];
+
+    for (const sel of searchSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const isVisible = await el.isVisible().catch(() => false);
+        if (!isVisible) continue;
+        await el.click();
+        await page.waitForTimeout(300);
+        return true;
+      } catch {}
+    }
+
+    // Fallback: find button near date inputs via evaluate
+    try {
+      const clicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll("button, input[type=submit], [role=button]")) as HTMLElement[];
+        const keywords = ["search","check","book","търси","провери","резервирай","покажи","наличност"];
+        for (const btn of btns) {
+          const t = (btn.textContent || btn.getAttribute("value") || btn.getAttribute("aria-label") || "").toLowerCase();
+          if (keywords.some(k => t.includes(k))) {
+            (btn as any).click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clicked) return true;
+    } catch {}
+
+    return false;
+  }
+
+  private async waitForAvailabilityResults(page: Page): Promise<void> {
+    // Wait for network to settle
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 8000 });
+    } catch {
+      // networkidle timeout is OK — page may still have results
+    }
+
+    // Also wait for any loading spinners to disappear
+    try {
+      await page.waitForFunction(() => {
+        const spinners = document.querySelectorAll(
+          '.loading, .spinner, [class*="loading"], [class*="spinner"], [aria-busy="true"]'
+        );
+        return spinners.length === 0 ||
+          Array.from(spinners).every(el => (el as HTMLElement).offsetParent === null);
+      }, { timeout: 6000 });
+    } catch {}
+
+    // Extra buffer for DOM to paint
+    await page.waitForTimeout(1500);
+  }
+
+  private async takeAvailabilityScreenshot(page: Page): Promise<string> {
+    // Try full-page first, fallback to viewport
+    try {
+      const buf = await page.screenshot({ fullPage: true, type: "png" });
+      return Buffer.from(buf).toString("base64");
+    } catch {
+      const buf = await page.screenshot({ fullPage: false, type: "png" });
+      return Buffer.from(buf).toString("base64");
+    }
+  }
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -2518,6 +2817,26 @@ async function main() {
     console.log(`[HTTP][/fill-form] data_keys=${dataKeys.join(",")} confirmed_keys=${confKeys.join(",")}`);
 
     const r = await manager.executeFillForm(body);
+    res.json(r);
+  });
+
+  app.post("/check-availability", async (req: Request, res: Response) => {
+    const { site_id, session_id, form_id, fingerprint, data } = req.body || {};
+    if (!site_id || !data) {
+      return res.json({ success: false, message: "Missing site_id/data" });
+    }
+    console.log(`[HTTP][/check-availability] site_id=${site_id} session_id=${session_id || ""}`);
+
+    // Delegate through executeFillForm with kind=availability
+    const r = await manager.executeFillForm({
+      site_id: String(site_id),
+      session_id: session_id ? String(session_id) : undefined,
+      form_id: form_id ? String(form_id) : undefined,
+      fingerprint: fingerprint ? String(fingerprint) : undefined,
+      kind: "availability",
+      data: data as Record<string, unknown>,
+      auto_submit: false,
+    });
     res.json(r);
   });
 
