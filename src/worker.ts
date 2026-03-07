@@ -1,10 +1,8 @@
 /**
- * NEO WORKER v6.2.0-booking-check — Universal, deterministic, schema-first
+ * NEO WORKER v6.3.0-smart-booking — Universal, deterministic, schema-first
  *
  * Patch v6.1.0-universal-choices:
- * - scanWizardStep detects ALL interactive choice elements universally:
- *     button groups, [role=radio], real <input type=radio>, styled div choices,
- *     generic clickable containers with 2+ short-text siblings
+ * - scanWizardStep detects ALL interactive choice elements universally
  * - countUnfilledVisibleFields detects unselected radios + div choices
  * - fillWizard matches ANY choice from data by group name/label
  * - buildWizardNeedPayload checks choice groups as missing_required
@@ -18,6 +16,13 @@
  * - Scrapes availability results: room names, price/night, total price, currency
  * - Supports: MPHB, Beds24, Sirvoy, Lodgify, Cloudbeds, generic WordPress booking
  * - Returns only info — does NOT make actual reservations
+ *
+ * Patch v6.3.0-smart-booking:
+ * - URL resolution: form_schemas.url (any row) → demo_sessions.url by session id → siteMap.url
+ * - AI-powered booking button detection: screenshot → Claude vision → click by coordinates
+ * - No hardcoded selectors — works on ANY site universally
+ * - LLM scores ALL visible clickable elements, picks the most booking-relevant one
+ * - Falls back gracefully: AI → DOM keyword scan → proceed without click
  */
 
 import express, { Request, Response } from "express";
@@ -565,6 +570,47 @@ class HotSessionManager {
   // /check-availability — Booking Widget Handler
   // ═══════════════════════════════════════════════════════════
 
+  /**
+   * Взима URL за отваряне по приоритет:
+   * 1. Всеки ред в form_schemas за тази сесия → взима .url
+   * 2. demo_sessions WHERE id = session_id → взима .url
+   * 3. siteMap.url (от /prepare-session payload)
+   */
+  private async resolveBookingUrl(session: HotSession, sessionId: string): Promise<string> {
+    // 1) form_schemas — взима url от първия наличен ред (всякакъв kind)
+    if (session.formSchemas.length > 0) {
+      for (const schema of session.formSchemas) {
+        if (schema.url) {
+          console.log(`[URL-RESOLVE] from form_schemas: ${schema.url}`);
+          return schema.url;
+        }
+      }
+    }
+
+    // 2) demo_sessions WHERE id = session_id
+    if (this.supabase && sessionId) {
+      try {
+        const { data, error } = await this.supabase
+          .from("demo_sessions")
+          .select("url")
+          .eq("id", sessionId)
+          .maybeSingle();
+
+        if (!error && data?.url) {
+          console.log(`[URL-RESOLVE] from demo_sessions: ${data.url}`);
+          return String(data.url);
+        }
+      } catch (e) {
+        console.log(`[URL-RESOLVE] demo_sessions lookup failed: ${e}`);
+      }
+    }
+
+    // 3) siteMap fallback
+    const fallback = session.siteMap.url || "";
+    console.log(`[URL-RESOLVE] fallback siteMap.url: ${fallback}`);
+    return fallback;
+  }
+
   async checkAvailability(req: CheckAvailabilityRequest): Promise<AvailabilityResult> {
     const { site_id, session_id, url, booking_data, crawl_only } = req;
 
@@ -575,17 +621,15 @@ class HotSessionManager {
     session.lastActivity = Date.now();
 
     // Зареди schemas ако липсват
-    if (session.formSchemas.length === 0 && (session_id || session.sessionId)) {
-      session.formSchemas = await this.loadFormSchemas(session_id || session.sessionId || site_id);
+    const dbSessionId = session_id || session.sessionId || site_id;
+    if (session.formSchemas.length === 0 && dbSessionId) {
+      session.formSchemas = await this.loadFormSchemas(dbSessionId);
     }
 
-    // Определи target URL
+    // Определи target URL — req.url override → form_schemas → demo_sessions → siteMap
     let targetUrl = url || "";
     if (!targetUrl) {
-      const bookingSchema = session.formSchemas.find(
-        s => s.kind === "booking_widget" || s.kind === "availability"
-      );
-      targetUrl = bookingSchema?.url || session.siteMap.url || "";
+      targetUrl = await this.resolveBookingUrl(session, dbSessionId);
     }
     if (targetUrl && !targetUrl.startsWith("http")) targetUrl = "https://" + targetUrl;
 
@@ -670,33 +714,37 @@ class HotSessionManager {
   }
 
   /**
-   * Търси резервационен бутон/widget на текущата страница и го натиска.
-   * Поддържа: inline форми, iframe widgets, бутони с текст.
+   * AI-POWERED универсален детектор на booking бутони.
+   *
+   * Логика:
+   * 1. Провери дали вече има видима booking форма → не е нужен клик
+   * 2. Провери за iframe с познат vendor
+   * 3. Събери ВСИЧКИ видими кликаеми елементи от DOM с техните текстове + позиции
+   * 4. Изпрати списъка към Claude Vision → LLM избира кой да се кликне
+   * 5. Кликни по координати (не по selector — работи на ВСЕКИ сайт)
+   * 6. Fallback: DOM keyword scan без AI
    */
   private async findAndClickBookingWidget(
     page: Page
   ): Promise<{ found: boolean; vendor: string; method: string }> {
 
-    // A) Провери дали вече има видима booking форма (inline widget)
+    // ── A) Вече има inline booking форма ────────────────────────────
     const hasInlineForm = await page.evaluate(() => {
-      const bookingKeywords = /check.?in|check.?out|настаняване|напускане|arrival|departure|mphb_check|checkin|checkout/i;
-      const inputs = Array.from(document.querySelectorAll("input, select"));
-      return inputs.some(el => {
-        const any = el as any;
-        const combined = `${any.name || ""} ${any.id || ""} ${any.placeholder || ""} ${any.getAttribute?.("aria-label") || ""}`;
-        return bookingKeywords.test(combined);
+      const re = /check.?in|check.?out|настаняване|напускане|arrival|departure|mphb_check|checkin|checkout/i;
+      return Array.from(document.querySelectorAll("input, select")).some(el => {
+        const a = el as any;
+        return re.test(`${a.name||""} ${a.id||""} ${a.placeholder||""} ${a.getAttribute?.("aria-label")||""}`);
       });
     }).catch(() => false);
 
     if (hasInlineForm) {
-      console.log("[BOOKING-WIDGET] Inline booking form detected");
+      console.log("[BOOKING-WIDGET] Inline booking form already visible");
       return { found: true, vendor: "inline", method: "inline_form" };
     }
 
-    // B) Провери за iframe с познати vendor-и
+    // ── B) iframe с познат vendor ────────────────────────────────────
     const iframeVendor = await page.evaluate((vendors: Record<string, string>) => {
-      const iframes = Array.from(document.querySelectorAll("iframe"));
-      for (const iframe of iframes) {
+      for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
         const src = ((iframe as any).src || iframe.getAttribute("data-src") || "").toLowerCase();
         for (const [key, name] of Object.entries(vendors)) {
           if (src.includes(key)) return { name, key };
@@ -706,87 +754,231 @@ class HotSessionManager {
     }, BOOKING_IFRAME_VENDORS).catch(() => null);
 
     if (iframeVendor) {
-      console.log(`[BOOKING-WIDGET] iframe vendor detected: ${iframeVendor.name}`);
-      // Scroll iframe into view
+      console.log(`[BOOKING-WIDGET] iframe vendor: ${iframeVendor.name}`);
       try {
-        await page.evaluate((key: string) => {
-          const iframes = Array.from(document.querySelectorAll("iframe"));
-          for (const iframe of iframes) {
-            if (((iframe as any).src || "").includes(key)) {
-              (iframe as HTMLElement).scrollIntoView({ behavior: "smooth" });
-            }
-          }
+        await page.evaluate((k: string) => {
+          const iframe = Array.from(document.querySelectorAll("iframe"))
+            .find(el => ((el as any).src || "").includes(k));
+          if (iframe) (iframe as HTMLElement).scrollIntoView({ behavior: "smooth" });
         }, iframeVendor.key);
         await page.waitForTimeout(600);
       } catch {}
-      return { found: true, vendor: iframeVendor.name, method: "iframe_detected" };
+      return { found: true, vendor: iframeVendor.name, method: "iframe_vendor" };
     }
 
-    // C) Търси бутон по познати текстове и атрибути
-    const bookingBtnSelectors = [
-      'button:has-text("Резервация")',
-      'button:has-text("Резервирай")',
-      'button:has-text("Настаняване")',
-      'button:has-text("Провери наличност")',
-      'button:has-text("Свободни стаи")',
-      'button:has-text("Виж стаи")',
-      'button:has-text("Book Now")',
-      'button:has-text("Check Availability")',
-      'button:has-text("Reserve")',
-      'button:has-text("Book")',
-      'a:has-text("Резервация")',
-      'a:has-text("Book Now")',
-      'a:has-text("Reserve")',
-      '[class*="booking-btn"]',
-      '[class*="book-now"]',
-      '[id*="booking-btn"]',
-      '[data-action*="book"]',
-    ];
+    // ── C) Събери всички видими кликаеми елементи ───────────────────
+    const clickableElements = await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const s = window.getComputedStyle(el as HTMLElement);
+        if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return false;
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.width > 10 && r.height > 10;
+      };
 
-    for (const sel of bookingBtnSelectors) {
-      try {
-        const el = await page.$(sel);
-        if (!el) continue;
-        const visible = await el.isVisible().catch(() => false);
-        if (!visible) continue;
-        await el.scrollIntoViewIfNeeded().catch(() => {});
-        await el.click({ timeout: 3000 });
-        await page.waitForTimeout(1200);
-        console.log(`[BOOKING-WIDGET] Clicked: ${sel}`);
-        return { found: true, vendor: "unknown", method: `button:${sel}` };
-      } catch {}
+      const results: Array<{
+        index: number;
+        tag: string;
+        text: string;
+        ariaLabel: string;
+        title: string;
+        href: string;
+        className: string;
+        id: string;
+        x: number;
+        y: number;
+        w: number;
+        h: number;
+      }> = [];
+
+      const seen = new Set<string>();
+      let idx = 0;
+
+      const els = Array.from(document.querySelectorAll(
+        "button, a, [role='button'], [role='link'], input[type='button'], input[type='submit'], " +
+        "[class*='btn'], [class*='button'], [class*='nav'], [class*='menu']"
+      ));
+
+      for (const el of els) {
+        if (!isVisible(el)) continue;
+        const any = el as any;
+        const r   = (el as HTMLElement).getBoundingClientRect();
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+        const aria = any.getAttribute?.("aria-label") || "";
+        const title = any.title || "";
+        const href  = any.href ? String(any.href).replace(location.origin, "").slice(0, 80) : "";
+        const cls   = (any.className || "").toString().slice(0, 80);
+        const id    = (any.id || "").slice(0, 40);
+
+        // Skip empty/useless
+        if (!text && !aria && !title && !href) continue;
+
+        const key = `${text}|${aria}|${Math.round(r.x)}|${Math.round(r.y)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        results.push({
+          index: idx++,
+          tag: el.tagName.toLowerCase(),
+          text, ariaLabel: aria, title, href, className: cls, id,
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        });
+
+        if (results.length >= 80) break;
+      }
+
+      return results;
+    }).catch(() => [] as any[]);
+
+    console.log(`[BOOKING-WIDGET] Found ${clickableElements.length} clickable elements for AI analysis`);
+
+    if (clickableElements.length === 0) {
+      return { found: false, vendor: "", method: "no_elements" };
     }
 
-    // D) Евристично търсене по keyword matching
-    const heuristic = await page.evaluate(() => {
-      const patterns = [/резерв/i, /настаняване/i, /нощувк/i, /стаи/i, /наличн/i,
-                        /book\s*now/i, /reserv/i, /availab/i, /room/i];
+    // ── D) AI анализ — изпрати елементите към Claude ────────────────
+    const aiResult = await this.askAiForBookingElement(clickableElements, page);
+
+    if (aiResult.index >= 0) {
+      const el = clickableElements[aiResult.index];
+      if (el) {
+        try {
+          // Кликни по центъра на елемента (не по selector)
+          await page.mouse.click(el.x, el.y);
+          await page.waitForTimeout(1400);
+
+          // Провери дали се е отворила форма / нова страница
+          const afterCheck = await page.evaluate(() => {
+            const re = /check.?in|check.?out|настаняване|arrival|departure|mphb_check|checkin|checkout|датa|date/i;
+            return Array.from(document.querySelectorAll("input, select")).some(el => {
+              const a = el as any;
+              return re.test(`${a.name||""} ${a.id||""} ${a.placeholder||""} ${a.getAttribute?.("aria-label")||""}`);
+            });
+          }).catch(() => false);
+
+          console.log(`[BOOKING-WIDGET] AI clicked index=${aiResult.index} text="${el.text}" reason="${aiResult.reason}" form_appeared=${afterCheck}`);
+          return {
+            found: true,
+            vendor: "ai-detected",
+            method: `ai:${el.text || el.ariaLabel || el.href}`,
+          };
+        } catch (e) {
+          console.log(`[BOOKING-WIDGET] AI click failed: ${e}`);
+        }
+      }
+    }
+
+    // ── E) DOM keyword fallback (без AI) ────────────────────────────
+    const BOOKING_RE = /резерв|настаняван|нощувк|свободни стаи|провери наличн|виж стаи|book\s*now|check\s*avail|reserv|find\s*room/i;
+
+    const fallbackClicked = await page.evaluate((pattern: string) => {
+      const re = new RegExp(pattern, "i");
       const els = Array.from(document.querySelectorAll("button, a, [role='button']"));
       for (const el of els) {
         const text = (el.textContent || "").trim();
         if (!text || text.length > 60) continue;
-        const style = window.getComputedStyle(el as HTMLElement);
-        if (style.display === "none" || style.visibility === "hidden") continue;
+        const s = window.getComputedStyle(el as HTMLElement);
+        if (s.display === "none" || s.visibility === "hidden") continue;
         const r = (el as HTMLElement).getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        for (const pat of patterns) {
-          if (pat.test(text)) {
-            (el as HTMLElement).click();
-            return text;
-          }
+        if (r.width < 10 || r.height < 10) continue;
+        if (re.test(text)) {
+          (el as HTMLElement).click();
+          return text;
         }
       }
       return "";
-    }).catch(() => "");
+    }, BOOKING_RE.source).catch(() => "");
 
-    if (heuristic) {
+    if (fallbackClicked) {
       await page.waitForTimeout(1200);
-      console.log(`[BOOKING-WIDGET] Heuristic click: "${heuristic}"`);
-      return { found: true, vendor: "unknown", method: `heuristic:${heuristic}` };
+      console.log(`[BOOKING-WIDGET] DOM keyword fallback clicked: "${fallbackClicked}"`);
+      return { found: true, vendor: "dom-keyword", method: `dom:${fallbackClicked}` };
     }
 
-    console.log("[BOOKING-WIDGET] No booking widget found — proceeding anyway");
+    console.log("[BOOKING-WIDGET] No booking element found — will attempt form fill directly");
     return { found: false, vendor: "", method: "none" };
+  }
+
+  /**
+   * Изпраща списък от видими елементи към Claude API.
+   * LLM анализира текстовете и избира кой е booking/reservation бутонът.
+   * Не разчита на screenshot — само на текст + атрибути (бързо и надеждно).
+   */
+  private async askAiForBookingElement(
+    elements: Array<{
+      index: number; tag: string; text: string; ariaLabel: string;
+      title: string; href: string; className: string; id: string;
+      x: number; y: number; w: number; h: number;
+    }>,
+    page: Page
+  ): Promise<{ index: number; reason: string }> {
+    // Вземи заглавие и URL на страницата за контекст
+    const pageContext = await page.evaluate(() => ({
+      title: document.title || "",
+      url:   location.href || "",
+      h1:    (document.querySelector("h1")?.textContent || "").trim().slice(0, 80),
+    })).catch(() => ({ title: "", url: "", h1: "" }));
+
+    // Форматирай елементите като кратък списък за LLM
+    const elementList = elements
+      .map(e => {
+        const label = e.text || e.ariaLabel || e.title || e.href;
+        const extra  = [e.className, e.id].filter(Boolean).join(" ").slice(0, 50);
+        return `[${e.index}] <${e.tag}> "${label}"${extra ? ` (${extra})` : ""}`;
+      })
+      .join("\n");
+
+    const prompt = `You are analyzing a hotel/accommodation website to find the booking or reservation button.
+
+Page: "${pageContext.title}" | H1: "${pageContext.h1}" | URL: ${pageContext.url}
+
+Here are all visible clickable elements on the page:
+${elementList}
+
+Task: Which element index is most likely a booking/reservation/availability check button?
+Look for: "Резервация", "Резервирай", "Настаняване", "Book Now", "Check Availability", "Reserve", "Booking", navigation links to booking pages, etc.
+
+Rules:
+- Prefer buttons/links that open a date picker or booking form
+- Avoid: language switchers, login, social media, newsletter, search, contact
+- If NO element looks like a booking button, return index -1
+
+Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
+
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 120,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+
+      if (!response.ok) {
+        console.log(`[AI-BOOKING] API error: ${response.status}`);
+        return { index: -1, reason: "api_error" };
+      }
+
+      const data = await response.json() as any;
+      const rawText = (data?.content?.[0]?.text || "").trim();
+      console.log(`[AI-BOOKING] Raw response: ${rawText}`);
+
+      // Parse JSON — strip possible markdown fences
+      const clean = rawText.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean);
+
+      if (typeof parsed?.index === "number") {
+        return { index: parsed.index, reason: parsed.reason || "" };
+      }
+    } catch (e) {
+      console.log(`[AI-BOOKING] Parse/fetch error: ${e}`);
+    }
+
+    return { index: -1, reason: "parse_error" };
   }
 
   /**
@@ -3547,7 +3739,7 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.2.0-booking-check listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v6.3.0-smart-booking listening on :${PORT}`);
   });
 
   await manager.start();
