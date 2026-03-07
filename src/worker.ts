@@ -18,12 +18,14 @@
  * - Returns only info — does NOT make actual reservations
  *
  * Patch v6.3.0-smart-booking:
- * - URL resolution: form_schemas.url (any row) → demo_sessions.url by session id → siteMap.url
- * - AI-powered booking button detection via Gemini 2.0 Flash Lite (cheapest Google LLM)
+ * - URL resolution: form_schemas.url → demo_sessions.url by session id → siteMap.url
+ * - AI-powered booking button detection via Gemini 2.0 Flash Lite
  * - No hardcoded selectors — works on ANY site universally
  * - LLM scores ALL visible clickable elements, picks the most booking-relevant one
  * - Falls back gracefully: AI → DOM keyword scan → proceed without click
  * - ENV: GEMINI_API_KEY required for AI detection
+ * - /fill-form with kind=availability and NO schema → auto-routes to checkAvailability
+ * - Accepts both mphb_* and generic check_in/check_out/adults/children keys
  */
 
 import express, { Request, Response } from "express";
@@ -1504,6 +1506,62 @@ Respond with ONLY valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
 
     if (!schema) {
       console.log(`[FILL-FORM][NO_SCHEMA] form_id=${form_id || ""} fingerprint=${(fingerprint || "").slice(0, 12)} schemas=${session.formSchemas.length} ids=${session.formSchemas.map(s => s.id).join(",")}`);
+
+      // ── Ако kind=availability и няма schema → fallback към checkAvailability ──
+      // Това се случва когато form_schemas е празна (сайтът не е бил crawl-нат)
+      // но Gemini пак изпраща /fill-form с kind=availability
+      if (kind === "availability" || kind === "booking_widget") {
+        console.log(`[FILL-FORM][AVAIL-FALLBACK] No schema but kind=${kind} → routing to checkAvailability`);
+
+        // Нормализирай data ключовете към booking_data формат
+        const merged = mergeConfirmedData(data || {}, confirmed as any);
+        const bookingData: Record<string, string> = {};
+
+        // Приеми и двата формата: mphb_check_in_date и check_in
+        const ci = String(merged.mphb_check_in_date  || merged.check_in  || merged.checkin  || merged["Настаняване"] || "");
+        const co = String(merged.mphb_check_out_date || merged.check_out || merged.checkout || merged["Напускане"]   || "");
+        const ad = String(merged.mphb_adults   || merged.adults   || merged["Възрастни"] || "");
+        const ch = String(merged.mphb_children || merged.children || merged["Деца"]      || "");
+
+        if (ci) bookingData.check_in  = ci;
+        if (co) bookingData.check_out = co;
+        if (ad) bookingData.adults    = ad;
+        if (ch) bookingData.children  = ch;
+
+        const availResult = await this.checkAvailability({
+          site_id,
+          session_id: session_id || session.sessionId || undefined,
+          booking_data: Object.keys(bookingData).length > 0 ? bookingData : undefined,
+        });
+
+        // Преобразувай AvailabilityResult → fill-form response формат
+        const obs: JsonObj = {
+          url:          availResult.source_url || "",
+          title:        "",
+          snippet:      availResult.raw_snippet || "",
+          widget_vendor: availResult.widget_vendor || "",
+        };
+
+        if (availResult.rooms && availResult.rooms.length > 0) {
+          obs.availability = {
+            rooms:     availResult.rooms,
+            submitted: true,
+            url:       availResult.source_url || "",
+          };
+        }
+
+        if (availResult.needs_input) {
+          obs.needs_input     = true;
+          obs.required_fields = availResult.required_fields || [];
+        }
+
+        return {
+          success:     availResult.success,
+          message:     availResult.message,
+          observation: obs,
+        };
+      }
+
       return { success: false, message: `Не намерих форма (schemas=${session.formSchemas.length})` };
     }
 
