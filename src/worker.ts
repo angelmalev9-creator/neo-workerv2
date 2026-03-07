@@ -742,20 +742,61 @@ class HotSessionManager {
     if (autoSubmit) {
       if (await this.clickAvailabilitySearchButton(page)) {
         actions.push("Търсене");
-        // ⚡ SPA apps re-render results — wait for DOM change, not just timeout
-        await page.waitForFunction(
-          () => document.body && document.body.innerText.replace(/\s/g, "").length > 200,
-          { timeout: 6000 }
-        ).catch(() => {});
-        await page.waitForTimeout(800);
+
+        // ⚡ Wait for navigation to search-results page
+        try {
+          await page.waitForURL("**/search-results/**", { timeout: 8000 });
+          console.log(`[AVAILABILITY] navigated to: ${page.url().slice(0, 80)}`);
+        } catch {
+          // Some sites reload in-place — wait for DOM to change significantly
+          const urlBefore = page.url();
+          await page.waitForFunction(
+            (before: string) => {
+              const url = window.location.href;
+              if (url !== before) return true;
+              // Or wait for result containers to appear
+              const hasResults = !!(
+                document.querySelector('[class*="search-result"]') ||
+                document.querySelector('[class*="room-result"]') ||
+                document.querySelector('[class*="mphb_room"]') ||
+                document.querySelector('.mphb-rooms-available') ||
+                document.querySelector('[class*="available"]')
+              );
+              return hasResults;
+            },
+            urlBefore,
+            { timeout: 8000 }
+          ).catch(() => {});
+        }
+
+        // Extra wait for JS-rendered content
+        await page.waitForTimeout(1200);
+        await this.dismissCookieBanner(page);
+        console.log(`[AVAILABILITY] final url: ${page.url().slice(0, 100)}`);
       }
     }
 
     const scraped = await this.scrapeAvailabilityResults(page);
     if (actions.length) scraped.actions = actions;
-    // ⚡ Wrap in .availability so useGeminiVoice can find it at obs.availability
+    scraped.check_in = checkInRaw;
+    scraped.check_out = checkOutRaw;
+    scraped.adults = adults;
+    scraped.children = children;
+
+    const roomCount = (scraped.rooms as any[])?.length || 0;
+    console.log(`[AVAILABILITY] returning ${roomCount} rooms from ${page.url().slice(0, 80)}`);
+    console.log(`[AVAILABILITY] check_in=${checkInRaw} check_out=${checkOutRaw} adults=${adults} children=${children}`);
+
+    if (roomCount === 0) {
+      // Last resort: grab full page text for Gemini to parse
+      scraped.snippet = await page.evaluate(() =>
+        (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 2000)
+      ).catch(() => "");
+      console.log(`[AVAILABILITY] no rooms found, snippet len=${String(scraped.snippet).length}`);
+    }
+
+    // ⚡ Wrap in .availability so useGeminiVoice finds it at obs.availability
     const obs: JsonObj = { availability: scraped };
-    console.log(`[AVAILABILITY] returning ${(scraped.rooms as any[])?.length || 0} rooms, check_in=${checkInRaw}, check_out=${checkOutRaw}`);
     return { ok: true, message: actions.join(" → ") || "Availability: страница отворена", observation: obs };
   }
 
