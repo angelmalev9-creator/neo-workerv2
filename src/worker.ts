@@ -683,14 +683,21 @@ class HotSessionManager {
   ): Promise<{ ok: boolean; message: string; observation?: JsonObj }> {
     const actions: string[] = [];
     const checkInRaw = String(
-      data.check_in || data.checkin || data["Дата на настаняване"] ||
-      data["дата на настаняване"] || data.from || data.arrival || data.start || ""
+      data.mphb_check_in_date || data.check_in || data.checkin ||
+      data["Дата на настаняване"] || data["дата на настаняване"] ||
+      data.from || data.arrival || data.start || ""
     ).trim();
     const checkOutRaw = String(
-      data.check_out || data.checkout || data["Дата на отпътуване"] ||
-      data["дата на отпътуване"] || data.to || data.departure || data.end || ""
+      data.mphb_check_out_date || data.check_out || data.checkout ||
+      data["Дата на отпътуване"] || data["дата на отпътуване"] ||
+      data.to || data.departure || data.end || ""
     ).trim();
-    const adults = String(data.adults || data.възрастни || data.guests || "").trim();
+    const adults = String(
+      data.mphb_adults || data.adults || data.възрастни || data.guests || ""
+    ).trim();
+    const children = String(
+      data.mphb_children || data.children || data.деца || data.kids || ""
+    ).trim();
 
     const checkInDate  = this.parseAvailabilityDate(checkInRaw);
     const checkOutDate = this.parseAvailabilityDate(checkOutRaw);
@@ -718,7 +725,19 @@ class HotSessionManager {
       }
     }
 
+    // ⚡ Fallback: if neither native nor calendar worked, use fillSingleField (handles flatpickr)
+    if (!nativeFilled && checkInRaw) {
+      const filledCI = await this.fillSingleField(page, "mphb_check_in_date", checkInRaw, [], false);
+      const filledCO = await this.fillSingleField(page, "mphb_check_out_date", checkOutRaw, [], false);
+      if (filledCI || filledCO) {
+        if (checkInRaw) actions.push(`Настаняване: ${checkInRaw}`);
+        if (checkOutRaw) actions.push(`Отпътуване: ${checkOutRaw}`);
+        console.log(`[AVAILABILITY] flatpickr fallback: CI=${filledCI} CO=${filledCO}`);
+      }
+    }
+
     if (adults) { await this.trySetGuestCount(page, adults); actions.push(`Гости: ${adults}`); }
+    if (children) { await this.trySetGuestCount(page, children, true); actions.push(`Деца: ${children}`); }
 
     if (autoSubmit) {
       if (await this.clickAvailabilitySearchButton(page)) {
@@ -732,8 +751,11 @@ class HotSessionManager {
       }
     }
 
-    const obs = await this.scrapeAvailabilityResults(page);
-    if (actions.length) obs.actions = actions;
+    const scraped = await this.scrapeAvailabilityResults(page);
+    if (actions.length) scraped.actions = actions;
+    // ⚡ Wrap in .availability so useGeminiVoice can find it at obs.availability
+    const obs: JsonObj = { availability: scraped };
+    console.log(`[AVAILABILITY] returning ${(scraped.rooms as any[])?.length || 0} rooms, check_in=${checkInRaw}, check_out=${checkOutRaw}`);
     return { ok: true, message: actions.join(" → ") || "Availability: страница отворена", observation: obs };
   }
 
@@ -854,12 +876,26 @@ class HotSessionManager {
     } catch { return false; }
   }
 
-  private async trySetGuestCount(page: Page, adults: string): Promise<void> {
-    for (const sel of ['select[name*="adult"]','select[name*="guest"]','[class*="adult"] select','[class*="guest"] select','select[aria-label*="възрастн" i]','select[aria-label*="adult" i]']) {
+  private async trySetGuestCount(page: Page, count: string, isChildren = false): Promise<void> {
+    const adultSels = [
+      'select[name="mphb_adults"]', 'select[name*="adult"]', 'select[name*="guest"]',
+      '[class*="adult"] select', '[class*="guest"] select',
+      'select[aria-label*="възрастн" i]', 'select[aria-label*="adult" i]',
+    ];
+    const childSels = [
+      'select[name="mphb_children"]', 'select[name*="child"]', 'select[name*="kids"]',
+      '[class*="child"] select', '[class*="kids"] select',
+      'select[aria-label*="деца" i]', 'select[aria-label*="child" i]',
+    ];
+    const sels = isChildren ? childSels : adultSels;
+    for (const sel of sels) {
       try {
         const el = await page.$(sel);
-        if (!el||!await el.isVisible().catch(()=>false)) continue;
-        await (el as any).selectOption({ label: adults }).catch(async () => { await (el as any).selectOption({ value: adults }).catch(()=>{}); });
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await (el as any).selectOption({ label: count }).catch(async () => {
+          await (el as any).selectOption({ value: count }).catch(() => {});
+        });
+        console.log(`[AVAILABILITY] set ${isChildren ? "children" : "adults"}=${count} via ${sel}`);
         return;
       } catch {}
     }
