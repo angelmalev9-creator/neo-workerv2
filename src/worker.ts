@@ -1056,14 +1056,48 @@ class HotSessionManager {
   }
 
   // ⚡ After search/submit — navigate booking flow until confirmation or payment
+  // Dismiss cookie consent banner if visible — must happen before any booking clicks
+  private async dismissCookieBanner(page: Page): Promise<void> {
+    const cookieSelectors = [
+      'button:has-text("Приемам")', 'button:has-text("Приемане")',
+      'button:has-text("Accept")', 'button:has-text("Accept all")',
+      'button:has-text("OK")', 'button:has-text("Разбрах")',
+      'button:has-text("Съгласен")', 'button:has-text("Agree")',
+      'button:has-text("Got it")', 'button:has-text("I agree")',
+      '[class*="cookie"] button', '[id*="cookie"] button',
+      '[class*="consent"] button[class*="accept"]',
+      '[class*="gdpr"] button', '[id*="gdpr"] button',
+      '.cc-accept', '.cc-btn', '#onetrust-accept-btn-handler',
+      '[class*="cookie-accept"]', '[class*="cookieAccept"]',
+      'button[class*="accept"]', 'a[class*="cookie"][class*="accept"]',
+    ];
+    for (const sel of cookieSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (!el || !await el.isVisible().catch(() => false)) continue;
+        await el.click({ timeout: 800 });
+        console.log(`[COOKIE] Dismissed banner via: ${sel}`);
+        await page.waitForTimeout(300).catch(() => {});
+        return;
+      } catch {}
+    }
+  }
+
   private async postSubmitBookingLoop(page: Page, actions: string[]): Promise<JsonObj> {
     const MAX_STEPS = 6;
     let lastUrl = page.url();
 
+    // Dismiss cookie banner before starting booking loop
+    await this.dismissCookieBanner(page);
+
     for (let step = 1; step <= MAX_STEPS; step++) {
-      // Wait for page to settle after each action
-      await page.waitForTimeout(1200).catch(() => {});
-      await page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => {});
+      // Wait for SPA to render — longer on step 1 (initial load)
+      const waitMs = step === 1 ? 2500 : 1500;
+      await page.waitForTimeout(waitMs).catch(() => {});
+      await page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => {});
+
+      // Dismiss cookie banner again — some sites show it after navigation
+      await this.dismissCookieBanner(page);
 
       const pageText = await page.evaluate(() =>
         (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 3000)
@@ -1110,14 +1144,18 @@ class HotSessionManager {
       }
 
       // ── DETECT: URL didn't change and no book button — we're stuck ──
-      if (currentUrl === lastUrl && step > 1) {
+      // Allow step 2 to pass (cookie banner may have caused false "no progress" on step 1)
+      if (currentUrl === lastUrl && step > 2) {
         console.log(`[BOOKING-LOOP] ⚠ No progress at step=${step}, stopping`);
+        // Scrape whatever results are on page before giving up
+        const results = await this.scrapeAvailabilityResults(page);
         return {
           status: "stuck",
-          message: "Системата не показа нито потвърждение, нито бутон за резервация",
+          message: "Системата не показа потвърждение — вероятно изисква ръчно довършване",
           snippet: pageText.slice(0, 600),
           url: currentUrl,
           step,
+          rooms: results.rooms || [],
         };
       }
 
@@ -1152,12 +1190,32 @@ class HotSessionManager {
     ];
     for (const sel of bookSelectors) {
       try {
-        const el = await page.$(sel);
-        if (!el || !await el.isVisible().catch(() => false)) continue;
-        await el.scrollIntoViewIfNeeded().catch(() => {});
-        await el.click({ timeout: 2000 });
-        console.log(`[BOOKING-LOOP][BOOK] clicked: ${sel}`);
-        return true;
+        const els = await page.$$(sel);
+        for (const el of els) {
+          if (!await el.isVisible().catch(() => false)) continue;
+
+          // Skip if inside a cookie/consent banner
+          const inBanner = await el.evaluate((node: Element) => {
+            let p: Element | null = node;
+            while (p) {
+              const id = (p.id || "").toLowerCase();
+              const cls = (p.className || "").toLowerCase();
+              if (/cookie|consent|gdpr|banner|popup|overlay/.test(id + cls)) return true;
+              p = p.parentElement;
+            }
+            return false;
+          }).catch(() => false);
+
+          if (inBanner) {
+            console.log(`[BOOKING-LOOP][SKIP-BANNER] ${sel}`);
+            continue;
+          }
+
+          await el.scrollIntoViewIfNeeded().catch(() => {});
+          await el.click({ timeout: 2000 });
+          console.log(`[BOOKING-LOOP][BOOK] clicked: ${sel}`);
+          return true;
+        }
       } catch {}
     }
     return false;
