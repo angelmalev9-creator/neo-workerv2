@@ -4390,7 +4390,7 @@ async function main() {
     res.json(r);
   });
 
-
+  app.post("/close-session", async (req: Request, res: Response) => {
     const { site_id } = req.body || {};
     if (site_id) await manager.closeSession(String(site_id));
     res.json({ success: true });
