@@ -669,32 +669,50 @@ class HotSessionManager {
       }
     }
 
-    // Открий и кликни booking widget
-    const widgetFound = await this.findAndClickBookingWidget(session.page);
-    console.log(`[CHECK-AVAIL] widget_found=${widgetFound.found} vendor=${widgetFound.vendor} method=${widgetFound.method}`);
+    // ── Стъпка 1: Провери за booking iframe ОЩЕ ПРЕДИ клик ──
+    // Quendoo и др. са вградени в страницата — можем директно да навигираме с дати
+    const preClickIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
 
-    // ── След клик: провери дали се е отворил нов таб или cross-origin iframe ──
-    // Ако има cross-origin booking iframe (quendoo, beds24, etc.) → навигирай директно към него
-    await session.page.waitForTimeout(2000); // Изчакай iframe-а да се зареди
-    const bookingIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
-    if (bookingIframeUrl) {
-      console.log(`[CHECK-AVAIL] Cross-origin booking iframe detected: ${bookingIframeUrl}`);
-      // Инжектирай датите директно в URL — пропуска date picker стъпката
-      const iframeWithDates = booking_data
-        ? this.injectDatesIntoBookingUrl(bookingIframeUrl, booking_data)
-        : bookingIframeUrl;
-      console.log(`[CHECK-AVAIL] Navigating to: ${iframeWithDates}`);
+    if (preClickIframeUrl && booking_data && Object.keys(booking_data).length > 0) {
+      // ✅ Директна навигация с дати — пропускаме date picker изцяло
+      const urlWithDates = this.injectDatesIntoBookingUrl(preClickIframeUrl, booking_data);
+      console.log(`[CHECK-AVAIL] Pre-click iframe found → direct nav: ${urlWithDates}`);
       try {
-        await session.page.goto(iframeWithDates, { waitUntil: "networkidle", timeout: 25000 });
+        await session.page.goto(urlWithDates, { waitUntil: "networkidle", timeout: 25000 });
         await session.page.waitForTimeout(2000);
         await this.dismissCookieBanner(session.page);
         console.log(`[CHECK-AVAIL] Now on: ${session.page.url()}`);
       } catch (e) {
-        console.log(`[CHECK-AVAIL] iframe nav error: ${e}`);
+        console.log(`[CHECK-AVAIL] direct nav error: ${e}`);
         try {
-          await session.page.goto(iframeWithDates, { waitUntil: "domcontentloaded", timeout: 15000 });
+          await session.page.goto(urlWithDates, { waitUntil: "domcontentloaded", timeout: 15000 });
           await session.page.waitForTimeout(2500);
         } catch {}
+      }
+    } else {
+      // Кликни booking бутон (сайтове без вграден iframe)
+      const widgetFound = await this.findAndClickBookingWidget(session.page);
+      console.log(`[CHECK-AVAIL] widget_found=${widgetFound.found} vendor=${widgetFound.vendor} method=${widgetFound.method}`);
+
+      // След клик — провери дали се появи iframe
+      await session.page.waitForTimeout(2000);
+      const postClickIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
+      if (postClickIframeUrl) {
+        const urlWithDates = booking_data
+          ? this.injectDatesIntoBookingUrl(postClickIframeUrl, booking_data)
+          : postClickIframeUrl;
+        console.log(`[CHECK-AVAIL] Post-click iframe → navigating: ${urlWithDates}`);
+        try {
+          await session.page.goto(urlWithDates, { waitUntil: "networkidle", timeout: 25000 });
+          await session.page.waitForTimeout(2000);
+          await this.dismissCookieBanner(session.page);
+        } catch (e) {
+          console.log(`[CHECK-AVAIL] post-click nav error: ${e}`);
+          try {
+            await session.page.goto(urlWithDates, { waitUntil: "domcontentloaded", timeout: 15000 });
+            await session.page.waitForTimeout(2500);
+          } catch {}
+        }
       }
     }
 
