@@ -579,6 +579,23 @@ class HotSessionManager {
    * 2. demo_sessions WHERE id = session_id → взима .url
    * 3. siteMap.url (от /prepare-session payload)
    */
+  /**
+   * Връща само frames, които са booking-свързани или главния frame.
+   * Филтрира reCAPTCHA, Google Analytics, Facebook и др. junk frames.
+   */
+  private getBookingFrames(page: Page) {
+    const JUNK_RE = /recaptcha|google\.com\/recaptcha|gstatic\.com|facebook\.com|analytics|gtm\.js|doubleclick|googletagmanager|googlesyndication|adsbygoogle/i;
+    const mainFrame = page.mainFrame();
+    const otherFrames = page.frames()
+      .filter(f => {
+        const u = f.url();
+        if (!u || u === "about:blank" || u === page.url()) return false;
+        if (JUNK_RE.test(u)) return false;
+        return true;
+      });
+    return [mainFrame, ...otherFrames];
+  }
+
   private async resolveBookingUrl(session: HotSession, sessionId: string): Promise<string> {
     // 1) form_schemas — взима url от първия наличен ред (всякакъв kind)
     if (session.formSchemas.length > 0) {
@@ -656,7 +673,23 @@ class HotSessionManager {
     const widgetFound = await this.findAndClickBookingWidget(session.page);
     console.log(`[CHECK-AVAIL] widget_found=${widgetFound.found} vendor=${widgetFound.vendor} method=${widgetFound.method}`);
 
-    // Crawl формата
+    // ── След клик: провери дали се е отворил нов таб или cross-origin iframe ──
+    // Ако има cross-origin booking iframe (quendoo, beds24, etc.) → навигирай директно към него
+    await session.page.waitForTimeout(1200);
+    const bookingIframeUrl = await this.detectCrossOriginBookingIframe(session.page);
+    if (bookingIframeUrl) {
+      console.log(`[CHECK-AVAIL] Cross-origin booking iframe detected: ${bookingIframeUrl}`);
+      console.log(`[CHECK-AVAIL] Navigating directly to iframe URL for full DOM access`);
+      try {
+        await session.page.goto(bookingIframeUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+        await session.page.waitForTimeout(1500);
+        await this.dismissCookieBanner(session.page);
+      } catch (e) {
+        console.log(`[CHECK-AVAIL] iframe nav error: ${e}`);
+      }
+    }
+
+    // Crawl формата (сега сме на правилната страница)
     const crawled = await this.scrapeBookingWidgetForm(session.page);
     console.log(`[CHECK-AVAIL] crawled fields=${crawled.required_fields.length} vendor=${crawled.vendor}`);
 
@@ -698,21 +731,32 @@ class HotSessionManager {
       };
     }
 
-    // Изчакай и scraпни резултати
-    await session.page.waitForTimeout(2000);
+    // Изчакай и scraпни резултати — по-дълго чакане за бавни booking системи
+    await session.page.waitForTimeout(3000);
     await this.dismissCookieBanner(session.page);
 
     const results = await this.scrapeBookingResults(session.page);
 
+    // Винаги scraпвай текста от страницата — дори да няма структурирани стаи
+    // Gemini трябва да вижда реалния резултат, не "запитването е изпратено"
+    const pageText = await session.page.evaluate(() =>
+      (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000)
+    ).catch(() => "");
+
+    const hasRooms = results.rooms.length > 0;
+
     return {
       success: true,
       rooms: results.rooms,
-      message: results.rooms.length > 0
+      message: hasRooms
         ? `Намерени ${results.rooms.length} вид/а стаи`
-        : "Не намерих стаи — провери дали формата е попълнена правилно",
+        : pageText
+          ? "Проверих наличността — виж raw_snippet за резултата"
+          : "Не намерих стаи — провери дали формата е попълнена правилно",
       source_url: session.page.url(),
       widget_vendor: crawled.vendor || widgetFound.vendor,
-      raw_snippet: results.rooms.length === 0 ? results.raw_snippet : undefined,
+      // Винаги включвай page text за Gemini — дори когато има стаи
+      raw_snippet: pageText,
     };
   }
 
@@ -930,7 +974,47 @@ class HotSessionManager {
   }
 
   /**
-   * Изпраща списък от видими елементи към Claude API.
+   * Открива cross-origin booking iframe след клик на booking бутон.
+   * Quendoo, Beds24, Sirvoy и др. се зареждат като отделен iframe с различен origin.
+   * Playwright НЕ може да evaluate() в cross-origin frames → навигираме директно.
+   *
+   * Връща URL-а на iframe-а ако е booking-свързан, иначе "".
+   */
+  private async detectCrossOriginBookingIframe(page: Page): Promise<string> {
+    // Знаем vendors чийто iframe URL-ове са cross-origin booking системи
+    const BOOKING_IFRAME_URL_RE = /quendoo|beds24|sirvoy|lodgify|cloudbeds|eviivo|guesty|hostfully|resly|roomcloud|hotel3s|pms365|booking\.com\/hotel|reservations\./i;
+
+    // Проверявай и iframe src атрибути в DOM
+    const iframeSrc = await page.evaluate((re: string) => {
+      const regex = new RegExp(re, "i");
+      const iframes = Array.from(document.querySelectorAll("iframe"));
+      for (const f of iframes) {
+        const src = (f as any).src || f.getAttribute("data-src") || "";
+        if (src && regex.test(src)) return src;
+      }
+      return "";
+    }, BOOKING_IFRAME_URL_RE.source).catch(() => "");
+
+    if (iframeSrc) {
+      console.log(`[IFRAME-DETECT] Found booking iframe in DOM: ${iframeSrc.slice(0, 80)}`);
+      return iframeSrc;
+    }
+
+    // Провери и Playwright frame обектите (може да са lazy-loaded)
+    for (const frame of page.frames()) {
+      const frameUrl = frame.url();
+      if (!frameUrl || frameUrl === "about:blank" || frameUrl === page.url()) continue;
+      // Пропускай reCAPTCHA, Google Analytics, Facebook и др.
+      if (/recaptcha|google\.com\/recaptcha|gstatic|facebook|analytics|gtm\.js|doubleclick/i.test(frameUrl)) continue;
+      if (BOOKING_IFRAME_URL_RE.test(frameUrl)) {
+        console.log(`[IFRAME-DETECT] Found booking iframe via Playwright frames: ${frameUrl.slice(0, 80)}`);
+        return frameUrl;
+      }
+    }
+
+    return "";
+  }
+
    * LLM анализира текстовете и избира кой е booking/reservation бутонът.
    * Не разчита на screenshot — само на текст + атрибути (бързо и надеждно).
    */
@@ -993,7 +1077,7 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
       }
 
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite-001:generateContent?key=${apiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1038,7 +1122,7 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     required_fields: RequiredBookingField[];
     vendor: string;
   }> {
-    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+    const frames = this.getBookingFrames(page);
 
     for (const frame of frames) {
       try {
@@ -1192,7 +1276,7 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     const rooms    = data.rooms     || "1";
     const promo    = data.promo_code || "";
 
-    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+    const frames = this.getBookingFrames(page);
     let totalFilled = 0;
 
     for (const frame of frames) {
@@ -1444,7 +1528,7 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     }
 
     // Iframe fallback
-    for (const frame of page.frames().slice(1)) {
+    for (const frame of this.getBookingFrames(page).slice(1)) {
       try {
         const ok = await frame.evaluate(() => {
           const btn = document.querySelector('button[type="submit"], input[type="submit"]') as any;
@@ -1480,7 +1564,7 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
     await page.waitForTimeout(600);
     await this.dismissCookieBanner(page);
 
-    const frames = [page.mainFrame(), ...page.frames().slice(1)];
+    const frames = this.getBookingFrames(page);
 
     for (const frame of frames) {
       try {
@@ -1644,11 +1728,14 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
         });
 
         // Преобразувай AvailabilityResult → fill-form response формат
+        // Важно: observation трябва да съдържа реалните резултати за Gemini
         const obs: JsonObj = {
-          url:          availResult.source_url || "",
-          title:        "",
-          snippet:      availResult.raw_snippet || "",
+          url:           availResult.source_url || "",
+          title:         "",
           widget_vendor: availResult.widget_vendor || "",
+          // raw_snippet = реалният текст от страницата с резултати
+          // Gemini ТРЯБВА да го прочете и да го преразкаже на клиента
+          page_content:  availResult.raw_snippet || "",
         };
 
         if (availResult.rooms && availResult.rooms.length > 0) {
@@ -1657,6 +1744,15 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
             submitted: true,
             url:       availResult.source_url || "",
           };
+          // Изгради human-readable summary на стаите за Gemini
+          const roomSummary = availResult.rooms.map((r: any) =>
+            `${r.name || "Стая"}` +
+            (r.price_per_night ? ` — ${r.price_per_night}/нощ` : "") +
+            (r.total_price && r.total_price !== r.price_per_night ? ` (общо: ${r.total_price})` : "") +
+            (r.availability === "available" ? " ✅" : r.availability === "unavailable" ? " ❌" : "")
+          ).join("\n");
+          obs.rooms_summary = roomSummary;
+          obs.rooms_count   = availResult.rooms.length;
         }
 
         if (availResult.needs_input) {
@@ -1664,9 +1760,16 @@ Respond ONLY with valid JSON: {"index": NUMBER, "reason": "SHORT_REASON"}`;
           obs.required_fields = availResult.required_fields || [];
         }
 
+        // message трябва да е информативно — не само "success"
+        const msg = availResult.rooms && availResult.rooms.length > 0
+          ? `Намерени ${availResult.rooms.length} вид/а стаи. Виж rooms_summary и availability в observation.`
+          : availResult.raw_snippet
+            ? `Наличността е проверена. Виж page_content в observation за резултата.`
+            : availResult.message;
+
         return {
           success:     availResult.success,
-          message:     availResult.message,
+          message:     msg,
           observation: obs,
         };
       }
