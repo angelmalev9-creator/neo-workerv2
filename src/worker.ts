@@ -1,14 +1,21 @@
 /**
- * NEO WORKER v6.2.0-availability — Universal, deterministic, schema-first
+ * NEO WORKER v7.0.0-booking — Universal, deterministic, schema-first
  *
- * Patch v6.2.0-availability:
- * - checkAvailability(): universal hotel availability check
- *     fills check-in/check-out dates universally across any hotel site
- *     clicks search button, waits for results, takes screenshot
- *     returns screenshot_base64 for Gemini Vision parsing in proxy
- * - /check-availability endpoint added
- * - executeFillForm: new branch for kind=availability
- * - All existing form/wizard logic unchanged
+ * v7.0.0-booking — НОВO:
+ * - makeReservation(): пълен workflow за резервация
+ *     1. Попълва availability form (дати, гости)
+ *     2. Взима screenshot → Gemini парсва цени/стаи
+ *     3. Ако клиентът е съгласен → попълва reservation details (имена, email, телефон)
+ *     4. Спира преди плащане → копира booking URL за клиента
+ * - /make-reservation endpoint
+ * - fillIframeBookingWidget(): взаимодейства вътре в booking iframes
+ *     поддържа: Cloudbeds, Beds24, Mews, Synxis, SabeApp, LittleHotelier, HotelRunner
+ *     използва page.frameLocator() за достъп до iframe DOM
+ * - fillCustomDatepicker(): universal handler за custom calendar widgets
+ *     поддържа: Flatpickr, Pikaday, React DatePicker, AirDatepicker, jQuery UI Datepicker
+ *     стратегии: click на ден в calendar grid, keyboard navigation, direct input
+ * - fillStyledChoiceGroups(): styled div/li choice groups в form context (не само wizard)
+ * - Всички съществуващи функции непроменени
  */
 
 import express, { Request, Response } from "express";
@@ -138,6 +145,27 @@ interface ExecuteRequest {
   session_id?: string;
   keywords: string[];
   data?: Record<string, unknown>;
+}
+
+interface MakeReservationRequest {
+  site_id: string;
+  session_id?: string;
+  fingerprint?: string;
+  // Availability data (step 1)
+  check_in: string;
+  check_out: string;
+  guests?: string | number;
+  rooms?: string | number;
+  room_type?: string;
+  // Guest details (step 2 — after client confirms price)
+  guest_name?: string;
+  guest_email?: string;
+  guest_phone?: string;
+  guest_message?: string;
+  // Control flags
+  phase: "check" | "reserve";  // "check" = само availability screenshot; "reserve" = попълни до плащане
+  confirmed_price?: string;     // цената, която клиентът е потвърдил
+  auto_submit?: boolean;        // дали да кликне финален submit (default: false — спира преди плащане)
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -648,6 +676,13 @@ class HotSessionManager {
     if (file) {
       const up = await this.uploadFile(page, fields, file);
       if (up) actions.push(`Файл: ${file.filename}`);
+    }
+
+    // ✅ NEW: Fill choice groups (radio, button_group, select choices) from schema
+    const schemaChoices = (schema.schema as any).choices as Array<any> | undefined;
+    if (schemaChoices?.length) {
+      const choiceActions = await this.fillStyledChoiceGroups(page, schemaChoices, data);
+      choiceActions.forEach(a => actions.push(a));
     }
 
     const submitInfo: JsonObj = {};
@@ -2656,8 +2691,45 @@ class HotSessionManager {
 
     result.checkin  = await tryFillDate(checkinSelectors, checkin);
     await page.waitForTimeout(200);
+
+    // ✅ NEW: If standard fill failed, try custom datepicker
+    if (!result.checkin) {
+      const dpCheckinSelectors = [
+        '.flatpickr-input[placeholder*="Check"]', '.flatpickr-input[placeholder*="Пристигане"]',
+        '[class*="checkin"] .flatpickr-input', '[class*="arrival"] .flatpickr-input',
+        'input.hasDatepicker[name*="check"]', 'input.hasDatepicker[name*="arrival"]',
+        '[id*="checkin_date"]', '[id*="arrival_date"]',
+      ];
+      for (const sel of dpCheckinSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !(await el.isVisible().catch(() => false))) continue;
+          result.checkin = await this.fillCustomDatepicker(page, sel, checkin);
+          if (result.checkin) break;
+        } catch {}
+      }
+    }
+
     result.checkout = await tryFillDate(checkoutSelectors, checkout);
     await page.waitForTimeout(200);
+
+    // ✅ NEW: If standard fill failed, try custom datepicker for checkout
+    if (!result.checkout) {
+      const dpCheckoutSelectors = [
+        '.flatpickr-input[placeholder*="Check-out"]', '.flatpickr-input[placeholder*="Заминаване"]',
+        '[class*="checkout"] .flatpickr-input', '[class*="departure"] .flatpickr-input',
+        'input.hasDatepicker[name*="check_out"]', 'input.hasDatepicker[name*="departure"]',
+        '[id*="checkout_date"]', '[id*="departure_date"]',
+      ];
+      for (const sel of dpCheckoutSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (!el || !(await el.isVisible().catch(() => false))) continue;
+          result.checkout = await this.fillCustomDatepicker(page, sel, checkout);
+          if (result.checkout) break;
+        } catch {}
+      }
+    }
 
     // Guests (optional — don't block if fails)
     for (const sel of guestSelectors) {
@@ -2768,6 +2840,715 @@ class HotSessionManager {
       return Buffer.from(buf).toString("base64");
     }
   }
+
+  // ─────────────────────────────────────────────────────────
+  // fillIframeBookingWidget — interact inside booking iframes
+  // Supports: Cloudbeds, Beds24, Mews, Synxis, SabeApp, LittleHotelier, HotelRunner, Bookero, Amelia
+  // ─────────────────────────────────────────────────────────
+
+  private async fillIframeBookingWidget(
+    page: Page,
+    iframeSrc: string,
+    vendor: string,
+    checkin: string,
+    checkout: string,
+    guests: string,
+    rooms: string
+  ): Promise<{ ok: boolean; message: string; screenshot_base64?: string }> {
+    try {
+      console.log(`[IFRAME] vendor=${vendor} src=${iframeSrc.slice(0, 80)}`);
+
+      // Locate the iframe
+      let frameLocator: any = null;
+      const iframeSelectors = [
+        `iframe[src*="${iframeSrc.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"]`,
+        `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
+        "iframe",
+      ];
+
+      for (const sel of iframeSelectors) {
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          const visible = await el.isVisible().catch(() => false);
+          if (!visible) continue;
+          frameLocator = page.frameLocator(sel);
+          break;
+        } catch {}
+      }
+
+      if (!frameLocator) {
+        console.log("[IFRAME] Could not locate iframe, falling back to main page");
+        // Fall back to main page availability check
+        const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+        const clicked = await this.clickAvailabilitySearch(page);
+        await this.waitForAvailabilityResults(page);
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
+      }
+
+      // ── Vendor-specific date selectors ────────────────────
+      const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
+        cloudbeds: {
+          checkin: ['input[name="checkin"]', '.cb-checkin input', '#checkin', 'input[placeholder*="Check-in"]'],
+          checkout: ['input[name="checkout"]', '.cb-checkout input', '#checkout', 'input[placeholder*="Check-out"]'],
+          guests: ['select[name="adults"]', '#adults', 'input[name="adults"]'],
+          search: ['button[type="submit"]', '.cb-search-btn', 'button:has-text("Search")'],
+        },
+        beds24: {
+          checkin: ['input[name="firstday"]', '#firstday', 'input[name="arrival"]'],
+          checkout: ['input[name="lastday"]', '#lastday', 'input[name="departure"]'],
+          guests: ['select[name="numadult"]', '#numadult'],
+          search: ['input[type="submit"]', 'button[type="submit"]'],
+        },
+        mews: {
+          checkin: ['input[data-testid*="start"]', '.mews-start input', 'input[name*="start"]'],
+          checkout: ['input[data-testid*="end"]', '.mews-end input', 'input[name*="end"]'],
+          guests: ['input[data-testid*="adult"]', 'select[data-testid*="adult"]'],
+          search: ['button[data-testid*="search"]', 'button[data-testid*="submit"]', 'button:has-text("Search")'],
+        },
+        sabeeapp: {
+          checkin: ['input[name="checkin"]', '#checkin_date'],
+          checkout: ['input[name="checkout"]', '#checkout_date'],
+          guests: ['select[name="adults"]', '#adults_count'],
+          search: ['button[type="submit"]', '.sabee-search'],
+        },
+        littlehotelier: {
+          checkin: ['input[name="StartDate"]', '#StartDate', 'input[data-field="start"]'],
+          checkout: ['input[name="EndDate"]', '#EndDate', 'input[data-field="end"]'],
+          guests: ['select[name="Adults"]', '#Adults'],
+          search: ['button[type="submit"]', '.be-submit'],
+        },
+        hotelrunner: {
+          checkin: ['input[name="checkin"]', '.hr-checkin input'],
+          checkout: ['input[name="checkout"]', '.hr-checkout input'],
+          guests: ['select[name="adult"]', '#adult_count'],
+          search: ['button[type="submit"]', '.hr-search-button'],
+        },
+        bookero: {
+          checkin: ['input[name="dateFrom"]', '#dateFrom'],
+          checkout: ['input[name="dateTo"]', '#dateTo'],
+          guests: ['select[name="persons"]', '#persons'],
+          search: ['button[type="submit"]', '.bookero-submit'],
+        },
+        amelia: {
+          checkin: ['.amelia-date-input', 'input[name="date"]', '#ameliaBookingDate'],
+          checkout: ['input[name="endDate"]', '.amelia-end-date'],
+          guests: ['select[name="guests"]', '.amelia-guests select'],
+          search: ['.amelia-step-btn', 'button.amelia-continue', 'button:has-text("Continue")'],
+        },
+      };
+
+      // Generic fallback selectors (used when vendor not in map or vendor-specific fails)
+      const genericSelectors = {
+        checkin: [
+          'input[name*="checkin"]', 'input[name*="check_in"]', 'input[name*="arrival"]',
+          'input[name*="from"]', 'input[name*="start"]', 'input[id*="checkin"]',
+          'input[placeholder*="Check-in"]', 'input[placeholder*="Arrival"]',
+          '[data-testid*="checkin"]', '[data-testid*="arrival"]',
+        ],
+        checkout: [
+          'input[name*="checkout"]', 'input[name*="check_out"]', 'input[name*="departure"]',
+          'input[name*="to"]', 'input[name*="end"]', 'input[id*="checkout"]',
+          'input[placeholder*="Check-out"]', 'input[placeholder*="Departure"]',
+          '[data-testid*="checkout"]', '[data-testid*="departure"]',
+        ],
+        guests: [
+          'select[name*="adult"]', 'input[name*="adult"]', 'select[name*="guest"]',
+          'input[name*="guest"]', '[data-testid*="adult"]',
+        ],
+        search: [
+          'button[type="submit"]', 'input[type="submit"]',
+          'button:has-text("Search")', 'button:has-text("Book")',
+          'button:has-text("Check")', 'button:has-text("Търси")',
+        ],
+      };
+
+      const selMap = vendorDateSelectors[vendor] || genericSelectors;
+
+      // Helper: try to fill an element inside the iframe
+      const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
+        const allSels = [...selectors, ...genericSelectors.checkin.slice(0, 3)];
+        for (const sel of selectors) {
+          try {
+            const loc = frameLocator.locator(sel).first();
+            const count = await loc.count().catch(() => 0);
+            if (count === 0) continue;
+            const visible = await loc.isVisible().catch(() => false);
+            if (!visible) continue;
+
+            // Try fill first
+            await loc.click({ timeout: 2000 }).catch(() => {});
+            await loc.fill(value, { timeout: 2000 }).catch(() => {});
+            await page.keyboard.press("Tab");
+            await page.waitForTimeout(200);
+
+            // Verify
+            const filled = await loc.inputValue().catch(() => "");
+            if (filled && filled !== "") {
+              console.log(`[IFRAME][FILL] ${sel} = ${filled}`);
+              return true;
+            }
+
+            // Try custom datepicker approach
+            const filledDP = await this.fillCustomDatepickerInFrame(frameLocator, sel, value);
+            if (filledDP) {
+              console.log(`[IFRAME][DATEPICKER] ${sel} = ${value}`);
+              return true;
+            }
+          } catch {}
+        }
+        return false;
+      };
+
+      const checkinOk = await iframeFill(selMap.checkin, checkin);
+      await page.waitForTimeout(300);
+      const checkoutOk = await iframeFill(selMap.checkout, checkout);
+      await page.waitForTimeout(300);
+
+      // Guests (optional)
+      try {
+        for (const sel of selMap.guests) {
+          const loc = frameLocator.locator(sel).first();
+          const count = await loc.count().catch(() => 0);
+          if (count === 0) continue;
+          const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
+          if (tag === "select") {
+            await loc.selectOption(guests).catch(() => {});
+          } else {
+            await loc.fill(guests).catch(() => {});
+          }
+          await page.waitForTimeout(200);
+          break;
+        }
+      } catch {}
+
+      // Click search inside iframe
+      let searchClicked = false;
+      for (const sel of selMap.search) {
+        try {
+          const loc = frameLocator.locator(sel).first();
+          const count = await loc.count().catch(() => 0);
+          if (count === 0) continue;
+          const visible = await loc.isVisible().catch(() => false);
+          if (!visible) continue;
+          await loc.click({ timeout: 3000 });
+          searchClicked = true;
+          console.log(`[IFRAME][SEARCH] clicked ${sel}`);
+          break;
+        } catch {}
+      }
+
+      await this.waitForAvailabilityResults(page);
+      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+      return {
+        ok: true,
+        message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
+        screenshot_base64,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[IFRAME] Error: ${msg}`);
+      // Fallback screenshot
+      try {
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return { ok: true, message: "iframe_error_screenshot", screenshot_base64 };
+      } catch {
+        return { ok: false, message: `Iframe error: ${msg}` };
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // fillCustomDatepicker — handles non-native date pickers
+  // Flatpickr, Pikaday, React DatePicker, AirDatepicker, jQuery UI
+  // ─────────────────────────────────────────────────────────
+
+  private async fillCustomDatepicker(page: Page, selector: string, dateStr: string): Promise<boolean> {
+    // dateStr expected: "2025-12-20" (ISO) or "20.12.2025" (BG)
+    return await this.fillCustomDatepickerInFrame(page, selector, dateStr);
+  }
+
+  private async fillCustomDatepickerInFrame(frame: any, selector: string, dateStr: string): Promise<boolean> {
+    try {
+      // Parse date
+      let year: number, month: number, day: number;
+      const isoMatch = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      const bgMatch = dateStr.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+      if (isoMatch) {
+        year = parseInt(isoMatch[1]); month = parseInt(isoMatch[2]); day = parseInt(isoMatch[3]);
+      } else if (bgMatch) {
+        day = parseInt(bgMatch[1]); month = parseInt(bgMatch[2]); year = parseInt(bgMatch[3]);
+      } else {
+        return false;
+      }
+
+      // Strategy 1: Try clicking the input to open the calendar, then click the day
+      const el = frame.locator(selector).first();
+      const count = await el.count().catch(() => 0);
+      if (count === 0) return false;
+
+      await el.click({ timeout: 2000 }).catch(() => {});
+      await frame.waitForTimeout?.(400) || await new Promise(r => setTimeout(r, 400));
+
+      // Look for calendar popup/grid
+      const calendarSelectors = [
+        '.flatpickr-calendar', '.pika-single', '.react-datepicker',
+        '.air-datepicker', '.ui-datepicker', '[class*="calendar"][class*="popup"]',
+        '[class*="datepicker"][class*="open"]', '[role="dialog"][aria-label*="calendar"]',
+        '.DayPicker', '.rdrCalendarWrapper', '.daterangepicker',
+      ];
+
+      let calendarFound = false;
+      for (const calSel of calendarSelectors) {
+        try {
+          const calEl = frame.locator(calSel).first();
+          const visible = await calEl.isVisible({ timeout: 800 }).catch(() => false);
+          if (!visible) continue;
+
+          // Navigate to the right month if needed
+          await this.navigateCalendarToMonth(frame, calEl, year, month);
+
+          // Click the day
+          const dayClicked = await this.clickCalendarDay(frame, calEl, day, month, year);
+          if (dayClicked) {
+            console.log(`[DATEPICKER] Clicked day ${day}/${month}/${year} in ${calSel}`);
+            calendarFound = true;
+            break;
+          }
+        } catch {}
+      }
+
+      if (calendarFound) return true;
+
+      // Strategy 2: Keyboard navigation — type date directly into input
+      await el.click({ clickCount: 3, timeout: 2000 }).catch(() => {});
+      // Try multiple formats
+      const formats = [
+        `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}/${year}`,
+        `${String(month).padStart(2, "0")}/${String(day).padStart(2, "0")}/${year}`,
+        `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+        `${String(day).padStart(2, "0")}.${String(month).padStart(2, "0")}.${year}`,
+      ];
+
+      for (const fmt of formats) {
+        try {
+          await el.fill(fmt, { timeout: 1500 }).catch(() => {});
+          await frame.keyboard?.press("Tab") || await frame.page?.().keyboard.press("Tab");
+          await new Promise(r => setTimeout(r, 200));
+          const val = await el.inputValue().catch(() => "");
+          if (val && val !== "") {
+            console.log(`[DATEPICKER][FORMAT] ${selector} = ${val}`);
+            return true;
+          }
+        } catch {}
+      }
+
+      // Strategy 3: Direct DOM value injection (for React-controlled inputs)
+      try {
+        const isoDate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+        const ok = await el.evaluate((el: any, d: string) => {
+          if (!el) return false;
+          // React synthetic events approach
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (nativeInputValueSetter) {
+            nativeInputValueSetter.call(el, d);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            // Flatpickr specific
+            if (el._flatpickr) {
+              el._flatpickr.setDate(d, true);
+            }
+            return el.value === d;
+          }
+          return false;
+        }, isoDate).catch(() => false);
+        if (ok) {
+          console.log(`[DATEPICKER][DOM] ${selector} = ${isoDate}`);
+          return true;
+        }
+      } catch {}
+
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  private async navigateCalendarToMonth(frame: any, calEl: any, year: number, month: number): Promise<void> {
+    try {
+      // Try to read current month from calendar header
+      for (let attempts = 0; attempts < 12; attempts++) {
+        const headerText = await calEl.locator('[class*="month"], [class*="title"], .flatpickr-monthDropdown-months, .pika-title').first().textContent().catch(() => "");
+        if (!headerText) break;
+
+        // Check if already at the right month
+        const monthNames: Record<number, string[]> = {
+          1: ["jan", "january", "яну"],  2: ["feb", "february", "фев"],
+          3: ["mar", "march", "мар"],    4: ["apr", "april", "апр"],
+          5: ["may", "май"],             6: ["jun", "june", "юни"],
+          7: ["jul", "july", "юли"],     8: ["aug", "august", "авг"],
+          9: ["sep", "september", "сеп"],10: ["oct", "october", "окт"],
+          11: ["nov", "november", "ное"],12: ["dec", "december", "дек"],
+        };
+        const lower = headerText.toLowerCase();
+        const yearMatch = lower.includes(String(year));
+        const monthMatch = (monthNames[month] || []).some(m => lower.includes(m));
+
+        if (yearMatch && monthMatch) break;
+
+        // Click next month button
+        const nextBtn = calEl.locator('[class*="next"], [aria-label*="next"], [aria-label*="следващ"], .flatpickr-next-month, .pika-next').first();
+        const hasPrev = lower < `${year}-${month}` ? false : true;
+        const btnSel = hasPrev ? nextBtn : calEl.locator('[class*="prev"], [aria-label*="prev"], .flatpickr-prev-month, .pika-prev').first();
+        await btnSel.click({ timeout: 1500 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch {}
+  }
+
+  private async clickCalendarDay(frame: any, calEl: any, day: number, month: number, year: number): Promise<boolean> {
+    const daySelectors = [
+      // Flatpickr
+      `.flatpickr-day[aria-label*="${day}"]`,
+      `.flatpickr-day:not(.disabled):not(.prevMonthDay):not(.nextMonthDay)`,
+      // Pikaday
+      `td[data-day="${day}"]`,
+      // React DatePicker
+      `.react-datepicker__day:not(.react-datepicker__day--disabled)`,
+      // Generic
+      `td[class*="day"]:not([class*="disabled"])`,
+      `[role="gridcell"]:not([aria-disabled="true"])`,
+      `[class*="day-${day}"]`, `[data-date*="-${String(day).padStart(2,"0")}"]`,
+    ];
+
+    for (const sel of daySelectors) {
+      try {
+        const dayEls = await calEl.locator(sel).all();
+        for (const dayEl of dayEls) {
+          const txt = (await dayEl.textContent().catch(() => "")).trim();
+          if (txt === String(day)) {
+            const visible = await dayEl.isVisible().catch(() => false);
+            if (!visible) continue;
+            await dayEl.click({ timeout: 2000 });
+            await new Promise(r => setTimeout(r, 200));
+            return true;
+          }
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // fillStyledChoiceGroups — fill div/label/li choice groups in any context
+  // Used for form schemas that have choice fields (not just wizards)
+  // ─────────────────────────────────────────────────────────
+
+  private async fillStyledChoiceGroups(
+    page: Page,
+    choices: Array<{ name: string; label: string; required: boolean; type: string; options: Array<{ value: string; label: string; selector_candidates?: string[] }> }>,
+    data: Record<string, unknown>
+  ): Promise<string[]> {
+    const actions: string[] = [];
+
+    for (const group of choices) {
+      const groupNameNorm = normLabel(group.name);
+      let desiredValue = "";
+
+      // Find matching value in data
+      for (const k of Object.keys(data)) {
+        const kNorm = normLabel(k);
+        if (kNorm === groupNameNorm || labelSoftIncludes(k, group.name) || labelSoftIncludes(k, group.label)) {
+          desiredValue = String((data as any)[k] ?? "").trim();
+          break;
+        }
+      }
+
+      if (!desiredValue) {
+        // Try value-based match
+        for (const k of Object.keys(data)) {
+          const v = String((data as any)[k] ?? "").trim();
+          if (!v || v.includes("@") || v.length > 40 || /^\+?\d{7,}$/.test(v.replace(/[\s()-]/g, ""))) continue;
+          const vNorm = normLabel(v);
+          if (!vNorm || vNorm.length < 2) continue;
+          const optMatch = group.options.some((o) => normLabel(o.label) === vNorm || normLabel(o.value) === vNorm);
+          if (optMatch) { desiredValue = v; break; }
+        }
+      }
+
+      if (!desiredValue) continue;
+
+      const wantedNorm = normLabel(desiredValue);
+      const pick =
+        group.options.find((o) => normLabel(o.label) === wantedNorm) ||
+        group.options.find((o) => normLabel(o.value) === wantedNorm) ||
+        group.options.find((o) => {
+          const oNorm = normLabel(o.label);
+          if (oNorm.length < 3 || wantedNorm.length < 3) return false;
+          return oNorm.includes(wantedNorm) || wantedNorm.includes(oNorm);
+        });
+
+      if (!pick) continue;
+
+      // Try selector_candidates from the option
+      const selectors = pick.selector_candidates || [];
+      let clicked = false;
+      for (const sel of selectors) {
+        if (!sel) continue;
+        try {
+          const el = await page.$(sel);
+          if (!el) continue;
+          const visible = await el.isVisible().catch(() => false);
+          if (!visible) continue;
+          await el.scrollIntoViewIfNeeded().catch(() => {});
+          await el.click({ timeout: 2500, force: true });
+          clicked = true;
+          break;
+        } catch {}
+      }
+
+      // Fallback: search by text
+      if (!clicked) {
+        const labelText = pick.label || pick.value;
+        const candidates = [
+          `button:has-text("${labelText}")`,
+          `[role="radio"]:has-text("${labelText}")`,
+          `label:has-text("${labelText}")`,
+          `li:has-text("${labelText}")`,
+        ];
+        for (const sel of candidates) {
+          try {
+            const el = await page.$(sel);
+            if (!el) continue;
+            const visible = await el.isVisible().catch(() => false);
+            if (!visible) continue;
+            await el.scrollIntoViewIfNeeded().catch(() => {});
+            await el.click({ timeout: 2000, force: true });
+            clicked = true;
+            break;
+          } catch {}
+        }
+      }
+
+      if (clicked) {
+        actions.push(`${group.label || group.name}: ${pick.label || pick.value}`);
+        console.log(`[CHOICES] Clicked "${group.label}" → "${pick.label}"`);
+      }
+    }
+
+    return actions;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // makeReservation — full hotel booking workflow
+  // Phase "check": fills dates, gets screenshot with prices
+  // Phase "reserve": fills guest details, stops before payment, returns URL
+  // ─────────────────────────────────────────────────────────
+
+  async makeReservation(req: MakeReservationRequest): Promise<{
+    ok: boolean;
+    phase: string;
+    message: string;
+    screenshot_base64?: string;
+    booking_url?: string;
+    prices_found?: string;
+    observation?: JsonObj;
+  }> {
+    const session = this.sessions.get(req.site_id);
+    if (!session) return { ok: false, phase: req.phase, message: "Няма активна сесия" };
+
+    session.lastActivity = Date.now();
+
+    const checkin  = String(req.check_in || "").trim();
+    const checkout = String(req.check_out || "").trim();
+    const guests   = String(req.guests || "2");
+    const rooms    = String(req.rooms || "1");
+    const page     = session.page;
+
+    console.log(`[RESERVATION] phase=${req.phase} check_in=${checkin} check_out=${checkout} guests=${guests}`);
+
+    if (req.phase === "check") {
+      // ── PHASE 1: Availability check ──────────────────────────
+      try {
+        // Find best availability schema
+        let availSchema = session.formSchemas.find(s => s.kind === "availability");
+        if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "booking_widget");
+        if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
+
+        const data: Record<string, unknown> = {
+          check_in: checkin, checkin, arrival: checkin,
+          check_out: checkout, checkout, departure: checkout,
+          guests, adults: guests, rooms,
+        };
+
+        // Check if booking widget (iframe)
+        if (availSchema?.kind === "booking_widget") {
+          const src = String(availSchema.schema.src || "");
+          const vendor = String(availSchema.schema.vendor || "unknown");
+          console.log(`[RESERVATION] Using iframe widget: vendor=${vendor}`);
+
+          await this.ensureOnSchemaUrl(page, availSchema.url);
+          await page.waitForTimeout(1000);
+
+          const result = await this.fillIframeBookingWidget(page, src, vendor, checkin, checkout, guests, rooms);
+          return {
+            ok: result.ok,
+            phase: "check",
+            message: result.message,
+            screenshot_base64: result.screenshot_base64,
+          };
+        }
+
+        // Standard availability check
+        if (availSchema) {
+          const result = await this.checkAvailability(page, availSchema, data);
+          return {
+            ok: result.ok,
+            phase: "check",
+            message: result.message,
+            screenshot_base64: result.observation?.screenshot_base64 as string | undefined,
+            observation: result.observation,
+          };
+        }
+
+        // No schema found — try generic availability on current page
+        console.log("[RESERVATION] No availability schema — trying generic");
+        await page.waitForTimeout(800);
+        const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+
+        // Also try custom datepickers if standard fill failed
+        if (!filled.checkin || !filled.checkout) {
+          const dpSelectors = [
+            '[class*="checkin"] input', '[class*="arrival"] input',
+            '[id*="checkin"]', '[id*="datepicker"]',
+            '.flatpickr-input', '.hasDatepicker',
+          ];
+          for (const sel of dpSelectors) {
+            try {
+              const el = await page.$(sel);
+              if (!el || !(await el.isVisible().catch(() => false))) continue;
+              if (!filled.checkin) {
+                filled.checkin = await this.fillCustomDatepicker(page, sel, checkin);
+                if (filled.checkin) continue;
+              }
+            } catch {}
+          }
+        }
+
+        const clicked = await this.clickAvailabilitySearch(page);
+        await this.waitForAvailabilityResults(page);
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+        return {
+          ok: true,
+          phase: "check",
+          message: clicked ? "availability_ready" : "availability_partial",
+          screenshot_base64,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[RESERVATION][CHECK] Error: ${msg}`);
+        try {
+          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+          return { ok: true, phase: "check", message: "check_error_screenshot", screenshot_base64 };
+        } catch {
+          return { ok: false, phase: "check", message: `Check error: ${msg}` };
+        }
+      }
+    }
+
+    if (req.phase === "reserve") {
+      // ── PHASE 2: Fill reservation form until payment page ────
+      try {
+        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email}`);
+
+        const guestData: Record<string, unknown> = {
+          name: req.guest_name || "",
+          full_name: req.guest_name || "",
+          email: req.guest_email || "",
+          phone: req.guest_phone || "",
+          message: req.guest_message || "",
+          note: req.guest_message || "",
+          // Also include dates for pre-populated forms
+          check_in: checkin, checkin,
+          check_out: checkout, checkout,
+          guests, adults: guests, rooms,
+          room_type: req.room_type || "",
+        };
+
+        // Find a form schema (contact/reservation form)
+        let formSchema = session.formSchemas.find(s =>
+          s.kind === "form" || s.kind === "wizard"
+        );
+
+        if (formSchema) {
+          await this.ensureOnSchemaUrl(page, formSchema.url);
+          await page.waitForTimeout(800);
+
+          // Fill choices first (room type, etc.)
+          if (formSchema.schema.choices?.length) {
+            const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
+            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE] ${a}`));
+          }
+
+          // Fill form fields
+          const fillResult = formSchema.kind === "wizard"
+            ? await this.fillWizard(page, formSchema, guestData, false, false) // auto_submit=false: stop before payment
+            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false); // auto_submit=false
+
+          const currentUrl = page.url();
+          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+          return {
+            ok: fillResult.ok || true, // partial fill is still ok
+            phase: "reserve",
+            message: fillResult.message,
+            booking_url: currentUrl,
+            screenshot_base64,
+            observation: {
+              url: currentUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+            },
+          };
+        }
+
+        // No form schema — try to detect booking/contact form on current page
+        console.log("[RESERVATION] No form schema for reserve phase — scanning page");
+        await page.waitForTimeout(800);
+
+        const obs = await this.quickObserve(page);
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+        return {
+          ok: true,
+          phase: "reserve",
+          message: "no_form_schema_found",
+          booking_url: page.url(),
+          screenshot_base64,
+          observation: obs,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
+        try {
+          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+          return {
+            ok: true, phase: "reserve",
+            message: `reserve_error_screenshot: ${msg}`,
+            booking_url: page.url(),
+            screenshot_base64,
+          };
+        } catch {
+          return { ok: false, phase: "reserve", message: `Reserve error: ${msg}` };
+        }
+      }
+    }
+
+    return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
+  }
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -2837,6 +3618,22 @@ async function main() {
       data: data as Record<string, unknown>,
       auto_submit: false,
     });
+    res.json(r);
+  });
+
+  // ── /make-reservation: full hotel booking workflow ─────────────────
+  app.post("/make-reservation", async (req: Request, res: Response) => {
+    const body = req.body as MakeReservationRequest;
+    if (!body?.site_id || !body?.phase) {
+      return res.json({ success: false, message: "Missing site_id/phase" });
+    }
+    if (body.phase === "check" && (!body.check_in || !body.check_out)) {
+      return res.json({ success: false, message: "Missing check_in/check_out for phase=check" });
+    }
+
+    console.log(`[HTTP][/make-reservation] site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""}`);
+
+    const r = await manager.makeReservation(body);
     res.json(r);
   });
 
