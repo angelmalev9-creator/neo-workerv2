@@ -2539,10 +2539,28 @@ class HotSessionManager {
       await page.waitForTimeout(1200);
 
       // ── 3. Try to fill date fields universally ─────────────────
-      const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+      const filled = await this.fillAvailabilityDates(page, schema, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
-      // ── 4. Click Search / Check button ────────────────────────
+         // ── 4. Click Search / Check button ────────────────────────
+      const nothingFilled = !filled.checkin && !filled.checkout && !filled.guests;
+      if (nothingFilled) {
+        console.log("[AVAIL] abort: no availability fields were filled");
+        return {
+          ok: false,
+          message: "availability_fields_not_filled",
+          observation: {
+            type: "availability_check",
+            check_in: checkin,
+            check_out: checkout,
+            guests,
+            rooms,
+            url: page.url(),
+            fill_result: filled,
+          },
+        };
+      }
+
       const clicked = await this.clickAvailabilitySearch(page);
       console.log(`[AVAIL] clickSearch=${clicked}`);
 
@@ -2612,8 +2630,9 @@ class HotSessionManager {
     return "";
   }
 
-  private async fillAvailabilityDates(
+    private async fillAvailabilityDates(
     page: Page,
+    schema: FormSchemaRow,
     checkin: string,
     checkout: string,
     guests: string,
@@ -2621,8 +2640,50 @@ class HotSessionManager {
   ): Promise<{ checkin: boolean; checkout: boolean; guests: boolean }> {
     const result = { checkin: false, checkout: false, guests: false };
 
-    // ── Date input selectors (ordered by specificity) ──────────
+    const schemaFields = Array.isArray(schema?.schema?.fields) ? schema.schema.fields : [];
+
+    const pickSchemaSelectors = (keywords: string[]): string[] => {
+      const out: string[] = [];
+
+      for (const f of schemaFields) {
+        const hay = [
+          f?.name || "",
+          f?.label || "",
+          f?.placeholder || "",
+          f?.aria_label || "",
+          f?.type || "",
+          f?.autocomplete || "",
+        ].join(" ").toLowerCase();
+
+        if (!keywords.some((k) => hay.includes(k))) continue;
+
+        for (const sel of Array.isArray(f?.selector_candidates) ? f.selector_candidates : []) {
+          const s = String(sel || "").trim();
+          if (s && !out.includes(s)) out.push(s);
+        }
+      }
+
+      return out;
+    };
+
+    const schemaCheckinSelectors = pickSchemaSelectors([
+      "check_in", "checkin", "check-in", "arrival", "from", "date_from", "пристигане", "от"
+    ]);
+    const schemaCheckoutSelectors = pickSchemaSelectors([
+      "check_out", "checkout", "check-out", "departure", "to", "date_to", "заминаване", "до"
+    ]);
+    const schemaGuestSelectors = pickSchemaSelectors([
+      "guest", "guests", "adult", "adults", "person", "pax", "възрастни", "гости"
+    ]);
+
+    console.log("[AVAIL][SCHEMA] url=", schema?.url || "");
+    console.log("[AVAIL][SCHEMA] checkin selectors=", JSON.stringify(schemaCheckinSelectors));
+    console.log("[AVAIL][SCHEMA] checkout selectors=", JSON.stringify(schemaCheckoutSelectors));
+    console.log("[AVAIL][SCHEMA] guest selectors=", JSON.stringify(schemaGuestSelectors));
+
+    // ── Date input selectors (schema first, then generic fallback) ──────────
     const checkinSelectors = [
+      ...schemaCheckinSelectors,
       'input[name*="check_in"]', 'input[name*="checkin"]', 'input[name*="check-in"]',
       'input[name*="arrival"]', 'input[name*="from"]', 'input[name*="date_from"]',
       'input[name*="start"]', 'input[id*="check_in"]', 'input[id*="checkin"]',
@@ -2632,6 +2693,7 @@ class HotSessionManager {
       '[data-testid*="checkin"]', '[data-testid*="check-in"]', '[data-testid*="arrival"]',
     ];
     const checkoutSelectors = [
+      ...schemaCheckoutSelectors,
       'input[name*="check_out"]', 'input[name*="checkout"]', 'input[name*="check-out"]',
       'input[name*="departure"]', 'input[name*="to"]', 'input[name*="date_to"]',
       'input[name*="end"]', 'input[id*="check_out"]', 'input[id*="checkout"]',
@@ -2641,13 +2703,13 @@ class HotSessionManager {
       '[data-testid*="checkout"]', '[data-testid*="check-out"]', '[data-testid*="departure"]',
     ];
     const guestSelectors = [
+      ...schemaGuestSelectors,
       'input[name*="guest"]', 'input[name*="adult"]', 'input[name*="person"]',
       'input[name*="pax"]', 'input[id*="guest"]', 'input[id*="adult"]',
       'select[name*="guest"]', 'select[name*="adult"]', 'select[id*="guest"]',
       'input[placeholder*="Guests"]', 'input[placeholder*="Adults"]',
       'input[placeholder*="Гости"]', 'input[placeholder*="Възрастни"]',
     ];
-
     // Helper: try to fill a date input
     const tryFillDate = async (selectors: string[], value: string): Promise<boolean> => {
       for (const sel of selectors) {
@@ -3416,7 +3478,23 @@ class HotSessionManager {
         // No schema found — try generic availability on current page
         console.log("[RESERVATION] No availability schema — trying generic");
         await page.waitForTimeout(800);
-        const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+        const filled = await this.fillAvailabilityDates(
+          page,
+          availSchema || ({
+            id: "",
+            session_id: "",
+            url: page.url(),
+            domain: "",
+            kind: "availability",
+            fingerprint: "",
+            schema: {},
+            dom_snapshot: null,
+          } as FormSchemaRow),
+          checkin,
+          checkout,
+          guests,
+          rooms
+        );
 
         // Also try custom datepickers if standard fill failed
         if (!filled.checkin || !filled.checkout) {
@@ -3664,8 +3742,7 @@ async function main() {
       return res.json({ success: false, message: "Missing check_in/check_out for phase=check" });
     }
 
-        console.log(`[HTTP][/make-reservation] HIT site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""} guests=${body.guests || ""} session_id=${body.session_id || ""}`);
-
+           console.log(`[HTTP][/make-reservation] HIT site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""} guests=${body.guests || ""} session_id=${body.session_id || ""}`);
     const r = await manager.makeReservation(body);
     res.json(r);
   });
