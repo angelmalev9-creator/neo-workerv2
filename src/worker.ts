@@ -3571,11 +3571,44 @@ async function main() {
   });
 
   app.get("/", (_, res) => {
-    res.json({ name: "NEO Worker", version: "6.1.0-universal-choices", mode: "schema-first" });
+    res.json({
+      name: "NEO Worker",
+      version: "7.0.0-booking",
+      build: "neo-worker_v7_make_reservation",
+      mode: "schema-first",
+      has_make_reservation: true
+    });
   });
 
-  app.get("/health", (_, res) => {
-    res.json({ status: "ok", ...manager.getStatus() });
+   app.get("/health", (_, res) => {
+    res.json({
+      status: "ok",
+      version: "7.0.0-booking",
+      build: "neo-worker_v7_make_reservation",
+      has_make_reservation: true,
+      ...manager.getStatus()
+    });
+  });
+
+  app.get("/__routes", (_, res) => {
+    res.json({
+      success: true,
+      version: "7.0.0-booking",
+      build: "neo-worker_v7_make_reservation",
+      routes: [
+        "GET /",
+        "GET /health",
+        "GET /__routes",
+        "POST /prepare-session",
+        "POST /fill-form",
+        "POST /check-availability",
+        "POST /make-reservation",
+        "POST /execute",
+        "GET /forms/:sessionId",
+        "POST /refresh-forms",
+        "POST /close-session"
+      ]
+    });
   });
 
   app.post("/prepare-session", async (req: Request, res: Response) => {
@@ -3631,7 +3664,7 @@ async function main() {
       return res.json({ success: false, message: "Missing check_in/check_out for phase=check" });
     }
 
-    console.log(`[HTTP][/make-reservation] site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""}`);
+        console.log(`[HTTP][/make-reservation] HIT site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""} guests=${body.guests || ""} session_id=${body.session_id || ""}`);
 
     const r = await manager.makeReservation(body);
     res.json(r);
@@ -3676,7 +3709,9 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v6.1.0-universal-choices listening on :${PORT}`);
+    console.log(`🚀 NEO Worker v7.0.0-booking listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v7_make_reservation port=${PORT}`);
+    console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
   await manager.start();
