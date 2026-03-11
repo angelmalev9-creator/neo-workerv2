@@ -2539,7 +2539,7 @@ class HotSessionManager {
       await page.waitForTimeout(1200);
 
       // ── 3. Try to fill date fields universally ─────────────────
-      const filled = await this.fillAvailabilityDates(page, schema, checkin, checkout, guests, rooms);
+    const filled = await this.fillAvailabilityDates(page, availSchema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
          // ── 4. Click Search / Check button ────────────────────────
