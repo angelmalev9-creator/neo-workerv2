@@ -2654,9 +2654,15 @@ class HotSessionManager {
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
          // ── 4. Click Search / Check button ────────────────────────
-      const nothingFilled = !filled.checkin && !filled.checkout && !filled.guests;
-      if (nothingFilled) {
-        console.log("[AVAIL] abort: no availability fields were filled");
+         const requiredFilled =
+        filled.checkin &&
+        filled.checkout &&
+        (!schemaRequiresGuests || filled.guests);
+
+      if (!requiredFilled) {
+        console.log(
+          `[AVAIL] abort: required availability fields not filled checkin=${filled.checkin} checkout=${filled.checkout} guests=${filled.guests} schemaRequiresGuests=${schemaRequiresGuests}`
+        );
         return {
           ok: false,
           message: "availability_fields_not_filled",
@@ -2668,10 +2674,10 @@ class HotSessionManager {
             rooms,
             url: page.url(),
             fill_result: filled,
+            schema_requires_guests: schemaRequiresGuests,
           },
         };
       }
-
       const clicked = await this.clickAvailabilitySearch(page);
       console.log(`[AVAIL] clickSearch=${clicked}`);
 
@@ -2749,9 +2755,23 @@ class HotSessionManager {
     guests: string,
     rooms: string
   ): Promise<{ checkin: boolean; checkout: boolean; guests: boolean }> {
-    const result = { checkin: false, checkout: false, guests: false };
+      const result = { checkin: false, checkout: false, guests: false };
 
-    const schemaFields = Array.isArray(schema?.schema?.fields) ? schema.schema.fields : [];
+    const schemaAny: any = schema?.schema || {};
+    const schemaFields = Array.isArray(schemaAny?.fields) ? schemaAny.fields : [];
+    const schemaDateInputs = Array.isArray(schemaAny?.date_inputs) ? schemaAny.date_inputs : [];
+    const schemaGuestFields = Array.isArray(schemaAny?.guest_fields) ? schemaAny.guest_fields : [];
+
+    const collectSelectors = (items: any[]): string[] => {
+      const out: string[] = [];
+      for (const item of items) {
+        for (const sel of Array.isArray(item?.selector_candidates) ? item.selector_candidates : []) {
+          const s = String(sel || "").trim();
+          if (s && !out.includes(s)) out.push(s);
+        }
+      }
+      return out;
+    };
 
     const pickSchemaSelectors = (keywords: string[]): string[] => {
       const out: string[] = [];
@@ -2777,20 +2797,47 @@ class HotSessionManager {
       return out;
     };
 
-    const schemaCheckinSelectors = pickSchemaSelectors([
-      "check_in", "checkin", "check-in", "arrival", "from", "date_from", "пристигане", "от"
-    ]);
-    const schemaCheckoutSelectors = pickSchemaSelectors([
-      "check_out", "checkout", "check-out", "departure", "to", "date_to", "заминаване", "до"
-    ]);
-    const schemaGuestSelectors = pickSchemaSelectors([
-      "guest", "guests", "adult", "adults", "person", "pax", "възрастни", "гости"
-    ]);
+    const schemaCheckinSelectors = [
+      ...collectSelectors(
+        schemaDateInputs.filter((f: any) => {
+          const hay = `${f?.name || ""} ${f?.label || ""} ${f?.text || ""}`.toLowerCase();
+          return ["check_in", "checkin", "check-in", "arrival", "from", "date_from", "пристигане", "от"].some((k) => hay.includes(k));
+        })
+      ),
+      ...pickSchemaSelectors([
+        "check_in", "checkin", "check-in", "arrival", "from", "date_from", "пристигане", "от"
+      ]),
+    ];
+
+    const schemaCheckoutSelectors = [
+      ...collectSelectors(
+        schemaDateInputs.filter((f: any) => {
+          const hay = `${f?.name || ""} ${f?.label || ""} ${f?.text || ""}`.toLowerCase();
+          return ["check_out", "checkout", "check-out", "departure", "to", "date_to", "заминаване", "до"].some((k) => hay.includes(k));
+        })
+      ),
+      ...pickSchemaSelectors([
+        "check_out", "checkout", "check-out", "departure", "to", "date_to", "заминаване", "до"
+      ]),
+    ];
+
+    const schemaGuestSelectors = [
+      ...collectSelectors(schemaGuestFields),
+      ...pickSchemaSelectors([
+        "guest", "guests", "adult", "adults", "person", "pax", "възрастни", "гости"
+      ]),
+    ];
+
+    const schemaRequiresGuests =
+      schemaGuestFields.length > 0 ||
+      schemaGuestSelectors.length > 0 ||
+      !!schemaAny?.detected_fields?.guests;
 
     console.log("[AVAIL][SCHEMA] url=", schema?.url || "");
     console.log("[AVAIL][SCHEMA] checkin selectors=", JSON.stringify(schemaCheckinSelectors));
     console.log("[AVAIL][SCHEMA] checkout selectors=", JSON.stringify(schemaCheckoutSelectors));
     console.log("[AVAIL][SCHEMA] guest selectors=", JSON.stringify(schemaGuestSelectors));
+    console.log("[AVAIL][SCHEMA] requiresGuests=", schemaRequiresGuests);
 
     // ── Date input selectors (schema first, then generic fallback) ──────────
     const checkinSelectors = [
@@ -2813,14 +2860,16 @@ class HotSessionManager {
       'input[placeholder*="Заминаване"]', 'input[placeholder*="До"]',
       '[data-testid*="checkout"]', '[data-testid*="check-out"]', '[data-testid*="departure"]',
     ];
-    const guestSelectors = [
-      ...schemaGuestSelectors,
-      'input[name*="guest"]', 'input[name*="adult"]', 'input[name*="person"]',
-      'input[name*="pax"]', 'input[id*="guest"]', 'input[id*="adult"]',
-      'select[name*="guest"]', 'select[name*="adult"]', 'select[id*="guest"]',
-      'input[placeholder*="Guests"]', 'input[placeholder*="Adults"]',
-      'input[placeholder*="Гости"]', 'input[placeholder*="Възрастни"]',
-    ];
+    const guestSelectors = schemaRequiresGuests
+      ? [
+          ...schemaGuestSelectors,
+          'input[name*="guest"]', 'input[name*="adult"]', 'input[name*="person"]',
+          'input[name*="pax"]', 'input[id*="guest"]', 'input[id*="adult"]',
+          'select[name*="guest"]', 'select[name*="adult"]', 'select[id*="guest"]',
+          'input[placeholder*="Guests"]', 'input[placeholder*="Adults"]',
+          'input[placeholder*="Гости"]', 'input[placeholder*="Възрастни"]',
+        ]
+      : [];
     // Helper: try to fill a date input
     const tryFillDate = async (selectors: string[], value: string): Promise<boolean> => {
       for (const sel of selectors) {
