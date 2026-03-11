@@ -2501,11 +2501,72 @@ class HotSessionManager {
     return this.loadFormSchemas(sessionId);
   }
 
-  getSessionByDbSessionId(dbSessionId: string): HotSession | null {
+   getSessionByDbSessionId(dbSessionId: string): HotSession | null {
     for (const [, s] of this.sessions) {
       if (s.sessionId === dbSessionId) return s;
     }
     return null;
+  }
+
+  private pickBestAvailabilitySchema(schemas: FormSchemaRow[]): FormSchemaRow | undefined {
+    const rows = Array.isArray(schemas) ? schemas : [];
+
+    const score = (s: FormSchemaRow): number => {
+      let points = 0;
+
+      const kind = String(s?.kind || "").toLowerCase();
+      const url = String(s?.url || "").toLowerCase();
+      const uiType = String((s?.schema as any)?.ui_type || "").toLowerCase();
+      const vendor = String((s?.schema as any)?.booking_vendor || (s?.schema as any)?.vendor || "").toLowerCase();
+      const iframeSrc = String((s?.schema as any)?.iframe_src || (s?.schema as any)?.src || "");
+      const dateInputs = Array.isArray((s?.schema as any)?.date_inputs) ? (s?.schema as any)?.date_inputs : [];
+      const guestFields = Array.isArray((s?.schema as any)?.guest_fields) ? (s?.schema as any)?.guest_fields : [];
+      const actionButtons = Array.isArray((s?.schema as any)?.action_buttons) ? (s?.schema as any)?.action_buttons : [];
+      const fields = Array.isArray((s?.schema as any)?.fields) ? (s?.schema as any)?.fields : [];
+
+      if (kind === "availability") points += 100;
+      if (kind === "booking_widget") points += 120;
+
+      if (uiType.includes("iframe_booking_widget")) points += 220;
+      if (vendor.includes("quendoo")) points += 160;
+      if (iframeSrc.includes("quendoo")) points += 160;
+
+      if (url.includes("/accommodation")) points += 120;
+      if (url.includes("/room/")) points += 80;
+      if (url === "https://jasminhotel.com/" || url.endsWith("//")) points -= 20;
+      if (url.includes("/contact")) points -= 200;
+
+      points += Math.min(dateInputs.length * 10, 40);
+      points += Math.min(guestFields.length * 10, 30);
+      points += Math.min(actionButtons.length * 8, 24);
+      points += Math.min(fields.length * 2, 20);
+
+      return points;
+    };
+
+    const candidates = rows
+      .filter((s) => ["availability", "booking_widget", "form", "wizard"].includes(String(s?.kind || "").toLowerCase()))
+      .map((s) => ({ s, score: score(s) }))
+      .sort((a, b) => b.score - a.score);
+
+    if (candidates.length) {
+      console.log(
+        "[RESERVATION][SCHEMA-RANKING]",
+        JSON.stringify(
+          candidates.slice(0, 8).map((x) => ({
+            url: x.s.url,
+            kind: x.s.kind,
+            ui_type: (x.s.schema as any)?.ui_type || "",
+            booking_vendor: (x.s.schema as any)?.booking_vendor || (x.s.schema as any)?.vendor || "",
+            score: x.score,
+          })),
+          null,
+          2
+        )
+      );
+    }
+
+    return candidates[0]?.s;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -2530,16 +2591,66 @@ class HotSessionManager {
 
       console.log(`[AVAIL] check_in=${checkin} check_out=${checkout} guests=${guests} rooms=${rooms}`);
 
-      if (!checkin || !checkout) {
+           if (!checkin || !checkout) {
         return { ok: false, message: "Липсват дати за проверка на наличност" };
       }
 
-      // ── 2. Navigate to availability URL ───────────────────────
+      const schemaAny: any = schema?.schema || {};
+      const uiType = String(schemaAny?.ui_type || "").toLowerCase();
+      const iframeSrc = String(schemaAny?.iframe_src || schemaAny?.src || "");
+      const vendor = String(schemaAny?.booking_vendor || schemaAny?.vendor || "unknown");
+
+      const isIframeAvailability =
+        uiType.includes("iframe_booking_widget") ||
+        !!iframeSrc ||
+        String(vendor).toLowerCase().includes("quendoo");
+
+      // ── 2. Schema-first iframe availability flow ───────────────
+      if (isIframeAvailability) {
+        console.log(`[AVAIL] iframe schema detected ui_type=${uiType} vendor=${vendor} url=${schema.url}`);
+
+        await this.ensureOnSchemaUrl(page, schema.url);
+        await page.waitForTimeout(1200);
+
+        const iframeResult = await this.fillIframeBookingWidget(
+          page,
+          iframeSrc,
+          vendor,
+          checkin,
+          checkout,
+          guests,
+          rooms
+        );
+
+        return {
+          ok: iframeResult.ok,
+          message: iframeResult.message,
+          observation: {
+            type: "availability_check",
+            check_in: checkin,
+            check_out: checkout,
+            guests,
+            rooms,
+            screenshot_base64: iframeResult.screenshot_base64,
+            url: page.url(),
+            iframe_src: iframeSrc,
+            vendor,
+            fill_result: {
+              checkin: true,
+              checkout: true,
+              guests: true,
+            },
+            search_clicked: true,
+          },
+        };
+      }
+
+      // ── 3. Navigate to availability URL ───────────────────────
       await this.ensureOnSchemaUrl(page, schema.url);
       await page.waitForTimeout(1200);
 
-      // ── 3. Try to fill date fields universally ─────────────────
-    const filled = await this.fillAvailabilityDates(page, availSchema as any, checkin, checkout, guests, rooms);
+      // ── 4. Try to fill date fields universally ─────────────────
+      const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
          // ── 4. Click Search / Check button ────────────────────────
@@ -3434,7 +3545,7 @@ class HotSessionManager {
     if (req.phase === "check") {
       // ── PHASE 1: Availability check ──────────────────────────
       try {
-        // Find best availability schema
+        // Find availability schema
         let availSchema = session.formSchemas.find(s => s.kind === "availability");
         if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "booking_widget");
         if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
@@ -3445,21 +3556,50 @@ class HotSessionManager {
           guests, adults: guests, rooms,
         };
 
-        // Check if booking widget (iframe)
-        if (availSchema?.kind === "booking_widget") {
-          const src = String(availSchema.schema.src || "");
-          const vendor = String(availSchema.schema.vendor || "unknown");
-          console.log(`[RESERVATION] Using iframe widget: vendor=${vendor}`);
+        const schemaAny: any = availSchema?.schema || {};
+        const uiType = String(schemaAny?.ui_type || "").toLowerCase();
+        const iframeSrc = String(schemaAny?.iframe_src || schemaAny?.src || "");
+        const vendor = String(schemaAny?.booking_vendor || schemaAny?.vendor || "unknown");
+
+        const isIframeAvailability =
+          uiType.includes("iframe_booking_widget") ||
+          !!iframeSrc ||
+          String(vendor).toLowerCase().includes("quendoo");
+
+        // Schema-first iframe flow
+        if (availSchema && isIframeAvailability) {
+          console.log(
+            `[RESERVATION] Using availability iframe schema ui_type=${uiType} vendor=${vendor} url=${availSchema.url}`
+          );
 
           await this.ensureOnSchemaUrl(page, availSchema.url);
           await page.waitForTimeout(1000);
 
-          const result = await this.fillIframeBookingWidget(page, src, vendor, checkin, checkout, guests, rooms);
+          const result = await this.fillIframeBookingWidget(
+            page,
+            iframeSrc,
+            vendor,
+            checkin,
+            checkout,
+            guests,
+            rooms
+          );
+
           return {
             ok: result.ok,
             phase: "check",
             message: result.message,
             screenshot_base64: result.screenshot_base64,
+            observation: {
+              type: "availability_iframe_check",
+              check_in: checkin,
+              check_out: checkout,
+              guests,
+              rooms,
+              url: page.url(),
+              iframe_src: iframeSrc,
+              vendor,
+            },
           };
         }
 
