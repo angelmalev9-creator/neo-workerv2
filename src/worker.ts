@@ -2942,7 +2942,7 @@ class HotSessionManager {
       if (!frameLocator) {
         console.log("[IFRAME] Could not locate iframe, falling back to main page");
         // Fall back to main page availability check
-        const filled = await this.fillAvailabilityDates(page, checkin, checkout, guests, rooms);
+        this.fillAvailabilityDates(page, schema, checkin, checkout, guests, rooms)
         const clicked = await this.clickAvailabilitySearch(page);
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
