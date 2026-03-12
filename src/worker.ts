@@ -3161,7 +3161,7 @@ class HotSessionManager {
 
       // Locate the iframe
       let frameLocator: any = null;
-        const iframeSelectors = [
+             const iframeSelectors = [
         iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
         `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
         "iframe",
