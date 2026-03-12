@@ -4042,7 +4042,7 @@ rooms: rooms,
         const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
-        return {
+               return {
           ok: true,
           phase: "reserve",
           message: "no_form_schema_found_current_step_preserved",
