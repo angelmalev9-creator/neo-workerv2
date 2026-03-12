@@ -2653,8 +2653,13 @@ class HotSessionManager {
       const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
-         // ── 4. Click Search / Check button ────────────────────────
-         const requiredFilled =
+      const schemaGuestFields = Array.isArray(schemaAny?.guest_fields) ? schemaAny.guest_fields : [];
+      const schemaRequiresGuests =
+        schemaGuestFields.length > 0 ||
+        !!schemaAny?.detected_fields?.guests;
+
+      // ── 4. Click Search / Check button ────────────────────────
+      const requiredFilled =
         filled.checkin &&
         filled.checkout &&
         (!schemaRequiresGuests || filled.guests);
@@ -3098,11 +3103,26 @@ class HotSessionManager {
           break;
         } catch {}
       }
-
       if (!frameLocator) {
         console.log("[IFRAME] Could not locate iframe, falling back to main page");
         // Fall back to main page availability check
-        this.fillAvailabilityDates(page, availSchema as any, checkin, checkout, guests, rooms)
+        await this.fillAvailabilityDates(
+          page,
+          {
+            id: "",
+            session_id: "",
+            url: page.url(),
+            domain: "",
+            kind: "availability",
+            fingerprint: "",
+            schema: {},
+            dom_snapshot: null,
+          } as FormSchemaRow,
+          checkin,
+          checkout,
+          guests,
+          rooms
+        );
         const clicked = await this.clickAvailabilitySearch(page);
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
