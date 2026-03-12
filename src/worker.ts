@@ -4027,27 +4027,6 @@ rooms: rooms,
               finalized: false,
             },
           };
-          }
-
-                          return {
-            ok: !!fillResult?.ok,
-            phase: "reserve",
-            message: fillResult.message,
-            booking_url: currentUrl,
-            screenshot_base64,
-            observation: {
-              url: currentUrl,
-              before_url: beforeUrl,
-              fill_message: fillResult.message,
-              confirmed_price: req.confirmed_price || "",
-              room_type: req.room_type || "",
-              current_step: "reserve",
-              missing_required: [],
-              can_continue: true,
-              payment_required: false,
-              finalized: false,
-            },
-          };
         }
 
         console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
