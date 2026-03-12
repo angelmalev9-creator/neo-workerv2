@@ -3761,35 +3761,43 @@ class HotSessionManager {
             choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
           }
 
-          let fillResult = formSchema.kind === "wizard"
+          const fillResult = formSchema.kind === "wizard"
             ? await this.fillWizard(page, formSchema, guestData, false, false)
             : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+
+          const currentUrl = page.url();
+          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
           const noMatchOnCurrentPage =
             !fillResult?.ok &&
             String(fillResult?.message || "").toLowerCase().includes("no_match");
 
           if (noMatchOnCurrentPage) {
-            console.log(`[RESERVATION][RESERVE] no matched fields on current step, fallback to schema url=${formSchema.url}`);
+            console.log("[RESERVATION][RESERVE] no matched fields on current step — keeping current page, not navigating back");
 
-            await this.ensureOnSchemaUrl(page, formSchema.url);
-            await page.waitForTimeout(800);
-
-            if (formSchema.schema.choices?.length) {
-              const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
-              choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][FALLBACK] ${a}`));
-            }
-
-            fillResult = formSchema.kind === "wizard"
-              ? await this.fillWizard(page, formSchema, guestData, false, false)
-              : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+            const missingRequired = ["current_booking_step_fields"];
+            return {
+              ok: false,
+              phase: "reserve",
+              message: "reserve_current_step_needs_input",
+              booking_url: "",
+              screenshot_base64,
+              observation: {
+                url: currentUrl,
+                before_url: beforeUrl,
+                fill_message: fillResult.message,
+                confirmed_price: req.confirmed_price || "",
+                current_step: "reserve",
+                missing_required: missingRequired,
+                can_continue: false,
+                payment_required: false,
+                finalized: false,
+              },
+            };
           }
 
-          const currentUrl = page.url();
-          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-
           return {
-            ok: fillResult.ok || !!currentUrl,
+            ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
             booking_url: currentUrl,
@@ -3799,6 +3807,11 @@ class HotSessionManager {
               before_url: beforeUrl,
               fill_message: fillResult.message,
               confirmed_price: req.confirmed_price || "",
+              current_step: "reserve",
+              missing_required: [],
+              can_continue: true,
+              payment_required: false,
+              finalized: false,
             },
           };
         }
