@@ -4004,31 +4004,10 @@ rooms: rooms,
                 payment_required: stepNeedsAfterFill.payment_required,
                 finalized: false,
               },
-            };
-          }
-
-                   return {
-            ok: !!fillResult?.ok,
-            phase: "reserve",
-            message: fillResult.message,
-            booking_url: currentUrl,
-            screenshot_base64,
-            observation: {
-              url: currentUrl,
-              before_url: beforeUrl,
-              fill_message: fillResult.message,
-              confirmed_price: req.confirmed_price || "",
-              room_type: req.room_type || "",
-              current_step: stepNeedsAfterFill.current_step,
-              missing_required: [],
-              can_continue: true,
-              payment_required: stepNeedsAfterFill.payment_required,
-              finalized: false,
-            },
           };
         }
 
-        console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
+        // No form schema — keep current booking step and return continuation state
         await page.waitForTimeout(800);
 
         const obs = await this.quickObserve(page);
