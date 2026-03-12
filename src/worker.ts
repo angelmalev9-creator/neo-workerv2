@@ -3600,9 +3600,11 @@ class HotSessionManager {
         if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
         const data: Record<string, unknown> = {
-          check_in: checkin, checkin, arrival: checkin,
-          check_out: checkout, checkout, departure: checkout,
-          guests, adults: guests, rooms,
+         check_in: checkin,
+check_out: checkout,
+guests: guests,
+adults: guests,
+rooms: rooms,
         };
 
         const schemaAny: any = availSchema?.schema || {};
@@ -3756,14 +3758,14 @@ class HotSessionManager {
           roomSelectionAttempted = true;
 
           const roomNeedle = String(req.room_type).trim().toLowerCase();
-          const roomPatterns = [
-            `text=/${roomNeedle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/i`,
-            `button:has-text("${req.room_type}")`,
-            `[role="button"]:has-text("${req.room_type}")`,
-            `a:has-text("${req.room_type}")`,
-            `label:has-text("${req.room_type}")`,
-            `div:has-text("${req.room_type}")`,
-          ];
+         const roomPatterns = [
+  `button:has-text("${req.room_type}")`,
+  `[role="button"]:has-text("${req.room_type}")`,
+  `a:has-text("${req.room_type}")`,
+  `label:has-text("${req.room_type}")`,
+  `div:has-text("${req.room_type}")`,
+  `li:has-text("${req.room_type}")`,
+];
 
           for (const sel of roomPatterns) {
             try {
