@@ -3883,7 +3883,7 @@ rooms: rooms,
             };
           }
 
-          return {
+                  return {
             ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
@@ -3902,7 +3902,8 @@ rooms: rooms,
               finalized: false,
             },
           };
-       
+        }
+
         console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
         await page.waitForTimeout(800);
 
