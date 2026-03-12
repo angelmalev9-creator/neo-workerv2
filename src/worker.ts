@@ -3823,9 +3823,11 @@ rooms: rooms,
     }
 
     if (req.phase === "reserve") {
-      // ── PHASE 2: Fill reservation form until payment page ────
+      // ── PHASE 2: continue booking step-by-step ────
       try {
-               console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
+        console.log(
+          `[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`
+        );
 
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
@@ -3834,11 +3836,11 @@ rooms: rooms,
           phone: req.guest_phone || "",
           message: req.guest_message || "",
           note: req.guest_message || "",
-        check_in: checkin,
-check_out: checkout,
-guests: guests,
-adults: guests,
-rooms: rooms,
+          check_in: checkin,
+          check_out: checkout,
+          guests: guests,
+          adults: guests,
+          rooms: rooms,
           room_type: req.room_type || "",
         };
 
@@ -3853,15 +3855,14 @@ rooms: rooms,
         if (req.room_type) {
           roomSelectionAttempted = true;
 
-          const roomNeedle = String(req.room_type).trim().toLowerCase();
-        const roomPatterns = [
-  `button:has-text("${req.room_type}")`,
-  `[role="button"]:has-text("${req.room_type}")`,
-  `a:has-text("${req.room_type}")`,
-  `label:has-text("${req.room_type}")`,
-  `div:has-text("${req.room_type}")`,
-  `li:has-text("${req.room_type}")`,
-];
+          const roomPatterns = [
+            `button:has-text("${req.room_type}")`,
+            `[role="button"]:has-text("${req.room_type}")`,
+            `a:has-text("${req.room_type}")`,
+            `label:has-text("${req.room_type}")`,
+            `div:has-text("${req.room_type}")`,
+            `li:has-text("${req.room_type}")`,
+          ];
 
           for (const sel of roomPatterns) {
             try {
@@ -3900,7 +3901,7 @@ rooms: rooms,
           }
         }
 
-               const currentUrlAfterRoom = page.url();
+        const currentUrlAfterRoom = page.url();
         const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
         const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
 
@@ -3931,20 +3932,26 @@ rooms: rooms,
             },
           };
         }
+
         // STEP 3: only now try to fill personal data on the CURRENT page/state
-        let formSchema = session.formSchemas.find(s =>
-          s.kind === "form" || s.kind === "wizard"
+        const formSchema = session.formSchemas.find(
+          (s) => s.kind === "form" || s.kind === "wizard"
         );
 
         if (formSchema) {
           if (formSchema.schema.choices?.length) {
-            const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
-            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
+            const choiceActions = await this.fillStyledChoiceGroups(
+              page,
+              formSchema.schema.choices,
+              guestData
+            );
+            choiceActions.forEach((a) => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
           }
 
-          const fillResult = formSchema.kind === "wizard"
-            ? await this.fillWizard(page, formSchema, guestData, false, false)
-            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+          const fillResult =
+            formSchema.kind === "wizard"
+              ? await this.fillWizard(page, formSchema, guestData, false, false)
+              : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
 
           const currentUrl = page.url();
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
@@ -4004,6 +4011,27 @@ rooms: rooms,
                 payment_required: stepNeedsAfterFill.payment_required,
                 finalized: false,
               },
+            };
+          }
+
+          return {
+            ok: !!fillResult?.ok,
+            phase: "reserve",
+            message: fillResult.message,
+            booking_url: currentUrl,
+            screenshot_base64,
+            observation: {
+              url: currentUrl,
+              before_url: beforeUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+              room_type: req.room_type || "",
+              current_step: stepNeedsAfterFill.current_step,
+              missing_required: [],
+              can_continue: true,
+              payment_required: stepNeedsAfterFill.payment_required,
+              finalized: false,
+            },
           };
         }
 
