@@ -4007,7 +4007,7 @@ rooms: rooms,
             };
           }
 
-          return {
+                   return {
             ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
