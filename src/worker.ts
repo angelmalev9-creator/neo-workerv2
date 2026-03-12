@@ -4014,7 +4014,7 @@ rooms: rooms,
             };
           }
 
-          return {
+                   return {
             ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
@@ -4033,7 +4033,7 @@ rooms: rooms,
               finalized: false,
             },
           };
-        
+        }
 
         // No form schema — keep current booking step and return continuation state
         await page.waitForTimeout(800);
@@ -4067,7 +4067,11 @@ rooms: rooms,
             screenshot_base64,
           };
         } catch {
-          return { ok: false, phase: "reserve", message: `Reserve error: ${msg}` };
+          return {
+            ok: false,
+            phase: "reserve",
+            message: `Reserve error: ${msg}`,
+          };
         }
       }
     }
