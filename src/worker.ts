@@ -4035,7 +4035,7 @@ rooms: rooms,
         const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
-            return {
+        return {
           ok: true,
           phase: "reserve",
           message: "no_form_schema_found_current_step_preserved",
@@ -4047,14 +4047,14 @@ rooms: rooms,
             confirmed_price: req.confirmed_price || "",
           },
         };
-      }
-      catch (e) {
+      } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
         try {
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
           return {
-            ok: true, phase: "reserve",
+            ok: true,
+            phase: "reserve",
             message: `reserve_error_screenshot: ${msg}`,
             booking_url: page.url(),
             screenshot_base64,
