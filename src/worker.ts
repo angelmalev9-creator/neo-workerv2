@@ -2112,6 +2112,80 @@ class HotSessionManager {
     }
   }
 
+  private async inferCurrentBookingStepNeeds(page: Page): Promise<{
+    missing_required: string[];
+    current_step: string;
+    payment_required: boolean;
+    can_continue: boolean;
+  }> {
+    try {
+      const unfilled = await this.countUnfilledVisibleFields(page);
+      const scanned = await this.scanWizardStep(page).catch(() => ({
+        fields: [],
+        choices: [],
+        choiceGroups: [],
+      }));
+
+      const bodyText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const currentUrl = page.url().toLowerCase();
+
+      const paymentRequired =
+        /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
+        /payment|checkout|stripe|pay/.test(currentUrl);
+
+      const out: string[] = [];
+      const seen = new Set<string>();
+
+      const push = (labelRaw: string) => {
+        const label = String(labelRaw || "").trim();
+        if (!label) return;
+        const key = label.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(label);
+      };
+
+      for (const lbl of unfilled.labels || []) push(lbl);
+
+      for (const f of scanned.fields || []) {
+        if (!f?.required) continue;
+        const label =
+          String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
+        if (!label) continue;
+        push(label);
+      }
+
+      for (const group of scanned.choiceGroups || []) {
+        if (!group?.required) continue;
+        const groupLabel =
+          String(group.label || group.name || "").trim() ||
+          (Array.isArray(group.options) ? group.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "");
+        if (!groupLabel) continue;
+        push(groupLabel);
+      }
+
+      console.log(
+        `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} missing=${out.join(" | ") || "none"}`
+      );
+
+      return {
+        missing_required: out.slice(0, 20),
+        current_step: paymentRequired ? "payment" : "reserve",
+        payment_required: paymentRequired,
+        can_continue: out.length === 0,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log(`[RESERVATION][STEP-NEEDS][ERROR] ${msg}`);
+      return {
+        missing_required: [],
+        current_step: "reserve",
+        payment_required: false,
+        can_continue: true,
+      };
+    }
+  }
+
   // ✅ stricter success: require success keywords AND no visible inputs/selects/textarea OR URL indicates thanks
   private async detectWizardSuccess(page: Page): Promise<boolean> {
     try {
@@ -3827,10 +3901,11 @@ rooms: rooms,
           }
         }
 
-        const currentUrlAfterRoom = page.url();
+               const currentUrlAfterRoom = page.url();
         const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
+        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
 
-        // STEP 2: if we only selected room, stop here and ask NEO for the next real field
+        // STEP 2: after room selection, return the REAL missing fields from the current booking step
         const hasGuestIdentity =
           !!String(req.guest_name || "").trim() &&
           !!String(req.guest_email || "").trim() &&
@@ -3841,7 +3916,7 @@ rooms: rooms,
             ok: true,
             phase: "reserve",
             message: "reserve_current_step_needs_input",
-            booking_url: "",
+            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
             screenshot_base64: screenshotAfterRoom,
             observation: {
               url: currentUrlAfterRoom,
@@ -3849,15 +3924,14 @@ rooms: rooms,
               room_type: req.room_type || "",
               room_selection_attempted: roomSelectionAttempted,
               room_selection_succeeded: roomSelectionSucceeded,
-              current_step: "reserve",
-              missing_required: ["current_booking_step_fields"],
-              can_continue: false,
-              payment_required: false,
+              current_step: stepNeedsAfterRoom.current_step,
+              missing_required: stepNeedsAfterRoom.missing_required,
+              can_continue: stepNeedsAfterRoom.can_continue,
+              payment_required: stepNeedsAfterRoom.payment_required,
               finalized: false,
             },
           };
         }
-
         // STEP 3: only now try to fill personal data on the CURRENT page/state
         let formSchema = session.formSchemas.find(s =>
           s.kind === "form" || s.kind === "wizard"
@@ -3880,14 +3954,18 @@ rooms: rooms,
             !fillResult?.ok &&
             String(fillResult?.message || "").toLowerCase().includes("no_match");
 
+          const stepNeedsAfterFill = await this.inferCurrentBookingStepNeeds(page);
+
           if (noMatchOnCurrentPage) {
-            console.log("[RESERVATION][RESERVE] no matched fields on current step — keeping current page, not navigating back");
+            console.log(
+              `[RESERVATION][RESERVE] no matched fields on current step — missing=${stepNeedsAfterFill.missing_required.join(" | ") || "none"}`
+            );
 
             return {
               ok: false,
               phase: "reserve",
               message: "reserve_current_step_needs_input",
-              booking_url: "",
+              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
               screenshot_base64,
               observation: {
                 url: currentUrl,
@@ -3895,13 +3973,60 @@ rooms: rooms,
                 fill_message: fillResult.message,
                 confirmed_price: req.confirmed_price || "",
                 room_type: req.room_type || "",
-                current_step: "reserve",
-                missing_required: ["current_booking_step_fields"],
-                can_continue: false,
-                payment_required: false,
+                current_step: stepNeedsAfterFill.current_step,
+                missing_required: stepNeedsAfterFill.missing_required,
+                can_continue: stepNeedsAfterFill.can_continue,
+                payment_required: stepNeedsAfterFill.payment_required,
                 finalized: false,
               },
             };
+          }
+
+          if (stepNeedsAfterFill.missing_required.length > 0) {
+            console.log(
+              `[RESERVATION][RESERVE] after fill still missing=${stepNeedsAfterFill.missing_required.join(" | ")}`
+            );
+
+            return {
+              ok: true,
+              phase: "reserve",
+              message: "reserve_current_step_needs_input",
+              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
+              screenshot_base64,
+              observation: {
+                url: currentUrl,
+                before_url: beforeUrl,
+                fill_message: fillResult.message,
+                confirmed_price: req.confirmed_price || "",
+                room_type: req.room_type || "",
+                current_step: stepNeedsAfterFill.current_step,
+                missing_required: stepNeedsAfterFill.missing_required,
+                can_continue: stepNeedsAfterFill.can_continue,
+                payment_required: stepNeedsAfterFill.payment_required,
+                finalized: false,
+              },
+            };
+          }
+
+          return {
+            ok: !!fillResult?.ok,
+            phase: "reserve",
+            message: fillResult.message,
+            booking_url: currentUrl,
+            screenshot_base64,
+            observation: {
+              url: currentUrl,
+              before_url: beforeUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+              room_type: req.room_type || "",
+              current_step: stepNeedsAfterFill.current_step,
+              missing_required: [],
+              can_continue: true,
+              payment_required: stepNeedsAfterFill.payment_required,
+              finalized: false,
+            },
+          };
           }
 
                           return {
