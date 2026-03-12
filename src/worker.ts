@@ -3967,58 +3967,11 @@ rooms: rooms,
               `[RESERVATION][RESERVE] no matched fields on current step — missing=${stepNeedsAfterFill.missing_required.join(" | ") || "none"}`
             );
 
-            return {
-              ok: false,
-              phase: "reserve",
-              message: "reserve_current_step_needs_input",
-              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
-              screenshot_base64,
-              observation: {
-                url: currentUrl,
-                before_url: beforeUrl,
-                fill_message: fillResult.message,
-                confirmed_price: req.confirmed_price || "",
-                room_type: req.room_type || "",
-                current_step: stepNeedsAfterFill.current_step,
-                missing_required: stepNeedsAfterFill.missing_required,
-                can_continue: stepNeedsAfterFill.can_continue,
-                payment_required: stepNeedsAfterFill.payment_required,
-                finalized: false,
-              },
-            };
-          }
-
-          if (stepNeedsAfterFill.missing_required.length > 0) {
-            console.log(
-              `[RESERVATION][RESERVE] after fill still missing=${stepNeedsAfterFill.missing_required.join(" | ")}`
-            );
-
-            return {
-              ok: true,
-              phase: "reserve",
-              message: "reserve_current_step_needs_input",
-              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
-              screenshot_base64,
-              observation: {
-                url: currentUrl,
-                before_url: beforeUrl,
-                fill_message: fillResult.message,
-                confirmed_price: req.confirmed_price || "",
-                room_type: req.room_type || "",
-                current_step: stepNeedsAfterFill.current_step,
-                missing_required: stepNeedsAfterFill.missing_required,
-                can_continue: stepNeedsAfterFill.can_continue,
-                payment_required: stepNeedsAfterFill.payment_required,
-                finalized: false,
-              },
-            };
-          }
-
-                   return {
-            ok: !!fillResult?.ok,
+                    return {
+            ok: false,
             phase: "reserve",
-            message: fillResult.message,
-            booking_url: currentUrl,
+            message: "reserve_current_step_needs_input",
+            booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
             screenshot_base64,
             observation: {
               url: currentUrl,
@@ -4027,57 +3980,104 @@ rooms: rooms,
               confirmed_price: req.confirmed_price || "",
               room_type: req.room_type || "",
               current_step: stepNeedsAfterFill.current_step,
-              missing_required: [],
-              can_continue: true,
+              missing_required: stepNeedsAfterFill.missing_required,
+              can_continue: stepNeedsAfterFill.can_continue,
               payment_required: stepNeedsAfterFill.payment_required,
               finalized: false,
             },
           };
         }
 
-        // No form schema — keep current booking step and return continuation state
-        await page.waitForTimeout(800);
+        if (stepNeedsAfterFill.missing_required.length > 0) {
+          console.log(
+            `[RESERVATION][RESERVE] after fill still missing=${stepNeedsAfterFill.missing_required.join(" | ")}`
+          );
 
-        const obs = await this.quickObserve(page);
-        const currentUrl = page.url();
-        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-
-        return {
-          ok: true,
-          phase: "reserve",
-          message: "no_form_schema_found_current_step_preserved",
-          booking_url: currentUrl,
-          screenshot_base64,
-          observation: {
-            ...(obs || {}),
-            url: currentUrl,
-            confirmed_price: req.confirmed_price || "",
-          },
-        };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
-        try {
-          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
           return {
             ok: true,
             phase: "reserve",
-            message: `reserve_error_screenshot: ${msg}`,
-            booking_url: page.url(),
+            message: "reserve_current_step_needs_input",
+            booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
             screenshot_base64,
-          };
-        } catch {
-          return {
-            ok: false,
-            phase: "reserve",
-            message: `Reserve error: ${msg}`,
+            observation: {
+              url: currentUrl,
+              before_url: beforeUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+              room_type: req.room_type || "",
+              current_step: stepNeedsAfterFill.current_step,
+              missing_required: stepNeedsAfterFill.missing_required,
+              can_continue: stepNeedsAfterFill.can_continue,
+              payment_required: stepNeedsAfterFill.payment_required,
+              finalized: false,
+            },
           };
         }
+
+        return {
+          ok: !!fillResult?.ok,
+          phase: "reserve",
+          message: fillResult.message,
+          booking_url: currentUrl,
+          screenshot_base64,
+          observation: {
+            url: currentUrl,
+            before_url: beforeUrl,
+            fill_message: fillResult.message,
+            confirmed_price: req.confirmed_price || "",
+            room_type: req.room_type || "",
+            current_step: stepNeedsAfterFill.current_step,
+            missing_required: [],
+            can_continue: true,
+            payment_required: stepNeedsAfterFill.payment_required,
+            finalized: false,
+          },
+        };
+      }
+
+      // No form schema — keep current booking step and return continuation state
+      await page.waitForTimeout(800);
+
+      const obs = await this.quickObserve(page);
+      const currentUrl = page.url();
+      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+      return {
+        ok: true,
+        phase: "reserve",
+        message: "no_form_schema_found_current_step_preserved",
+        booking_url: currentUrl,
+        screenshot_base64,
+        observation: {
+          ...(obs || {}),
+          url: currentUrl,
+          confirmed_price: req.confirmed_price || "",
+        },
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
+      try {
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return {
+          ok: true,
+          phase: "reserve",
+          message: `reserve_error_screenshot: ${msg}`,
+          booking_url: page.url(),
+          screenshot_base64,
+        };
+      } catch {
+        return {
+          ok: false,
+          phase: "reserve",
+          message: `Reserve error: ${msg}`,
+        };
       }
     }
-
-    return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
   }
+
+  return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
+}
 }
 
 // ───────────────────────────────────────────────────────────────
