@@ -3740,9 +3740,11 @@ rooms: rooms,
           phone: req.guest_phone || "",
           message: req.guest_message || "",
           note: req.guest_message || "",
-          check_in: checkin, checkin,
-          check_out: checkout, checkout,
-          guests, adults: guests, rooms,
+        check_in: checkin,
+check_out: checkout,
+guests: guests,
+adults: guests,
+rooms: rooms,
           room_type: req.room_type || "",
         };
 
@@ -3758,7 +3760,7 @@ rooms: rooms,
           roomSelectionAttempted = true;
 
           const roomNeedle = String(req.room_type).trim().toLowerCase();
-         const roomPatterns = [
+        const roomPatterns = [
   `button:has-text("${req.room_type}")`,
   `[role="button"]:has-text("${req.room_type}")`,
   `a:has-text("${req.room_type}")`,
@@ -3900,28 +3902,7 @@ rooms: rooms,
               finalized: false,
             },
           };
-        }
-          return {
-            ok: !!fillResult?.ok,
-            phase: "reserve",
-            message: fillResult.message,
-            booking_url: currentUrl,
-            screenshot_base64,
-            observation: {
-              url: currentUrl,
-              before_url: beforeUrl,
-              fill_message: fillResult.message,
-              confirmed_price: req.confirmed_price || "",
-              current_step: "reserve",
-              missing_required: [],
-              can_continue: true,
-              payment_required: false,
-              finalized: false,
-            },
-          };
-        }
-
-        // No form schema — keep current booking step and return continuation state
+       
         console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
         await page.waitForTimeout(800);
 
