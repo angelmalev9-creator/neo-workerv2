@@ -3161,12 +3161,11 @@ class HotSessionManager {
 
       // Locate the iframe
       let frameLocator: any = null;
-      const iframeSelectors = [
-        `iframe[src*="${iframeSrc.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"]`,
+        const iframeSelectors = [
+        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
         `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
         "iframe",
-      ];
-
+      ].filter(Boolean) as string[];
       for (const sel of iframeSelectors) {
         try {
           const el = await page.$(sel);
