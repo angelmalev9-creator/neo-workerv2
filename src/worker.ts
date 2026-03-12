@@ -4033,7 +4033,7 @@ rooms: rooms,
               finalized: false,
             },
           };
-        }
+        
 
         // No form schema — keep current booking step and return continuation state
         await page.waitForTimeout(800);
