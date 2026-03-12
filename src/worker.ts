@@ -3269,6 +3269,7 @@ class HotSessionManager {
         message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
         screenshot_base64,
       };
+    
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[IFRAME] Error: ${msg}`);
@@ -3883,7 +3884,7 @@ rooms: rooms,
             };
           }
 
-                  return {
+                          return {
             ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
