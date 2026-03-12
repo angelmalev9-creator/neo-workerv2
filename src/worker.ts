@@ -3729,7 +3729,7 @@ class HotSessionManager {
     if (req.phase === "reserve") {
       // ── PHASE 2: Fill reservation form until payment page ────
       try {
-        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
+               console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
 
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
@@ -3738,24 +3738,107 @@ class HotSessionManager {
           phone: req.guest_phone || "",
           message: req.guest_message || "",
           note: req.guest_message || "",
-          // Also include dates for pre-populated forms
           check_in: checkin, checkin,
           check_out: checkout, checkout,
           guests, adults: guests, rooms,
           room_type: req.room_type || "",
         };
 
-        // Find a form schema (contact/reservation form)
+        const beforeUrl = page.url();
+        console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
+        await page.waitForTimeout(800);
+
+        // STEP 1: first select the chosen room on the CURRENT booking page
+        let roomSelectionAttempted = false;
+        let roomSelectionSucceeded = false;
+
+        if (req.room_type) {
+          roomSelectionAttempted = true;
+
+          const roomNeedle = String(req.room_type).trim().toLowerCase();
+          const roomPatterns = [
+            `text=/${roomNeedle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/i`,
+            `button:has-text("${req.room_type}")`,
+            `[role="button"]:has-text("${req.room_type}")`,
+            `a:has-text("${req.room_type}")`,
+            `label:has-text("${req.room_type}")`,
+            `div:has-text("${req.room_type}")`,
+          ];
+
+          for (const sel of roomPatterns) {
+            try {
+              const loc = page.locator(sel).first();
+              const count = await page.locator(sel).count().catch(() => 0);
+              if (!count) continue;
+
+              await loc.scrollIntoViewIfNeeded().catch(() => {});
+              await loc.click({ timeout: 1500 }).catch(async () => {
+                await loc.dispatchEvent("click").catch(() => {});
+              });
+
+              await page.waitForTimeout(1200);
+
+              const afterUrl = page.url();
+              const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+
+              if (
+                afterUrl !== beforeUrl ||
+                pageText.includes("име") ||
+                pageText.includes("email") ||
+                pageText.includes("имейл") ||
+                pageText.includes("телефон") ||
+                pageText.includes("card") ||
+                pageText.includes("плащ")
+              ) {
+                roomSelectionSucceeded = true;
+                console.log(`[RESERVATION][ROOM] selected via ${sel}`);
+                break;
+              }
+            } catch {}
+          }
+
+          if (!roomSelectionSucceeded) {
+            console.log("[RESERVATION][ROOM] direct room click not confirmed from DOM/url change");
+          }
+        }
+
+        const currentUrlAfterRoom = page.url();
+        const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
+
+        // STEP 2: if we only selected room, stop here and ask NEO for the next real field
+        const hasGuestIdentity =
+          !!String(req.guest_name || "").trim() &&
+          !!String(req.guest_email || "").trim() &&
+          !!String(req.guest_phone || "").trim();
+
+        if (req.room_type && !hasGuestIdentity) {
+          return {
+            ok: true,
+            phase: "reserve",
+            message: "reserve_current_step_needs_input",
+            booking_url: "",
+            screenshot_base64: screenshotAfterRoom,
+            observation: {
+              url: currentUrlAfterRoom,
+              before_url: beforeUrl,
+              room_type: req.room_type || "",
+              room_selection_attempted: roomSelectionAttempted,
+              room_selection_succeeded: roomSelectionSucceeded,
+              current_step: "reserve",
+              missing_required: ["current_booking_step_fields"],
+              can_continue: false,
+              payment_required: false,
+              finalized: false,
+            },
+          };
+        }
+
+        // STEP 3: only now try to fill personal data on the CURRENT page/state
         let formSchema = session.formSchemas.find(s =>
           s.kind === "form" || s.kind === "wizard"
         );
 
         if (formSchema) {
-          const beforeUrl = page.url();
-          console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
-          await page.waitForTimeout(800);
-
-          // First try to fill the CURRENT page/state, without jumping back
           if (formSchema.schema.choices?.length) {
             const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
             choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
@@ -3775,7 +3858,6 @@ class HotSessionManager {
           if (noMatchOnCurrentPage) {
             console.log("[RESERVATION][RESERVE] no matched fields on current step — keeping current page, not navigating back");
 
-            const missingRequired = ["current_booking_step_fields"];
             return {
               ok: false,
               phase: "reserve",
@@ -3787,8 +3869,9 @@ class HotSessionManager {
                 before_url: beforeUrl,
                 fill_message: fillResult.message,
                 confirmed_price: req.confirmed_price || "",
+                room_type: req.room_type || "",
                 current_step: "reserve",
-                missing_required: missingRequired,
+                missing_required: ["current_booking_step_fields"],
                 can_continue: false,
                 payment_required: false,
                 finalized: false,
@@ -3796,6 +3879,26 @@ class HotSessionManager {
             };
           }
 
+          return {
+            ok: !!fillResult?.ok,
+            phase: "reserve",
+            message: fillResult.message,
+            booking_url: currentUrl,
+            screenshot_base64,
+            observation: {
+              url: currentUrl,
+              before_url: beforeUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+              room_type: req.room_type || "",
+              current_step: "reserve",
+              missing_required: [],
+              can_continue: true,
+              payment_required: false,
+              finalized: false,
+            },
+          };
+        }
           return {
             ok: !!fillResult?.ok,
             phase: "reserve",
