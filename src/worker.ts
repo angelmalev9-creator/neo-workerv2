@@ -3729,7 +3729,7 @@ class HotSessionManager {
     if (req.phase === "reserve") {
       // ── PHASE 2: Fill reservation form until payment page ────
       try {
-        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email}`);
+        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
 
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
@@ -3751,51 +3751,77 @@ class HotSessionManager {
         );
 
         if (formSchema) {
-          await this.ensureOnSchemaUrl(page, formSchema.url);
+          const beforeUrl = page.url();
+          console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
           await page.waitForTimeout(800);
 
-          // Fill choices first (room type, etc.)
+          // First try to fill the CURRENT page/state, without jumping back
           if (formSchema.schema.choices?.length) {
             const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
-            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE] ${a}`));
+            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
           }
 
-          // Fill form fields
-          const fillResult = formSchema.kind === "wizard"
-            ? await this.fillWizard(page, formSchema, guestData, false, false) // auto_submit=false: stop before payment
-            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false); // auto_submit=false
+          let fillResult = formSchema.kind === "wizard"
+            ? await this.fillWizard(page, formSchema, guestData, false, false)
+            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+
+          const noMatchOnCurrentPage =
+            !fillResult?.ok &&
+            String(fillResult?.message || "").toLowerCase().includes("no_match");
+
+          if (noMatchOnCurrentPage) {
+            console.log(`[RESERVATION][RESERVE] no matched fields on current step, fallback to schema url=${formSchema.url}`);
+
+            await this.ensureOnSchemaUrl(page, formSchema.url);
+            await page.waitForTimeout(800);
+
+            if (formSchema.schema.choices?.length) {
+              const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
+              choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][FALLBACK] ${a}`));
+            }
+
+            fillResult = formSchema.kind === "wizard"
+              ? await this.fillWizard(page, formSchema, guestData, false, false)
+              : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+          }
 
           const currentUrl = page.url();
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
           return {
-            ok: fillResult.ok || true, // partial fill is still ok
+            ok: fillResult.ok || !!currentUrl,
             phase: "reserve",
             message: fillResult.message,
             booking_url: currentUrl,
             screenshot_base64,
             observation: {
               url: currentUrl,
+              before_url: beforeUrl,
               fill_message: fillResult.message,
               confirmed_price: req.confirmed_price || "",
             },
           };
         }
 
-        // No form schema — try to detect booking/contact form on current page
-        console.log("[RESERVATION] No form schema for reserve phase — scanning page");
+        // No form schema — keep current booking step and return continuation state
+        console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
         await page.waitForTimeout(800);
 
         const obs = await this.quickObserve(page);
+        const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
         return {
           ok: true,
           phase: "reserve",
-          message: "no_form_schema_found",
-          booking_url: page.url(),
+          message: "no_form_schema_found_current_step_preserved",
+          booking_url: currentUrl,
           screenshot_base64,
-          observation: obs,
+          observation: {
+            ...(obs || {}),
+            url: currentUrl,
+            confirmed_price: req.confirmed_price || "",
+          },
         };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
