@@ -4193,7 +4193,7 @@ rooms: rooms,
 
   return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
 }
-
+}
 
 // ───────────────────────────────────────────────────────────────
 // Server
