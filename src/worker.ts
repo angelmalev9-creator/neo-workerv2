@@ -2650,11 +2650,38 @@ class HotSessionManager {
       await page.waitForTimeout(1200);
 
       // ── 4. Try to fill date fields universally ─────────────────
-      const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
+           const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
-         // ── 4. Click Search / Check button ────────────────────────
-         const requiredFilled =
+      const schemaAnyForRequired: any = schema?.schema || {};
+      const schemaGuestFieldsForRequired = Array.isArray(schemaAnyForRequired?.guest_fields)
+        ? schemaAnyForRequired.guest_fields
+        : [];
+      const schemaFieldsForRequired = Array.isArray(schemaAnyForRequired?.fields)
+        ? schemaAnyForRequired.fields
+        : [];
+
+      const schemaRequiresGuests = Boolean(
+        schemaGuestFieldsForRequired.length > 0 ||
+        schemaFieldsForRequired.some((f: any) => {
+          const hay = [
+            f?.name || "",
+            f?.label || "",
+            f?.placeholder || "",
+            f?.aria_label || "",
+            f?.type || "",
+            f?.autocomplete || "",
+          ].join(" ").toLowerCase();
+
+          return ["guest", "guests", "adult", "adults", "person", "pax", "възрастни", "гости"].some((k) =>
+            hay.includes(k)
+          );
+        }) ||
+        schemaAnyForRequired?.detected_fields?.guests
+      );
+
+      // ── 4. Click Search / Check button ────────────────────────
+      const requiredFilled =
         filled.checkin &&
         filled.checkout &&
         (!schemaRequiresGuests || filled.guests);
@@ -2678,6 +2705,7 @@ class HotSessionManager {
           },
         };
       }
+
       const clicked = await this.clickAvailabilitySearch(page);
       console.log(`[AVAIL] clickSearch=${clicked}`);
 
@@ -3101,13 +3129,29 @@ class HotSessionManager {
 
       if (!frameLocator) {
         console.log("[IFRAME] Could not locate iframe, falling back to main page");
-        // Fall back to main page availability check
-        this.fillAvailabilityDates(page, availSchema as any, checkin, checkout, guests, rooms)
+
+        const fallbackSchema = {
+          id: "",
+          session_id: "",
+          url: page.url(),
+          domain: "",
+          kind: "availability",
+          fingerprint: "",
+          schema: {
+            ui_type: "iframe_fallback_main_page",
+            vendor,
+            src: iframeSrc,
+          },
+          dom_snapshot: null,
+        } as FormSchemaRow;
+
+        await this.fillAvailabilityDates(page, fallbackSchema, checkin, checkout, guests, rooms);
         const clicked = await this.clickAvailabilitySearch(page);
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-        return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
+        return { ok: true, message: clicked ? "iframe_fallback_main_page" : "iframe_fallback_main_page_partial", screenshot_base64 };
       }
+
 
       // ── Vendor-specific date selectors ────────────────────
       const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
