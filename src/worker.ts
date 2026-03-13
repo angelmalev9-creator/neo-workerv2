@@ -2165,8 +2165,35 @@ class HotSessionManager {
       }
 
       console.log(
-        `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} missing=${out.join(" | ") || "none"}`
+        `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} current_step=${paymentRequired ? "payment" : "reserve"} missing=${out.join(" | ") || "none"}`
       );
+
+      if (unfilled.labels?.length) {
+        console.log(
+          `[RESERVATION][STEP-NEEDS][UNFILLED_LABELS] ${unfilled.labels.slice(0, 30).join(" | ")}`
+        );
+      }
+
+      if ((scanned.fields || []).length) {
+        const requiredFieldLabels = (scanned.fields || [])
+          .filter((f: any) => !!f?.required)
+          .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
+          .filter(Boolean);
+        console.log(
+          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_FIELDS] ${requiredFieldLabels.join(" | ") || "none"}`
+        );
+      }
+
+      if ((scanned.choiceGroups || []).length) {
+        const requiredChoiceLabels = (scanned.choiceGroups || [])
+          .filter((g: any) => !!g?.required)
+          .map((g: any) => String(g.label || g.name || "").trim() || (Array.isArray(g.options) ? g.options.map((o: any) => o.text).filter(Boolean).join(" / ") : ""))
+          .filter(Boolean);
+        console.log(
+          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_CHOICES] ${requiredChoiceLabels.join(" | ") || "none"}`
+        );
+      }
+
 
       return {
         missing_required: out.slice(0, 20),
@@ -3933,8 +3960,19 @@ rooms: rooms,
               const containerCount = Math.min(await containers.count().catch(() => 0), 4);
               for (let i = 0; i < containerCount; i++) {
                 const container = containers.nth(i);
-                const text = String(await container.innerText().catch(() => "")).toLowerCase().replace(/\s+/g, " ").trim();
+                const rawText = String(await container.innerText().catch(() => ""));
+                const text = rawText.toLowerCase().replace(/\s+/g, " ").trim();
+
+                console.log(
+                  `[RESERVATION][ROOM][SCAN] label=${label} containerSel=${containerSel} idx=${i} text="${rawText.slice(0, 300).replace(/\s+/g, " ")}"`
+                );
+
                 if (!text || !text.includes(normRoom)) continue;
+
+                console.log(
+                  `[RESERVATION][ROOM][MATCH] label=${label} containerSel=${containerSel} idx=${i} matched_room="${req.room_type}"`
+                );
+
 
                 for (const ctaSel of ctaSelectors) {
                   const ctas = container.locator(ctaSel);
@@ -3942,19 +3980,43 @@ rooms: rooms,
                   for (let j = 0; j < ctaCount; j++) {
                     const cta = ctas.nth(j);
                     const tag = await cta.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
-                    if (tag === "a") continue;
-                    if (!(await cta.isVisible().catch(() => false))) continue;
+                    const ctaText = String(await cta.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+                    if (tag === "a") {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=anchor text="${ctaText}"`
+                      );
+                      continue;
+                    }
+                    if (!(await cta.isVisible().catch(() => false))) {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=hidden text="${ctaText}"`
+                      );
+                      continue;
+                    }
+
+                    console.log(
+                      `[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} tag=${tag} text="${ctaText}"`
+                    );
 
                     await cta.scrollIntoViewIfNeeded().catch(() => {});
                     await cta.click({ timeout: 1800 }).catch(async () => {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j}`
+                      );
                       await cta.dispatchEvent("click").catch(() => {});
                     });
                     await page.waitForTimeout(1200);
 
-                    if (await indicatesBookingProgress()) {
+                    const progressed = await indicatesBookingProgress();
+                    console.log(
+                      `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}"`
+                    );
+
+                    if (progressed) {
                       console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel}`);
                       return true;
                     }
+
                   }
                 }
 
@@ -3963,17 +4025,37 @@ rooms: rooms,
 
                 for (let j = 0; j < fallbackCount; j++) {
                   const btn = fallbackButtons.nth(j);
-                  if (!(await btn.isVisible().catch(() => false))) continue;
+                  const btnText = String(await btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+                  const btnTag = await btn.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                  if (!(await btn.isVisible().catch(() => false))) {
+                    console.log(
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=hidden tag=${btnTag} text="${btnText}"`
+                    );
+                    continue;
+                  }
+
+                  console.log(
+                    `[RESERVATION][ROOM][FALLBACK][TRY] label=${label} idx=${j} tag=${btnTag} text="${btnText}"`
+                  );
+
                   await btn.scrollIntoViewIfNeeded().catch(() => {});
                   await btn.click({ timeout: 1800 }).catch(async () => {
+                    console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j}`);
                     await btn.dispatchEvent("click").catch(() => {});
                   });
                   await page.waitForTimeout(1200);
-                  if (await indicatesBookingProgress()) {
+
+                  const progressed = await indicatesBookingProgress();
+                  console.log(
+                    `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}"`
+                  );
+
+                  if (progressed) {
                     console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container`);
                     return true;
                   }
                 }
+
               }
             }
 
@@ -3988,18 +4070,32 @@ rooms: rooms,
             for (const sel of directSelectors) {
               const loc = ctx.locator(sel).first();
               const count = await ctx.locator(sel).count().catch(() => 0);
+              console.log(`[RESERVATION][ROOM][DIRECT][SCAN] label=${label} sel=${sel} count=${count}`);
               if (!count) continue;
-              if (!(await loc.isVisible().catch(() => false))) continue;
+              if (!(await loc.isVisible().catch(() => false))) {
+                console.log(`[RESERVATION][ROOM][DIRECT][SKIP] label=${label} sel=${sel} reason=hidden`);
+                continue;
+              }
+
+              const directText = String(await loc.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+              console.log(`[RESERVATION][ROOM][DIRECT][TRY] label=${label} sel=${sel} text="${directText}"`);
+
               await loc.scrollIntoViewIfNeeded().catch(() => {});
               await loc.click({ timeout: 1500 }).catch(async () => {
+                console.log(`[RESERVATION][ROOM][DIRECT][DISPATCH] label=${label} sel=${sel}`);
                 await loc.dispatchEvent("click").catch(() => {});
               });
               await page.waitForTimeout(1200);
-              if (await indicatesBookingProgress()) {
+
+              const progressed = await indicatesBookingProgress();
+              console.log(`[RESERVATION][ROOM][DIRECT][RESULT] label=${label} sel=${sel} progressed=${progressed} url="${page.url()}"`);
+
+              if (progressed) {
                 console.log(`[RESERVATION][ROOM] selected via ${label} -> ${sel}`);
                 return true;
               }
             }
+
 
             return false;
           };
@@ -4025,8 +4121,14 @@ rooms: rooms,
         }
 
         const currentUrlAfterRoom = page.url();
+        const bodySnippetAfterRoom = String(await page.locator("body").innerText().catch(() => ""))
+          .replace(/\s+/g, " ")
+          .slice(0, 1200);
+        console.log(`[RESERVATION][AFTER_ROOM] url=${currentUrlAfterRoom} body="${bodySnippetAfterRoom}"`);
+
         const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
         const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
+
 
         if (roomSelectionAttempted && !roomSelectionSucceeded) {
           return {
