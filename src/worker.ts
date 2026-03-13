@@ -3848,56 +3848,171 @@ rooms: rooms,
         console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
         await page.waitForTimeout(800);
 
-        // STEP 1: first select the chosen room on the CURRENT booking page
+        // STEP 1: first select the chosen room on the CURRENT booking page / iframe context
         let roomSelectionAttempted = false;
         let roomSelectionSucceeded = false;
 
         if (req.room_type) {
           roomSelectionAttempted = true;
 
-          const roomPatterns = [
-            `button:has-text("${req.room_type}")`,
-            `[role="button"]:has-text("${req.room_type}")`,
-            `a:has-text("${req.room_type}")`,
-            `label:has-text("${req.room_type}")`,
-            `div:has-text("${req.room_type}")`,
-            `li:has-text("${req.room_type}")`,
-          ];
+          const normRoom = String(req.room_type || "")
+            .toLowerCase()
+            .replace(/\s+/g, " ")
+            .trim();
 
-          for (const sel of roomPatterns) {
-            try {
-              const loc = page.locator(sel).first();
-              const count = await page.locator(sel).count().catch(() => 0);
+          const isBadRoomNavigation = (fromUrl: string, toUrl: string) => {
+            if (!toUrl || toUrl === fromUrl) return false;
+            const lower = toUrl.toLowerCase();
+            return /\/room\//.test(lower) || /\/accommodation\//.test(lower) === false;
+          };
+
+          const indicatesBookingProgress = async () => {
+            const afterUrl = page.url();
+            const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+            const stepNeeds = await this.inferCurrentBookingStepNeeds(page).catch(() => ({
+              current_step: "",
+              missing_required: [],
+              can_continue: true,
+              payment_required: false,
+            }));
+
+            if (isBadRoomNavigation(beforeUrl, afterUrl)) {
+              console.log(`[RESERVATION][ROOM] ignored navigation outside booking flow: ${afterUrl}`);
+              try { await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }); } catch {}
+              await page.waitForTimeout(800).catch(() => {});
+              return false;
+            }
+
+            return (
+              afterUrl !== beforeUrl ||
+              pageText.includes("име") ||
+              pageText.includes("email") ||
+              pageText.includes("имейл") ||
+              pageText.includes("телефон") ||
+              pageText.includes("card") ||
+              pageText.includes("плащ") ||
+              pageText.includes("резервац") ||
+              (Array.isArray((stepNeeds as any)?.missing_required) && (stepNeeds as any).missing_required.length > 0) ||
+              !!(stepNeeds as any)?.payment_required
+            );
+          };
+
+          const clickRoomInContext = async (ctx: any, label: string) => {
+            const ctaSelectors = [
+              `button:has-text("Резервирай")`,
+              `button:has-text("Избери")`,
+              `button:has-text("Book")`,
+              `button:has-text("Reserve")`,
+              `button:has-text("Select")`,
+              `[role="button"]:has-text("Резервирай")`,
+              `[role="button"]:has-text("Избери")`,
+              `[role="button"]:has-text("Book")`,
+              `[role="button"]:has-text("Reserve")`,
+              `[role="button"]:has-text("Select")`,
+              `input[type="submit"]`,
+              `input[type="button"]`,
+              `button`,
+              `[role="button"]`,
+            ];
+
+            const containerSelectors = [
+              `article:has-text("${req.room_type}")`,
+              `[class*="room"]:has-text("${req.room_type}")`,
+              `[class*="rate"]:has-text("${req.room_type}")`,
+              `[class*="card"]:has-text("${req.room_type}")`,
+              `li:has-text("${req.room_type}")`,
+              `div:has-text("${req.room_type}")`,
+            ];
+
+            for (const containerSel of containerSelectors) {
+              const containers = ctx.locator(containerSel);
+              const containerCount = Math.min(await containers.count().catch(() => 0), 4);
+              for (let i = 0; i < containerCount; i++) {
+                const container = containers.nth(i);
+                const text = String(await container.innerText().catch(() => "")).toLowerCase().replace(/\s+/g, " ").trim();
+                if (!text || !text.includes(normRoom)) continue;
+
+                for (const ctaSel of ctaSelectors) {
+                  const ctas = container.locator(ctaSel);
+                  const ctaCount = Math.min(await ctas.count().catch(() => 0), 3);
+                  for (let j = 0; j < ctaCount; j++) {
+                    const cta = ctas.nth(j);
+                    const tag = await cta.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                    if (tag === "a") continue;
+                    if (!(await cta.isVisible().catch(() => false))) continue;
+
+                    await cta.scrollIntoViewIfNeeded().catch(() => {});
+                    await cta.click({ timeout: 1800 }).catch(async () => {
+                      await cta.dispatchEvent("click").catch(() => {});
+                    });
+                    await page.waitForTimeout(1200);
+
+                    if (await indicatesBookingProgress()) {
+                      console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel}`);
+                      return true;
+                    }
+                  }
+                }
+
+                const fallbackButtons = container.locator(`button, [role="button"], input[type="button"], input[type="submit"]`);
+                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 2);
+                for (let j = 0; j < fallbackCount; j++) {
+                  const btn = fallbackButtons.nth(j);
+                  if (!(await btn.isVisible().catch(() => false))) continue;
+                  await btn.scrollIntoViewIfNeeded().catch(() => {});
+                  await btn.click({ timeout: 1800 }).catch(async () => {
+                    await btn.dispatchEvent("click").catch(() => {});
+                  });
+                  await page.waitForTimeout(1200);
+                  if (await indicatesBookingProgress()) {
+                    console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container`);
+                    return true;
+                  }
+                }
+              }
+            }
+
+            const directSelectors = [
+              `button:has-text("${req.room_type}")`,
+              `[role="button"]:has-text("${req.room_type}")`,
+              `label:has-text("${req.room_type}")`,
+            ];
+            for (const sel of directSelectors) {
+              const loc = ctx.locator(sel).first();
+              const count = await ctx.locator(sel).count().catch(() => 0);
               if (!count) continue;
-
+              if (!(await loc.isVisible().catch(() => false))) continue;
               await loc.scrollIntoViewIfNeeded().catch(() => {});
               await loc.click({ timeout: 1500 }).catch(async () => {
                 await loc.dispatchEvent("click").catch(() => {});
               });
-
               await page.waitForTimeout(1200);
-
-              const afterUrl = page.url();
-              const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-
-              if (
-                afterUrl !== beforeUrl ||
-                pageText.includes("име") ||
-                pageText.includes("email") ||
-                pageText.includes("имейл") ||
-                pageText.includes("телефон") ||
-                pageText.includes("card") ||
-                pageText.includes("плащ")
-              ) {
-                roomSelectionSucceeded = true;
-                console.log(`[RESERVATION][ROOM] selected via ${sel}`);
-                break;
+              if (await indicatesBookingProgress()) {
+                console.log(`[RESERVATION][ROOM] selected via ${label} -> ${sel}`);
+                return true;
               }
-            } catch {}
+            }
+
+            return false;
+          };
+
+          const frames = page.frames().filter((f) => f !== page.mainFrame());
+          for (const frame of frames) {
+            const frameUrl = String(frame.url() || "");
+            const frameName = String((frame as any).name?.() || "");
+            const label = `frame(${frameName || frameUrl || "unknown"})`;
+            if (await clickRoomInContext(frame as any, label)) {
+              roomSelectionSucceeded = true;
+              break;
+            }
           }
 
           if (!roomSelectionSucceeded) {
-            console.log("[RESERVATION][ROOM] direct room click not confirmed from DOM/url change");
+            roomSelectionSucceeded = await clickRoomInContext(page as any, "page");
+          }
+
+          if (!roomSelectionSucceeded) {
+            console.log("[RESERVATION][ROOM] safe room click not confirmed inside booking context");
           }
         }
 
@@ -4076,9 +4191,10 @@ rooms: rooms,
       }
     }
 
-    return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
-  }
+  return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
 }
+
+
 // ───────────────────────────────────────────────────────────────
 // Server
 // ───────────────────────────────────────────────────────────────
