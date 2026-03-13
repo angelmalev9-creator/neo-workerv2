@@ -3562,6 +3562,122 @@ class HotSessionManager {
 
     return actions;
   }
+  private normalizeRoomChoiceText(s: unknown): string {
+    return String(s ?? "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[“”"']/g, " ")
+      .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private async clickNearestRoomAction(page: Page, roomType: string): Promise<{ clicked: boolean; message: string }> {
+    const wanted = this.normalizeRoomChoiceText(roomType);
+    if (!wanted) return { clicked: false, message: "room_type_missing" };
+
+    const roomActionTexts = [
+      "избери",
+      "резервирай",
+      "резервиране",
+      "виж",
+      "детайли",
+      "book",
+      "reserve",
+      "select",
+      "choose",
+      "continue",
+      "next",
+    ];
+
+    const result = await page.evaluate(
+      ({ wanted, roomActionTexts }) => {
+        const norm = (s: unknown) =>
+          String(s ?? "")
+            .toLowerCase()
+            .normalize("NFKD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[“”"']/g, " ")
+            .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const isVisible = (el: Element | null) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el as HTMLElement);
+          if (!style) return false;
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const r = (el as HTMLElement).getBoundingClientRect?.();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+
+        const clickableSelector = [
+          "button",
+          "a",
+          "[role='button']",
+          "[onclick]",
+          "input[type='button']",
+          "input[type='submit']"
+        ].join(",");
+
+        const all = Array.from(document.querySelectorAll("body *")) as HTMLElement[];
+
+        const candidates = all
+          .filter((el) => isVisible(el))
+          .map((el) => ({
+            el,
+            text: norm(el.innerText || el.textContent || ""),
+          }))
+          .filter((x) => x.text && (x.text.includes(wanted) || wanted.includes(x.text)));
+
+        if (!candidates.length) {
+          return { clicked: false, message: "room_card_not_found" };
+        }
+
+        const scored = candidates
+          .map((c) => {
+            let card: HTMLElement | null = c.el;
+            for (let i = 0; i < 6 && card; i++) {
+              const txt = norm(card.innerText || card.textContent || "");
+              if (txt.includes(wanted) && txt.length <= 1200) break;
+              card = card.parentElement;
+            }
+            return { ...c, card: card || c.el };
+          })
+          .sort((a, b) => a.text.length - b.text.length);
+
+        for (const item of scored) {
+          const card = item.card as HTMLElement;
+
+          const localButtons = Array.from(card.querySelectorAll(clickableSelector)) as HTMLElement[];
+          const picked = localButtons.find((btn) => {
+            const t = norm(btn.innerText || btn.textContent || (btn as HTMLInputElement).value || "");
+            return roomActionTexts.some((kw) => t.includes(norm(kw)));
+          });
+
+          if (picked && isVisible(picked)) {
+            picked.click();
+            return { clicked: true, message: `room_action_clicked:${(picked.innerText || picked.textContent || "").trim()}` };
+          }
+
+          if (isVisible(card)) {
+            card.click();
+            return { clicked: true, message: "room_card_clicked" };
+          }
+        }
+
+        return { clicked: false, message: "room_action_not_found" };
+      },
+      { wanted, roomActionTexts }
+    );
+
+    if (result.clicked) {
+      await page.waitForTimeout(1200).catch(() => {});
+    }
+
+    return result;
+  }
 
   // ─────────────────────────────────────────────────────────
   // makeReservation — full hotel booking workflow
@@ -3731,6 +3847,32 @@ class HotSessionManager {
       try {
         console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
 
+                if (req.room_type) {
+          const roomPick = await this.clickNearestRoomAction(page, req.room_type);
+          console.log(`[RESERVATION][ROOM_PICK] room_type="${req.room_type}" clicked=${roomPick.clicked} message=${roomPick.message}`);
+
+          if (!roomPick.clicked) {
+            const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+            return {
+              ok: false,
+              phase: "reserve",
+              message: "reserve_room_selection_failed",
+              booking_url: "",
+              screenshot_base64,
+              observation: {
+                url: page.url(),
+                current_step: "room_selection",
+                room_type: req.room_type,
+                missing_required: [`Избор на стая: ${req.room_type}`],
+                can_continue: false,
+                payment_required: false,
+                finalized: false,
+              },
+            };
+          }
+        }
+
+
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
           full_name: req.guest_name || "",
@@ -3796,11 +3938,18 @@ class HotSessionManager {
             };
           }
 
+                   const fillObs: any = fillResult?.observation || {};
+          const fillMissing = Array.isArray(fillObs?.missing_required)
+            ? fillObs.missing_required
+            : Array.isArray(fillObs?.wizard_next?.missing_required)
+            ? fillObs.wizard_next.missing_required.map((x: any) => x?.label || x?.name || "").filter(Boolean)
+            : [];
+
           return {
             ok: !!fillResult?.ok,
             phase: "reserve",
             message: fillResult.message,
-            booking_url: currentUrl,
+            booking_url: fillResult?.ok ? currentUrl : "",
             screenshot_base64,
             observation: {
               url: currentUrl,
@@ -3808,12 +3957,14 @@ class HotSessionManager {
               fill_message: fillResult.message,
               confirmed_price: req.confirmed_price || "",
               current_step: "reserve",
-              missing_required: [],
-              can_continue: true,
+              room_type: req.room_type || "",
+              missing_required: fillMissing,
+              can_continue: !!fillResult?.ok,
               payment_required: false,
               finalized: false,
             },
           };
+
         }
 
         // No form schema — keep current booking step and return continuation state
