@@ -2112,6 +2112,80 @@ class HotSessionManager {
     }
   }
 
+  private async inferCurrentBookingStepNeeds(page: Page): Promise<{
+    missing_required: string[];
+    current_step: string;
+    payment_required: boolean;
+    can_continue: boolean;
+  }> {
+    try {
+      const unfilled = await this.countUnfilledVisibleFields(page);
+      const scanned = await this.scanWizardStep(page).catch(() => ({
+        fields: [],
+        choices: [],
+        choiceGroups: [],
+      }));
+
+      const bodyText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const currentUrl = page.url().toLowerCase();
+
+      const paymentRequired =
+        /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
+        /payment|checkout|stripe|pay/.test(currentUrl);
+
+      const out: string[] = [];
+      const seen = new Set<string>();
+
+      const push = (labelRaw: string) => {
+        const label = String(labelRaw || "").trim();
+        if (!label) return;
+        const key = label.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(label);
+      };
+
+      for (const lbl of unfilled.labels || []) push(lbl);
+
+      for (const f of scanned.fields || []) {
+        if (!f?.required) continue;
+        const label =
+          String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
+        if (!label) continue;
+        push(label);
+      }
+
+      for (const group of scanned.choiceGroups || []) {
+        if (!group?.required) continue;
+        const groupLabel =
+          String(group.label || group.name || "").trim() ||
+          (Array.isArray(group.options) ? group.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "");
+        if (!groupLabel) continue;
+        push(groupLabel);
+      }
+
+      console.log(
+        `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} missing=${out.join(" | ") || "none"}`
+      );
+
+      return {
+        missing_required: out.slice(0, 20),
+        current_step: paymentRequired ? "payment" : "reserve",
+        payment_required: paymentRequired,
+        can_continue: out.length === 0,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log(`[RESERVATION][STEP-NEEDS][ERROR] ${msg}`);
+      return {
+        missing_required: [],
+        current_step: "reserve",
+        payment_required: false,
+        can_continue: true,
+      };
+    }
+  }
+
   // ✅ stricter success: require success keywords AND no visible inputs/selects/textarea OR URL indicates thanks
   private async detectWizardSuccess(page: Page): Promise<boolean> {
     try {
@@ -2650,35 +2724,13 @@ class HotSessionManager {
       await page.waitForTimeout(1200);
 
       // ── 4. Try to fill date fields universally ─────────────────
-           const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
+      const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
-      const schemaAnyForRequired: any = schema?.schema || {};
-      const schemaGuestFieldsForRequired = Array.isArray(schemaAnyForRequired?.guest_fields)
-        ? schemaAnyForRequired.guest_fields
-        : [];
-      const schemaFieldsForRequired = Array.isArray(schemaAnyForRequired?.fields)
-        ? schemaAnyForRequired.fields
-        : [];
-
-      const schemaRequiresGuests = Boolean(
-        schemaGuestFieldsForRequired.length > 0 ||
-        schemaFieldsForRequired.some((f: any) => {
-          const hay = [
-            f?.name || "",
-            f?.label || "",
-            f?.placeholder || "",
-            f?.aria_label || "",
-            f?.type || "",
-            f?.autocomplete || "",
-          ].join(" ").toLowerCase();
-
-          return ["guest", "guests", "adult", "adults", "person", "pax", "възрастни", "гости"].some((k) =>
-            hay.includes(k)
-          );
-        }) ||
-        schemaAnyForRequired?.detected_fields?.guests
-      );
+      const schemaGuestFields = Array.isArray(schemaAny?.guest_fields) ? schemaAny.guest_fields : [];
+      const schemaRequiresGuests =
+        schemaGuestFields.length > 0 ||
+        !!schemaAny?.detected_fields?.guests;
 
       // ── 4. Click Search / Check button ────────────────────────
       const requiredFilled =
@@ -2705,7 +2757,6 @@ class HotSessionManager {
           },
         };
       }
-
       const clicked = await this.clickAvailabilitySearch(page);
       console.log(`[AVAIL] clickSearch=${clicked}`);
 
@@ -2723,8 +2774,6 @@ class HotSessionManager {
       const timing = Date.now() - t0;
       console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars`);
 
-      const screenshotSet = await this.takeAvailabilityScreenshotSet(page);
-
       return {
         ok: true,
         message: "availability_screenshot_ready",
@@ -2734,17 +2783,13 @@ class HotSessionManager {
           check_out: checkout,
           guests,
           rooms,
-          screenshot_base64: screenshotSet.primary_base64,
-          screenshot_full_page_base64: screenshotSet.full_page_base64,
-          screenshot_viewport_base64: screenshotSet.viewport_base64,
-          screenshot_iframe_base64: screenshotSet.iframe_base64,
+          screenshot_base64: screenshotBase64,
           url: page.url(),
           timing_ms: timing,
           fill_result: filled,
           search_clicked: clicked,
         },
       };
-
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[AVAIL] Error: ${msg}`);
@@ -3087,6 +3132,7 @@ class HotSessionManager {
   }
 
   private async takeAvailabilityScreenshot(page: Page): Promise<string> {
+    // Try full-page first, fallback to viewport
     try {
       const buf = await page.screenshot({ fullPage: true, type: "png" });
       return Buffer.from(buf).toString("base64");
@@ -3095,72 +3141,6 @@ class HotSessionManager {
       return Buffer.from(buf).toString("base64");
     }
   }
-
-  private async takeAvailabilityScreenshotSet(
-    page: Page,
-    iframeSrc?: string,
-    vendor?: string
-  ): Promise<{
-    primary_base64: string;
-    full_page_base64?: string;
-    viewport_base64?: string;
-    iframe_base64?: string;
-  }> {
-    const out: {
-      primary_base64: string;
-      full_page_base64?: string;
-      viewport_base64?: string;
-      iframe_base64?: string;
-    } = {
-      primary_base64: "",
-    };
-
-    try {
-      const full = await page.screenshot({ fullPage: true, type: "png" });
-      out.full_page_base64 = Buffer.from(full).toString("base64");
-      out.primary_base64 = out.full_page_base64;
-    } catch {}
-
-    try {
-      const view = await page.screenshot({ fullPage: false, type: "png" });
-      out.viewport_base64 = Buffer.from(view).toString("base64");
-      if (!out.primary_base64) out.primary_base64 = out.viewport_base64;
-    } catch {}
-
-    try {
-      const iframeSelectors = [
-        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 80).replace(/"/g, '\\"')}"]` : "",
-        vendor && vendor !== "unknown" ? `iframe[src*="${vendor}"]` : "",
-        "iframe",
-      ].filter(Boolean);
-
-      for (const sel of iframeSelectors) {
-        const frameEl = page.locator(sel).first();
-        const count = await frameEl.count().catch(() => 0);
-        if (!count) continue;
-
-        const visible = await frameEl.isVisible().catch(() => false);
-        if (!visible) continue;
-
-        await frameEl.scrollIntoViewIfNeeded().catch(() => {});
-        await page.waitForTimeout(400);
-
-        const shot = await frameEl.screenshot({ type: "png" }).catch(() => null);
-        if (shot) {
-          out.iframe_base64 = Buffer.from(shot).toString("base64");
-          out.primary_base64 = out.iframe_base64 || out.primary_base64;
-          break;
-        }
-      }
-    } catch {}
-
-    if (!out.primary_base64) {
-      out.primary_base64 = "";
-    }
-
-    return out;
-  }
-
 
   // ─────────────────────────────────────────────────────────
   // fillIframeBookingWidget — interact inside booking iframes
@@ -3181,12 +3161,11 @@ class HotSessionManager {
 
       // Locate the iframe
       let frameLocator: any = null;
-      const iframeSelectors = [
-        `iframe[src*="${iframeSrc.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"]`,
+             const iframeSelectors = [
+        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
         `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
         "iframe",
-      ];
-
+      ].filter(Boolean) as string[];
       for (const sel of iframeSelectors) {
         try {
           const el = await page.$(sel);
@@ -3197,32 +3176,31 @@ class HotSessionManager {
           break;
         } catch {}
       }
-
       if (!frameLocator) {
         console.log("[IFRAME] Could not locate iframe, falling back to main page");
-
-        const fallbackSchema = {
-          id: "",
-          session_id: "",
-          url: page.url(),
-          domain: "",
-          kind: "availability",
-          fingerprint: "",
-          schema: {
-            ui_type: "iframe_fallback_main_page",
-            vendor,
-            src: iframeSrc,
-          },
-          dom_snapshot: null,
-        } as FormSchemaRow;
-
-        await this.fillAvailabilityDates(page, fallbackSchema, checkin, checkout, guests, rooms);
+        // Fall back to main page availability check
+        await this.fillAvailabilityDates(
+          page,
+          {
+            id: "",
+            session_id: "",
+            url: page.url(),
+            domain: "",
+            kind: "availability",
+            fingerprint: "",
+            schema: {},
+            dom_snapshot: null,
+          } as FormSchemaRow,
+          checkin,
+          checkout,
+          guests,
+          rooms
+        );
         const clicked = await this.clickAvailabilitySearch(page);
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-        return { ok: true, message: clicked ? "iframe_fallback_main_page" : "iframe_fallback_main_page_partial", screenshot_base64 };
+        return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
       }
-
 
       // ── Vendor-specific date selectors ────────────────────
       const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
@@ -3377,15 +3355,14 @@ class HotSessionManager {
       }
 
       await this.waitForAvailabilityResults(page);
-
-      const screenshots = await this.takeAvailabilityScreenshotSet(page, iframeSrc, vendor);
+      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
       return {
         ok: true,
         message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
-        screenshot_base64: screenshots.primary_base64,
+        screenshot_base64,
       };
-
+    
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[IFRAME] Error: ${msg}`);
@@ -3679,122 +3656,6 @@ class HotSessionManager {
 
     return actions;
   }
-  private normalizeRoomChoiceText(s: unknown): string {
-    return String(s ?? "")
-      .toLowerCase()
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[“”"']/g, " ")
-      .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  private async clickNearestRoomAction(page: Page, roomType: string): Promise<{ clicked: boolean; message: string }> {
-    const wanted = this.normalizeRoomChoiceText(roomType);
-    if (!wanted) return { clicked: false, message: "room_type_missing" };
-
-    const roomActionTexts = [
-      "избери",
-      "резервирай",
-      "резервиране",
-      "виж",
-      "детайли",
-      "book",
-      "reserve",
-      "select",
-      "choose",
-      "continue",
-      "next",
-    ];
-
-    const result = await page.evaluate(
-      ({ wanted, roomActionTexts }) => {
-        const norm = (s: unknown) =>
-          String(s ?? "")
-            .toLowerCase()
-            .normalize("NFKD")
-            .replace(/[\u0300-\u036f]/g, "")
-            .replace(/[“”"']/g, " ")
-            .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-
-        const isVisible = (el: Element | null) => {
-          if (!el) return false;
-          const style = window.getComputedStyle(el as HTMLElement);
-          if (!style) return false;
-          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-          const r = (el as HTMLElement).getBoundingClientRect?.();
-          return !!r && r.width > 0 && r.height > 0;
-        };
-
-        const clickableSelector = [
-          "button",
-          "a",
-          "[role='button']",
-          "[onclick]",
-          "input[type='button']",
-          "input[type='submit']"
-        ].join(",");
-
-        const all = Array.from(document.querySelectorAll("body *")) as HTMLElement[];
-
-        const candidates = all
-          .filter((el) => isVisible(el))
-          .map((el) => ({
-            el,
-            text: norm(el.innerText || el.textContent || ""),
-          }))
-          .filter((x) => x.text && (x.text.includes(wanted) || wanted.includes(x.text)));
-
-        if (!candidates.length) {
-          return { clicked: false, message: "room_card_not_found" };
-        }
-
-        const scored = candidates
-          .map((c) => {
-            let card: HTMLElement | null = c.el;
-            for (let i = 0; i < 6 && card; i++) {
-              const txt = norm(card.innerText || card.textContent || "");
-              if (txt.includes(wanted) && txt.length <= 1200) break;
-              card = card.parentElement;
-            }
-            return { ...c, card: card || c.el };
-          })
-          .sort((a, b) => a.text.length - b.text.length);
-
-        for (const item of scored) {
-          const card = item.card as HTMLElement;
-
-          const localButtons = Array.from(card.querySelectorAll(clickableSelector)) as HTMLElement[];
-          const picked = localButtons.find((btn) => {
-            const t = norm(btn.innerText || btn.textContent || (btn as HTMLInputElement).value || "");
-            return roomActionTexts.some((kw) => t.includes(norm(kw)));
-          });
-
-          if (picked && isVisible(picked)) {
-            picked.click();
-            return { clicked: true, message: `room_action_clicked:${(picked.innerText || picked.textContent || "").trim()}` };
-          }
-
-          if (isVisible(card)) {
-            card.click();
-            return { clicked: true, message: "room_card_clicked" };
-          }
-        }
-
-        return { clicked: false, message: "room_action_not_found" };
-      },
-      { wanted, roomActionTexts }
-    );
-
-    if (result.clicked) {
-      await page.waitForTimeout(1200).catch(() => {});
-    }
-
-    return result;
-  }
 
   // ─────────────────────────────────────────────────────────
   // makeReservation — full hotel booking workflow
@@ -3833,9 +3694,11 @@ class HotSessionManager {
         if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
         const data: Record<string, unknown> = {
-          check_in: checkin, checkin, arrival: checkin,
-          check_out: checkout, checkout, departure: checkout,
-          guests, adults: guests, rooms,
+         check_in: checkin,
+check_out: checkout,
+guests: guests,
+adults: guests,
+rooms: rooms,
         };
 
         const schemaAny: any = availSchema?.schema || {};
@@ -3867,13 +3730,11 @@ class HotSessionManager {
             rooms
           );
 
-          const screenshotSet = await this.takeAvailabilityScreenshotSet(page, iframeSrc, vendor);
-
           return {
             ok: result.ok,
             phase: "check",
             message: result.message,
-            screenshot_base64: screenshotSet.primary_base64,
+            screenshot_base64: result.screenshot_base64,
             observation: {
               type: "availability_iframe_check",
               check_in: checkin,
@@ -3883,13 +3744,8 @@ class HotSessionManager {
               url: page.url(),
               iframe_src: iframeSrc,
               vendor,
-              screenshot_base64: screenshotSet.primary_base64,
-              screenshot_full_page_base64: screenshotSet.full_page_base64,
-              screenshot_viewport_base64: screenshotSet.viewport_base64,
-              screenshot_iframe_base64: screenshotSet.iframe_base64,
             },
           };
-
         }
 
         // Standard availability check
@@ -3967,35 +3823,11 @@ class HotSessionManager {
     }
 
     if (req.phase === "reserve") {
-      // ── PHASE 2: Fill reservation form until payment page ────
+      // ── PHASE 2: continue booking step-by-step ────
       try {
-        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
-
-                if (req.room_type) {
-          const roomPick = await this.clickNearestRoomAction(page, req.room_type);
-          console.log(`[RESERVATION][ROOM_PICK] room_type="${req.room_type}" clicked=${roomPick.clicked} message=${roomPick.message}`);
-
-          if (!roomPick.clicked) {
-            const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-            return {
-              ok: false,
-              phase: "reserve",
-              message: "reserve_room_selection_failed",
-              booking_url: "",
-              screenshot_base64,
-              observation: {
-                url: page.url(),
-                current_step: "room_selection",
-                room_type: req.room_type,
-                missing_required: [`Избор на стая: ${req.room_type}`],
-                can_continue: false,
-                payment_required: false,
-                finalized: false,
-              },
-            };
-          }
-        }
-
+        console.log(
+          `[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`
+        );
 
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
@@ -4004,32 +3836,122 @@ class HotSessionManager {
           phone: req.guest_phone || "",
           message: req.guest_message || "",
           note: req.guest_message || "",
-          // Also include dates for pre-populated forms
-          check_in: checkin, checkin,
-          check_out: checkout, checkout,
-          guests, adults: guests, rooms,
+          check_in: checkin,
+          check_out: checkout,
+          guests: guests,
+          adults: guests,
+          rooms: rooms,
           room_type: req.room_type || "",
         };
 
-        // Find a form schema (contact/reservation form)
-        let formSchema = session.formSchemas.find(s =>
-          s.kind === "form" || s.kind === "wizard"
+        const beforeUrl = page.url();
+        console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
+        await page.waitForTimeout(800);
+
+        // STEP 1: first select the chosen room on the CURRENT booking page
+        let roomSelectionAttempted = false;
+        let roomSelectionSucceeded = false;
+
+        if (req.room_type) {
+          roomSelectionAttempted = true;
+
+          const roomPatterns = [
+            `button:has-text("${req.room_type}")`,
+            `[role="button"]:has-text("${req.room_type}")`,
+            `a:has-text("${req.room_type}")`,
+            `label:has-text("${req.room_type}")`,
+            `div:has-text("${req.room_type}")`,
+            `li:has-text("${req.room_type}")`,
+          ];
+
+          for (const sel of roomPatterns) {
+            try {
+              const loc = page.locator(sel).first();
+              const count = await page.locator(sel).count().catch(() => 0);
+              if (!count) continue;
+
+              await loc.scrollIntoViewIfNeeded().catch(() => {});
+              await loc.click({ timeout: 1500 }).catch(async () => {
+                await loc.dispatchEvent("click").catch(() => {});
+              });
+
+              await page.waitForTimeout(1200);
+
+              const afterUrl = page.url();
+              const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+
+              if (
+                afterUrl !== beforeUrl ||
+                pageText.includes("име") ||
+                pageText.includes("email") ||
+                pageText.includes("имейл") ||
+                pageText.includes("телефон") ||
+                pageText.includes("card") ||
+                pageText.includes("плащ")
+              ) {
+                roomSelectionSucceeded = true;
+                console.log(`[RESERVATION][ROOM] selected via ${sel}`);
+                break;
+              }
+            } catch {}
+          }
+
+          if (!roomSelectionSucceeded) {
+            console.log("[RESERVATION][ROOM] direct room click not confirmed from DOM/url change");
+          }
+        }
+
+        const currentUrlAfterRoom = page.url();
+        const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
+        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
+
+        // STEP 2: after room selection, return the REAL missing fields from the current booking step
+        const hasGuestIdentity =
+          !!String(req.guest_name || "").trim() &&
+          !!String(req.guest_email || "").trim() &&
+          !!String(req.guest_phone || "").trim();
+
+        if (req.room_type && !hasGuestIdentity) {
+          return {
+            ok: true,
+            phase: "reserve",
+            message: "reserve_current_step_needs_input",
+            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
+            screenshot_base64: screenshotAfterRoom,
+            observation: {
+              url: currentUrlAfterRoom,
+              before_url: beforeUrl,
+              room_type: req.room_type || "",
+              room_selection_attempted: roomSelectionAttempted,
+              room_selection_succeeded: roomSelectionSucceeded,
+              current_step: stepNeedsAfterRoom.current_step,
+              missing_required: stepNeedsAfterRoom.missing_required,
+              can_continue: stepNeedsAfterRoom.can_continue,
+              payment_required: stepNeedsAfterRoom.payment_required,
+              finalized: false,
+            },
+          };
+        }
+
+        // STEP 3: only now try to fill personal data on the CURRENT page/state
+        const formSchema = session.formSchemas.find(
+          (s) => s.kind === "form" || s.kind === "wizard"
         );
 
         if (formSchema) {
-          const beforeUrl = page.url();
-          console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
-          await page.waitForTimeout(800);
-
-          // First try to fill the CURRENT page/state, without jumping back
           if (formSchema.schema.choices?.length) {
-            const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
-            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
+            const choiceActions = await this.fillStyledChoiceGroups(
+              page,
+              formSchema.schema.choices,
+              guestData
+            );
+            choiceActions.forEach((a) => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
           }
 
-          const fillResult = formSchema.kind === "wizard"
-            ? await this.fillWizard(page, formSchema, guestData, false, false)
-            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+          const fillResult =
+            formSchema.kind === "wizard"
+              ? await this.fillWizard(page, formSchema, guestData, false, false)
+              : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
 
           const currentUrl = page.url();
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
@@ -4038,99 +3960,125 @@ class HotSessionManager {
             !fillResult?.ok &&
             String(fillResult?.message || "").toLowerCase().includes("no_match");
 
+          const stepNeedsAfterFill = await this.inferCurrentBookingStepNeeds(page);
+
           if (noMatchOnCurrentPage) {
-            console.log("[RESERVATION][RESERVE] no matched fields on current step — keeping current page, not navigating back");
+            console.log(
+              `[RESERVATION][RESERVE] no matched fields on current step — missing=${stepNeedsAfterFill.missing_required.join(" | ") || "none"}`
+            );
 
-            const missingRequired = ["current_booking_step_fields"];
-            return {
-              ok: false,
-              phase: "reserve",
-              message: "reserve_current_step_needs_input",
-              booking_url: "",
-              screenshot_base64,
-              observation: {
-                url: currentUrl,
-                before_url: beforeUrl,
-                fill_message: fillResult.message,
-                confirmed_price: req.confirmed_price || "",
-                current_step: "reserve",
-                missing_required: missingRequired,
-                can_continue: false,
-                payment_required: false,
-                finalized: false,
-              },
-            };
-          }
-
-                   const fillObs: any = fillResult?.observation || {};
-          const fillMissing = Array.isArray(fillObs?.missing_required)
-            ? fillObs.missing_required
-            : Array.isArray(fillObs?.wizard_next?.missing_required)
-            ? fillObs.wizard_next.missing_required.map((x: any) => x?.label || x?.name || "").filter(Boolean)
-            : [];
-
-          return {
-            ok: !!fillResult?.ok,
+                    return {
+            ok: false,
             phase: "reserve",
-            message: fillResult.message,
-            booking_url: fillResult?.ok ? currentUrl : "",
+            message: "reserve_current_step_needs_input",
+            booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
             screenshot_base64,
             observation: {
               url: currentUrl,
               before_url: beforeUrl,
               fill_message: fillResult.message,
               confirmed_price: req.confirmed_price || "",
-              current_step: "reserve",
               room_type: req.room_type || "",
-              missing_required: fillMissing,
-              can_continue: !!fillResult?.ok,
-              payment_required: false,
+              current_step: stepNeedsAfterFill.current_step,
+              missing_required: stepNeedsAfterFill.missing_required,
+              can_continue: stepNeedsAfterFill.can_continue,
+              payment_required: stepNeedsAfterFill.payment_required,
               finalized: false,
             },
           };
-
         }
 
-        // No form schema — keep current booking step and return continuation state
-        console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
-        await page.waitForTimeout(800);
+        if (stepNeedsAfterFill.missing_required.length > 0) {
+          console.log(
+            `[RESERVATION][RESERVE] after fill still missing=${stepNeedsAfterFill.missing_required.join(" | ")}`
+          );
 
-        const obs = await this.quickObserve(page);
-        const currentUrl = page.url();
-        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+          return {
+            ok: true,
+            phase: "reserve",
+            message: "reserve_current_step_needs_input",
+            booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
+            screenshot_base64,
+            observation: {
+              url: currentUrl,
+              before_url: beforeUrl,
+              fill_message: fillResult.message,
+              confirmed_price: req.confirmed_price || "",
+              room_type: req.room_type || "",
+              current_step: stepNeedsAfterFill.current_step,
+              missing_required: stepNeedsAfterFill.missing_required,
+              can_continue: stepNeedsAfterFill.can_continue,
+              payment_required: stepNeedsAfterFill.payment_required,
+              finalized: false,
+            },
+          };
+        }
 
         return {
-          ok: true,
+          ok: !!fillResult?.ok,
           phase: "reserve",
-          message: "no_form_schema_found_current_step_preserved",
+          message: fillResult.message,
           booking_url: currentUrl,
           screenshot_base64,
           observation: {
-            ...(obs || {}),
             url: currentUrl,
+            before_url: beforeUrl,
+            fill_message: fillResult.message,
             confirmed_price: req.confirmed_price || "",
+            room_type: req.room_type || "",
+            current_step: stepNeedsAfterFill.current_step,
+            missing_required: [],
+            can_continue: true,
+            payment_required: stepNeedsAfterFill.payment_required,
+            finalized: false,
           },
         };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
-        try {
-          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-          return {
-            ok: true, phase: "reserve",
-            message: `reserve_error_screenshot: ${msg}`,
-            booking_url: page.url(),
-            screenshot_base64,
-          };
-        } catch {
-          return { ok: false, phase: "reserve", message: `Reserve error: ${msg}` };
-        }
+      }
+
+      // No form schema — keep current booking step and return continuation state
+      await page.waitForTimeout(800);
+
+      const obs = await this.quickObserve(page);
+      const currentUrl = page.url();
+      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+      return {
+        ok: true,
+        phase: "reserve",
+        message: "no_form_schema_found_current_step_preserved",
+        booking_url: currentUrl,
+        screenshot_base64,
+        observation: {
+          ...(obs || {}),
+          url: currentUrl,
+          confirmed_price: req.confirmed_price || "",
+        },
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
+      try {
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return {
+          ok: true,
+          phase: "reserve",
+          message: `reserve_error_screenshot: ${msg}`,
+          booking_url: page.url(),
+          screenshot_base64,
+        };
+      } catch {
+        return {
+          ok: false,
+          phase: "reserve",
+          message: `Reserve error: ${msg}`,
+        };
       }
     }
-
-    return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
   }
+
+  return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
 }
+
 
 // ───────────────────────────────────────────────────────────────
 // Server
