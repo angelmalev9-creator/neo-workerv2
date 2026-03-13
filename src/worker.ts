@@ -2723,6 +2723,8 @@ class HotSessionManager {
       const timing = Date.now() - t0;
       console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars`);
 
+      const screenshotSet = await this.takeAvailabilityScreenshotSet(page);
+
       return {
         ok: true,
         message: "availability_screenshot_ready",
@@ -2732,13 +2734,17 @@ class HotSessionManager {
           check_out: checkout,
           guests,
           rooms,
-          screenshot_base64: screenshotBase64,
+          screenshot_base64: screenshotSet.primary_base64,
+          screenshot_full_page_base64: screenshotSet.full_page_base64,
+          screenshot_viewport_base64: screenshotSet.viewport_base64,
+          screenshot_iframe_base64: screenshotSet.iframe_base64,
           url: page.url(),
           timing_ms: timing,
           fill_result: filled,
           search_clicked: clicked,
         },
       };
+
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[AVAIL] Error: ${msg}`);
@@ -3081,7 +3087,6 @@ class HotSessionManager {
   }
 
   private async takeAvailabilityScreenshot(page: Page): Promise<string> {
-    // Try full-page first, fallback to viewport
     try {
       const buf = await page.screenshot({ fullPage: true, type: "png" });
       return Buffer.from(buf).toString("base64");
@@ -3090,6 +3095,72 @@ class HotSessionManager {
       return Buffer.from(buf).toString("base64");
     }
   }
+
+  private async takeAvailabilityScreenshotSet(
+    page: Page,
+    iframeSrc?: string,
+    vendor?: string
+  ): Promise<{
+    primary_base64: string;
+    full_page_base64?: string;
+    viewport_base64?: string;
+    iframe_base64?: string;
+  }> {
+    const out: {
+      primary_base64: string;
+      full_page_base64?: string;
+      viewport_base64?: string;
+      iframe_base64?: string;
+    } = {
+      primary_base64: "",
+    };
+
+    try {
+      const full = await page.screenshot({ fullPage: true, type: "png" });
+      out.full_page_base64 = Buffer.from(full).toString("base64");
+      out.primary_base64 = out.full_page_base64;
+    } catch {}
+
+    try {
+      const view = await page.screenshot({ fullPage: false, type: "png" });
+      out.viewport_base64 = Buffer.from(view).toString("base64");
+      if (!out.primary_base64) out.primary_base64 = out.viewport_base64;
+    } catch {}
+
+    try {
+      const iframeSelectors = [
+        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 80).replace(/"/g, '\\"')}"]` : "",
+        vendor && vendor !== "unknown" ? `iframe[src*="${vendor}"]` : "",
+        "iframe",
+      ].filter(Boolean);
+
+      for (const sel of iframeSelectors) {
+        const frameEl = page.locator(sel).first();
+        const count = await frameEl.count().catch(() => 0);
+        if (!count) continue;
+
+        const visible = await frameEl.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        await frameEl.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(400);
+
+        const shot = await frameEl.screenshot({ type: "png" }).catch(() => null);
+        if (shot) {
+          out.iframe_base64 = Buffer.from(shot).toString("base64");
+          out.primary_base64 = out.iframe_base64 || out.primary_base64;
+          break;
+        }
+      }
+    } catch {}
+
+    if (!out.primary_base64) {
+      out.primary_base64 = "";
+    }
+
+    return out;
+  }
+
 
   // ─────────────────────────────────────────────────────────
   // fillIframeBookingWidget — interact inside booking iframes
@@ -3306,13 +3377,15 @@ class HotSessionManager {
       }
 
       await this.waitForAvailabilityResults(page);
-      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+
+      const screenshots = await this.takeAvailabilityScreenshotSet(page, iframeSrc, vendor);
 
       return {
         ok: true,
         message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
-        screenshot_base64,
+        screenshot_base64: screenshots.primary_base64,
       };
+
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[IFRAME] Error: ${msg}`);
@@ -3794,11 +3867,13 @@ class HotSessionManager {
             rooms
           );
 
+          const screenshotSet = await this.takeAvailabilityScreenshotSet(page, iframeSrc, vendor);
+
           return {
             ok: result.ok,
             phase: "check",
             message: result.message,
-            screenshot_base64: result.screenshot_base64,
+            screenshot_base64: screenshotSet.primary_base64,
             observation: {
               type: "availability_iframe_check",
               check_in: checkin,
@@ -3808,8 +3883,13 @@ class HotSessionManager {
               url: page.url(),
               iframe_src: iframeSrc,
               vendor,
+              screenshot_base64: screenshotSet.primary_base64,
+              screenshot_full_page_base64: screenshotSet.full_page_base64,
+              screenshot_viewport_base64: screenshotSet.viewport_base64,
+              screenshot_iframe_base64: screenshotSet.iframe_base64,
             },
           };
+
         }
 
         // Standard availability check
