@@ -2112,80 +2112,6 @@ class HotSessionManager {
     }
   }
 
-  private async inferCurrentBookingStepNeeds(page: Page): Promise<{
-    missing_required: string[];
-    current_step: string;
-    payment_required: boolean;
-    can_continue: boolean;
-  }> {
-    try {
-      const unfilled = await this.countUnfilledVisibleFields(page);
-      const scanned = await this.scanWizardStep(page).catch(() => ({
-        fields: [],
-        choices: [],
-        choiceGroups: [],
-      }));
-
-      const bodyText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-      const currentUrl = page.url().toLowerCase();
-
-      const paymentRequired =
-        /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
-        /payment|checkout|stripe|pay/.test(currentUrl);
-
-      const out: string[] = [];
-      const seen = new Set<string>();
-
-      const push = (labelRaw: string) => {
-        const label = String(labelRaw || "").trim();
-        if (!label) return;
-        const key = label.toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
-        out.push(label);
-      };
-
-      for (const lbl of unfilled.labels || []) push(lbl);
-
-      for (const f of scanned.fields || []) {
-        if (!f?.required) continue;
-        const label =
-          String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
-        if (!label) continue;
-        push(label);
-      }
-
-      for (const group of scanned.choiceGroups || []) {
-        if (!group?.required) continue;
-        const groupLabel =
-          String(group.label || group.name || "").trim() ||
-          (Array.isArray(group.options) ? group.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "");
-        if (!groupLabel) continue;
-        push(groupLabel);
-      }
-
-      console.log(
-        `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} missing=${out.join(" | ") || "none"}`
-      );
-
-      return {
-        missing_required: out.slice(0, 20),
-        current_step: paymentRequired ? "payment" : "reserve",
-        payment_required: paymentRequired,
-        can_continue: out.length === 0,
-      };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.log(`[RESERVATION][STEP-NEEDS][ERROR] ${msg}`);
-      return {
-        missing_required: [],
-        current_step: "reserve",
-        payment_required: false,
-        can_continue: true,
-      };
-    }
-  }
-
   // ✅ stricter success: require success keywords AND no visible inputs/selects/textarea OR URL indicates thanks
   private async detectWizardSuccess(page: Page): Promise<boolean> {
     try {
@@ -2727,13 +2653,8 @@ class HotSessionManager {
       const filled = await this.fillAvailabilityDates(page, schema as any, checkin, checkout, guests, rooms);
       console.log(`[AVAIL] fillDates=${JSON.stringify(filled)}`);
 
-      const schemaGuestFields = Array.isArray(schemaAny?.guest_fields) ? schemaAny.guest_fields : [];
-      const schemaRequiresGuests =
-        schemaGuestFields.length > 0 ||
-        !!schemaAny?.detected_fields?.guests;
-
-      // ── 4. Click Search / Check button ────────────────────────
-      const requiredFilled =
+         // ── 4. Click Search / Check button ────────────────────────
+         const requiredFilled =
         filled.checkin &&
         filled.checkout &&
         (!schemaRequiresGuests || filled.guests);
@@ -3161,11 +3082,12 @@ class HotSessionManager {
 
       // Locate the iframe
       let frameLocator: any = null;
-             const iframeSelectors = [
-        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
+      const iframeSelectors = [
+        `iframe[src*="${iframeSrc.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"]`,
         `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
         "iframe",
-      ].filter(Boolean) as string[];
+      ];
+
       for (const sel of iframeSelectors) {
         try {
           const el = await page.$(sel);
@@ -3176,26 +3098,11 @@ class HotSessionManager {
           break;
         } catch {}
       }
+
       if (!frameLocator) {
         console.log("[IFRAME] Could not locate iframe, falling back to main page");
         // Fall back to main page availability check
-        await this.fillAvailabilityDates(
-          page,
-          {
-            id: "",
-            session_id: "",
-            url: page.url(),
-            domain: "",
-            kind: "availability",
-            fingerprint: "",
-            schema: {},
-            dom_snapshot: null,
-          } as FormSchemaRow,
-          checkin,
-          checkout,
-          guests,
-          rooms
-        );
+        this.fillAvailabilityDates(page, availSchema as any, checkin, checkout, guests, rooms)
         const clicked = await this.clickAvailabilitySearch(page);
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
@@ -3362,7 +3269,6 @@ class HotSessionManager {
         message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
         screenshot_base64,
       };
-    
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[IFRAME] Error: ${msg}`);
@@ -3694,11 +3600,9 @@ class HotSessionManager {
         if (!availSchema) availSchema = session.formSchemas.find(s => s.kind === "form" || s.kind === "wizard");
 
         const data: Record<string, unknown> = {
-         check_in: checkin,
-check_out: checkout,
-guests: guests,
-adults: guests,
-rooms: rooms,
+          check_in: checkin, checkin, arrival: checkin,
+          check_out: checkout, checkout, departure: checkout,
+          guests, adults: guests, rooms,
         };
 
         const schemaAny: any = availSchema?.schema || {};
@@ -3823,11 +3727,9 @@ rooms: rooms,
     }
 
     if (req.phase === "reserve") {
-      // ── PHASE 2: continue booking step-by-step ────
+      // ── PHASE 2: Fill reservation form until payment page ────
       try {
-        console.log(
-          `[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`
-        );
+        console.log(`[RESERVATION] Starting reserve phase: name=${req.guest_name} email=${req.guest_email} room_type=${req.room_type || ""}`);
 
         const guestData: Record<string, unknown> = {
           name: req.guest_name || "",
@@ -3836,122 +3738,32 @@ rooms: rooms,
           phone: req.guest_phone || "",
           message: req.guest_message || "",
           note: req.guest_message || "",
-          check_in: checkin,
-          check_out: checkout,
-          guests: guests,
-          adults: guests,
-          rooms: rooms,
+          // Also include dates for pre-populated forms
+          check_in: checkin, checkin,
+          check_out: checkout, checkout,
+          guests, adults: guests, rooms,
           room_type: req.room_type || "",
         };
 
-        const beforeUrl = page.url();
-        console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
-        await page.waitForTimeout(800);
-
-        // STEP 1: first select the chosen room on the CURRENT booking page
-        let roomSelectionAttempted = false;
-        let roomSelectionSucceeded = false;
-
-        if (req.room_type) {
-          roomSelectionAttempted = true;
-
-          const roomPatterns = [
-            `button:has-text("${req.room_type}")`,
-            `[role="button"]:has-text("${req.room_type}")`,
-            `a:has-text("${req.room_type}")`,
-            `label:has-text("${req.room_type}")`,
-            `div:has-text("${req.room_type}")`,
-            `li:has-text("${req.room_type}")`,
-          ];
-
-          for (const sel of roomPatterns) {
-            try {
-              const loc = page.locator(sel).first();
-              const count = await page.locator(sel).count().catch(() => 0);
-              if (!count) continue;
-
-              await loc.scrollIntoViewIfNeeded().catch(() => {});
-              await loc.click({ timeout: 1500 }).catch(async () => {
-                await loc.dispatchEvent("click").catch(() => {});
-              });
-
-              await page.waitForTimeout(1200);
-
-              const afterUrl = page.url();
-              const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-
-              if (
-                afterUrl !== beforeUrl ||
-                pageText.includes("име") ||
-                pageText.includes("email") ||
-                pageText.includes("имейл") ||
-                pageText.includes("телефон") ||
-                pageText.includes("card") ||
-                pageText.includes("плащ")
-              ) {
-                roomSelectionSucceeded = true;
-                console.log(`[RESERVATION][ROOM] selected via ${sel}`);
-                break;
-              }
-            } catch {}
-          }
-
-          if (!roomSelectionSucceeded) {
-            console.log("[RESERVATION][ROOM] direct room click not confirmed from DOM/url change");
-          }
-        }
-
-        const currentUrlAfterRoom = page.url();
-        const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
-        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
-
-        // STEP 2: after room selection, return the REAL missing fields from the current booking step
-        const hasGuestIdentity =
-          !!String(req.guest_name || "").trim() &&
-          !!String(req.guest_email || "").trim() &&
-          !!String(req.guest_phone || "").trim();
-
-        if (req.room_type && !hasGuestIdentity) {
-          return {
-            ok: true,
-            phase: "reserve",
-            message: "reserve_current_step_needs_input",
-            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
-            screenshot_base64: screenshotAfterRoom,
-            observation: {
-              url: currentUrlAfterRoom,
-              before_url: beforeUrl,
-              room_type: req.room_type || "",
-              room_selection_attempted: roomSelectionAttempted,
-              room_selection_succeeded: roomSelectionSucceeded,
-              current_step: stepNeedsAfterRoom.current_step,
-              missing_required: stepNeedsAfterRoom.missing_required,
-              can_continue: stepNeedsAfterRoom.can_continue,
-              payment_required: stepNeedsAfterRoom.payment_required,
-              finalized: false,
-            },
-          };
-        }
-
-        // STEP 3: only now try to fill personal data on the CURRENT page/state
-        const formSchema = session.formSchemas.find(
-          (s) => s.kind === "form" || s.kind === "wizard"
+        // Find a form schema (contact/reservation form)
+        let formSchema = session.formSchemas.find(s =>
+          s.kind === "form" || s.kind === "wizard"
         );
 
-               if (formSchema) {
+        if (formSchema) {
+          const beforeUrl = page.url();
+          console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
+          await page.waitForTimeout(800);
+
+          // First try to fill the CURRENT page/state, without jumping back
           if (formSchema.schema.choices?.length) {
-            const choiceActions = await this.fillStyledChoiceGroups(
-              page,
-              formSchema.schema.choices,
-              guestData
-            );
-            choiceActions.forEach((a) => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
+            const choiceActions = await this.fillStyledChoiceGroups(page, formSchema.schema.choices, guestData);
+            choiceActions.forEach(a => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
           }
 
-          const fillResult =
-            formSchema.kind === "wizard"
-              ? await this.fillWizard(page, formSchema, guestData, false, false)
-              : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
+          const fillResult = formSchema.kind === "wizard"
+            ? await this.fillWizard(page, formSchema, guestData, false, false)
+            : await this.fillFormSchema(page, formSchema, guestData, undefined, false, false);
 
           const currentUrl = page.url();
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
@@ -3960,55 +3772,25 @@ rooms: rooms,
             !fillResult?.ok &&
             String(fillResult?.message || "").toLowerCase().includes("no_match");
 
-          const stepNeedsAfterFill = await this.inferCurrentBookingStepNeeds(page);
-
           if (noMatchOnCurrentPage) {
-            console.log(
-              `[RESERVATION][RESERVE] no matched fields on current step — missing=${stepNeedsAfterFill.missing_required.join(" | ") || "none"}`
-            );
+            console.log("[RESERVATION][RESERVE] no matched fields on current step — keeping current page, not navigating back");
 
+            const missingRequired = ["current_booking_step_fields"];
             return {
               ok: false,
               phase: "reserve",
               message: "reserve_current_step_needs_input",
-              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
+              booking_url: "",
               screenshot_base64,
               observation: {
                 url: currentUrl,
                 before_url: beforeUrl,
                 fill_message: fillResult.message,
                 confirmed_price: req.confirmed_price || "",
-                room_type: req.room_type || "",
-                current_step: stepNeedsAfterFill.current_step,
-                missing_required: stepNeedsAfterFill.missing_required,
-                can_continue: stepNeedsAfterFill.can_continue,
-                payment_required: stepNeedsAfterFill.payment_required,
-                finalized: false,
-              },
-            };
-          }
-
-          if (stepNeedsAfterFill.missing_required.length > 0) {
-            console.log(
-              `[RESERVATION][RESERVE] after fill still missing=${stepNeedsAfterFill.missing_required.join(" | ")}`
-            );
-
-            return {
-              ok: true,
-              phase: "reserve",
-              message: "reserve_current_step_needs_input",
-              booking_url: stepNeedsAfterFill.payment_required ? currentUrl : "",
-              screenshot_base64,
-              observation: {
-                url: currentUrl,
-                before_url: beforeUrl,
-                fill_message: fillResult.message,
-                confirmed_price: req.confirmed_price || "",
-                room_type: req.room_type || "",
-                current_step: stepNeedsAfterFill.current_step,
-                missing_required: stepNeedsAfterFill.missing_required,
-                can_continue: stepNeedsAfterFill.can_continue,
-                payment_required: stepNeedsAfterFill.payment_required,
+                current_step: "reserve",
+                missing_required: missingRequired,
+                can_continue: false,
+                payment_required: false,
                 finalized: false,
               },
             };
@@ -4025,24 +3807,24 @@ rooms: rooms,
               before_url: beforeUrl,
               fill_message: fillResult.message,
               confirmed_price: req.confirmed_price || "",
-              room_type: req.room_type || "",
-              current_step: stepNeedsAfterFill.current_step,
+              current_step: "reserve",
               missing_required: [],
               can_continue: true,
-              payment_required: stepNeedsAfterFill.payment_required,
+              payment_required: false,
               finalized: false,
             },
           };
         }
 
         // No form schema — keep current booking step and return continuation state
+        console.log("[RESERVATION] No form schema for reserve phase — staying on current page");
         await page.waitForTimeout(800);
 
         const obs = await this.quickObserve(page);
         const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
-               return {
+        return {
           ok: true,
           phase: "reserve",
           message: "no_form_schema_found_current_step_preserved",
@@ -4060,18 +3842,13 @@ rooms: rooms,
         try {
           const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
           return {
-            ok: true,
-            phase: "reserve",
+            ok: true, phase: "reserve",
             message: `reserve_error_screenshot: ${msg}`,
             booking_url: page.url(),
             screenshot_base64,
           };
         } catch {
-          return {
-            ok: false,
-            phase: "reserve",
-            message: `Reserve error: ${msg}`,
-          };
+          return { ok: false, phase: "reserve", message: `Reserve error: ${msg}` };
         }
       }
     }
@@ -4079,6 +3856,7 @@ rooms: rooms,
     return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
   }
 }
+
 // ───────────────────────────────────────────────────────────────
 // Server
 // ───────────────────────────────────────────────────────────────
