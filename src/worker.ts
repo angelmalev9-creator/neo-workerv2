@@ -3857,6 +3857,10 @@ rooms: rooms,
 
           const normRoom = String(req.room_type || "")
             .toLowerCase()
+            .normalize("NFKD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[“”"']/g, " ")
+            .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
             .replace(/\s+/g, " ")
             .trim();
 
@@ -3954,8 +3958,9 @@ rooms: rooms,
                   }
                 }
 
-                const fallbackButtons = container.locator(`button, [role="button"], input[type="button"], input[type="submit"]`);
-                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 2);
+                const fallbackButtons = container.locator(`button, [role="button"], a, input[type="button"], input[type="submit"]`);
+                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 4);
+
                 for (let j = 0; j < fallbackCount; j++) {
                   const btn = fallbackButtons.nth(j);
                   if (!(await btn.isVisible().catch(() => false))) continue;
@@ -3976,7 +3981,10 @@ rooms: rooms,
               `button:has-text("${req.room_type}")`,
               `[role="button"]:has-text("${req.room_type}")`,
               `label:has-text("${req.room_type}")`,
+              `a:has-text("${req.room_type}")`,
+              `text="${req.room_type}"`,
             ];
+
             for (const sel of directSelectors) {
               const loc = ctx.locator(sel).first();
               const count = await ctx.locator(sel).count().catch(() => 0);
@@ -4019,6 +4027,27 @@ rooms: rooms,
         const currentUrlAfterRoom = page.url();
         const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
         const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
+
+        if (roomSelectionAttempted && !roomSelectionSucceeded) {
+          return {
+            ok: false,
+            phase: "reserve",
+            message: "room_selection_not_confirmed",
+            booking_url: "",
+            screenshot_base64: screenshotAfterRoom,
+            observation: {
+              url: currentUrlAfterRoom,
+              before_url: beforeUrl,
+              room_type: req.room_type || "",
+              current_step: stepNeedsAfterRoom.current_step,
+              missing_required: stepNeedsAfterRoom.missing_required,
+              can_continue: stepNeedsAfterRoom.can_continue,
+              payment_required: stepNeedsAfterRoom.payment_required,
+              finalized: false,
+            },
+          };
+        }
+
 
         // STEP 2: after room selection, return the REAL missing fields from the current booking step
         const hasGuestIdentity =
@@ -4156,19 +4185,27 @@ rooms: rooms,
         const obs = await this.quickObserve(page);
         const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        const stepNeeds = await this.inferCurrentBookingStepNeeds(page);
 
-               return {
+        return {
           ok: true,
           phase: "reserve",
           message: "no_form_schema_found_current_step_preserved",
-          booking_url: currentUrl,
+          booking_url: stepNeeds.payment_required ? currentUrl : "",
           screenshot_base64,
           observation: {
             ...(obs || {}),
             url: currentUrl,
             confirmed_price: req.confirmed_price || "",
+            room_type: req.room_type || "",
+            current_step: stepNeeds.current_step,
+            missing_required: stepNeeds.missing_required,
+            can_continue: stepNeeds.can_continue,
+            payment_required: stepNeeds.payment_required,
+            finalized: false,
           },
         };
+
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error(`[RESERVATION][RESERVE] Error: ${msg}`);
