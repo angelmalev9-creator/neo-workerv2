@@ -1,7 +1,7 @@
 /**
- * NEO WORKER v7.0.1-booking — Universal, deterministic, schema-first
+ * NEO WORKER v7.0.0-booking — Universal, deterministic, schema-first
  *
- * v7.0.1-booking — НОВO:
+ * v7.0.0-booking — НОВO:
  * - makeReservation(): пълен workflow за резервация
  *     1. Попълва availability form (дати, гости)
  *     2. Взима screenshot → Gemini парсва цени/стаи
@@ -3156,103 +3156,54 @@ class HotSessionManager {
     guests: string,
     rooms: string
   ): Promise<{ ok: boolean; message: string; screenshot_base64?: string }> {
-    const safeScreenshot = async () => {
-      try {
-        return await this.takeAvailabilityScreenshot(page);
-      } catch {
-        return "";
-      }
-    };
-
     try {
-      const vendorNorm = String(vendor || "unknown").toLowerCase().trim();
-      console.log(`[IFRAME] vendor=${vendorNorm} src=${String(iframeSrc || "").slice(0, 120)}`);
+      console.log(`[IFRAME] vendor=${vendor} src=${iframeSrc.slice(0, 80)}`);
 
-      let iframeSelector = "";
-      const iframeHandles = await page.locator("iframe").elementHandles().catch(() => []);
-      for (const handle of iframeHandles) {
+      // Locate the iframe
+      let frameLocator: any = null;
+             const iframeSelectors = [
+        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
+        `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
+        "iframe",
+      ].filter(Boolean) as string[];
+      for (const sel of iframeSelectors) {
         try {
-          const src = String((await handle.getAttribute("src")) || "");
-          const visible = await handle.isVisible().catch(() => false);
+          const el = await page.$(sel);
+          if (!el) continue;
+          const visible = await el.isVisible().catch(() => false);
           if (!visible) continue;
-
-          const srcLower = src.toLowerCase();
-          const wantIframeSrc = String(iframeSrc || "").toLowerCase();
-          if (
-            (wantIframeSrc && srcLower.includes("quendoo")) ||
-            (vendorNorm && vendorNorm !== "unknown" && srcLower.includes(vendorNorm)) ||
-            srcLower.includes("booking")
-          ) {
-            const exactSrc = src.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-            iframeSelector = `iframe[src="${exactSrc}"]`;
-            console.log(`[IFRAME] matched iframe src=${src.slice(0, 160)}`);
-            break;
-          }
+          frameLocator = page.frameLocator(sel);
+          break;
         } catch {}
       }
-
-      if (!iframeSelector) {
-        const screenshot_base64 = await safeScreenshot();
-        console.log("[IFRAME] no matching visible iframe found");
-        return {
-          ok: false,
-          message: "iframe_not_found",
-          screenshot_base64: screenshot_base64 || undefined,
-        };
+      if (!frameLocator) {
+        console.log("[IFRAME] Could not locate iframe, falling back to main page");
+        // Fall back to main page availability check
+        await this.fillAvailabilityDates(
+          page,
+          {
+            id: "",
+            session_id: "",
+            url: page.url(),
+            domain: "",
+            kind: "availability",
+            fingerprint: "",
+            schema: {},
+            dom_snapshot: null,
+          } as FormSchemaRow,
+          checkin,
+          checkout,
+          guests,
+          rooms
+        );
+        const clicked = await this.clickAvailabilitySearch(page);
+        await this.waitForAvailabilityResults(page);
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
       }
 
-      const frameLocator = page.frameLocator(iframeSelector);
-
+      // ── Vendor-specific date selectors ────────────────────
       const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
-        quendoo: {
-          checkin: [
-            'input[name*="check"]',
-            'input[name*="arrival"]',
-            'input[id*="check"]',
-            'input[id*="arrival"]',
-            'input[placeholder*="Пристигане"]',
-            'input[placeholder*="Arrival"]',
-            'input[placeholder*="Check"]',
-            '[data-testid*="check"] input',
-            '[data-testid*="arrival"] input',
-            'input'
-          ],
-          checkout: [
-            'input[name*="out"]',
-            'input[name*="departure"]',
-            'input[id*="out"]',
-            'input[id*="departure"]',
-            'input[placeholder*="Напускане"]',
-            'input[placeholder*="Заминаване"]',
-            'input[placeholder*="Departure"]',
-            'input[placeholder*="Check-out"]',
-            'input'
-          ],
-          guests: [
-            'select[name*="guest"]',
-            'select[name*="adult"]',
-            'input[name*="guest"]',
-            'input[name*="adult"]',
-            '[class*="guest"] input',
-            '[class*="guest"] select',
-            '[class*="adult"] input',
-            '[class*="adult"] select'
-          ],
-          search: [
-            'button[type="submit"]',
-            'button:has-text("Резервирай")',
-            'button:has-text("Провери")',
-            'button:has-text("Търси")',
-            'button:has-text("Search")',
-            'button:has-text("Check")',
-            'button:has-text("Book")',
-            '[role="button"]:has-text("Резервирай")',
-            '[role="button"]:has-text("Провери")',
-            '[role="button"]:has-text("Search")',
-            'button',
-            '[role="button"]'
-          ],
-        },
         cloudbeds: {
           checkin: ['input[name="checkin"]', '.cb-checkin input', '#checkin', 'input[placeholder*="Check-in"]'],
           checkout: ['input[name="checkout"]', '.cb-checkout input', '#checkout', 'input[placeholder*="Check-out"]'],
@@ -3303,48 +3254,37 @@ class HotSessionManager {
         },
       };
 
+      // Generic fallback selectors (used when vendor not in map or vendor-specific fails)
       const genericSelectors = {
         checkin: [
           'input[name*="checkin"]', 'input[name*="check_in"]', 'input[name*="arrival"]',
           'input[name*="from"]', 'input[name*="start"]', 'input[id*="checkin"]',
           'input[placeholder*="Check-in"]', 'input[placeholder*="Arrival"]',
-          'input[placeholder*="Пристигане"]', '[data-testid*="checkin"]', '[data-testid*="arrival"]',
-          'input'
+          '[data-testid*="checkin"]', '[data-testid*="arrival"]',
         ],
         checkout: [
           'input[name*="checkout"]', 'input[name*="check_out"]', 'input[name*="departure"]',
           'input[name*="to"]', 'input[name*="end"]', 'input[id*="checkout"]',
           'input[placeholder*="Check-out"]', 'input[placeholder*="Departure"]',
-          'input[placeholder*="Напускане"]', 'input[placeholder*="Заминаване"]',
           '[data-testid*="checkout"]', '[data-testid*="departure"]',
-          'input'
         ],
         guests: [
           'select[name*="adult"]', 'input[name*="adult"]', 'select[name*="guest"]',
-          'input[name*="guest"]', '[data-testid*="adult"]', '[data-testid*="guest"]'
+          'input[name*="guest"]', '[data-testid*="adult"]',
         ],
         search: [
           'button[type="submit"]', 'input[type="submit"]',
           'button:has-text("Search")', 'button:has-text("Book")',
           'button:has-text("Check")', 'button:has-text("Търси")',
-          'button:has-text("Провери")', 'button:has-text("Резервирай")',
-          'button', '[role="button"]'
         ],
       };
 
-      const selMap = vendorDateSelectors[vendorNorm] || genericSelectors;
+      const selMap = vendorDateSelectors[vendor] || genericSelectors;
 
-      const iframeFillDate = async (
-        selectors: string[],
-        value: string,
-        kind: "checkin" | "checkout"
-      ): Promise<boolean> => {
-        const used = new Set<string>();
-        const allSelectors = [...selectors, ...(kind === "checkin" ? genericSelectors.checkin : genericSelectors.checkout)];
-        for (const sel of allSelectors) {
-          if (!sel || used.has(sel)) continue;
-          used.add(sel);
-
+      // Helper: try to fill an element inside the iframe
+      const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
+        const allSels = [...selectors, ...genericSelectors.checkin.slice(0, 3)];
+        for (const sel of selectors) {
           try {
             const loc = frameLocator.locator(sel).first();
             const count = await loc.count().catch(() => 0);
@@ -3352,207 +3292,87 @@ class HotSessionManager {
             const visible = await loc.isVisible().catch(() => false);
             if (!visible) continue;
 
-            const inputType = await loc.evaluate((el: any) => (el?.getAttribute?.("type") || "").toLowerCase()).catch(() => "");
-            const placeholder = await loc.getAttribute("placeholder").catch(() => "") || "";
-            const nameAttr = await loc.getAttribute("name").catch(() => "") || "";
-            const idAttr = await loc.getAttribute("id").catch(() => "") || "";
-            const meta = `${placeholder} ${nameAttr} ${idAttr}`.toLowerCase();
-
-            if (kind === "checkin" && /(out|departure|напуск|заминав)/.test(meta) && !/checkin|arrival|пристиг/.test(meta)) continue;
-            if (kind === "checkout" && /(in|arrival|пристиг)/.test(meta) && !/checkout|departure|напуск|заминав/.test(meta)) continue;
-
-            await loc.scrollIntoViewIfNeeded().catch(() => {});
+            // Try fill first
             await loc.click({ timeout: 2000 }).catch(() => {});
-            await page.waitForTimeout(250);
+            await loc.fill(value, { timeout: 2000 }).catch(() => {});
+            await page.keyboard.press("Tab");
+            await page.waitForTimeout(200);
 
-            let ok = false;
-
-            if (inputType === "date") {
-              await loc.fill(value, { timeout: 2000 }).catch(() => {});
-              await page.keyboard.press("Tab").catch(() => {});
-              await page.waitForTimeout(250);
-              const filled = await loc.inputValue().catch(() => "");
-              ok = !!filled;
-            }
-
-            if (!ok) {
-              await loc.fill("", { timeout: 1000 }).catch(() => {});
-              await loc.fill(value, { timeout: 2000 }).catch(() => {});
-              await page.keyboard.press("Tab").catch(() => {});
-              await page.waitForTimeout(250);
-              const filled = await loc.inputValue().catch(() => "");
-              ok = !!filled;
-            }
-
-            if (!ok) {
-              ok = await this.fillCustomDatepickerInFrame(frameLocator, sel, value);
-            }
-
-            if (!ok) {
-              const altFormats = (() => {
-                const m = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-                if (!m) return [];
-                const [, y, mo, d] = m;
-                return [`${d}.${mo}.${y}`, `${d}/${mo}/${y}`, `${mo}/${d}/${y}`];
-              })();
-
-              for (const fmt of altFormats) {
-                await loc.fill("", { timeout: 1000 }).catch(() => {});
-                await loc.fill(fmt, { timeout: 2000 }).catch(() => {});
-                await page.keyboard.press("Tab").catch(() => {});
-                await page.waitForTimeout(250);
-                const filled = await loc.inputValue().catch(() => "");
-                if (filled) {
-                  ok = true;
-                  break;
-                }
-              }
-            }
-
-            if (ok) {
-              const finalValue = await loc.inputValue().catch(() => "");
-              console.log(`[IFRAME][${kind.toUpperCase()}][OK] sel=${sel} value=${finalValue || value}`);
+            // Verify
+            const filled = await loc.inputValue().catch(() => "");
+            if (filled && filled !== "") {
+              console.log(`[IFRAME][FILL] ${sel} = ${filled}`);
               return true;
             }
 
-            console.log(`[IFRAME][${kind.toUpperCase()}][MISS] sel=${sel}`);
-          } catch (e) {
-            console.log(`[IFRAME][${kind.toUpperCase()}][ERR] sel=${sel} ${(e as Error)?.message || e}`);
-          }
+            // Try custom datepicker approach
+            const filledDP = await this.fillCustomDatepickerInFrame(frameLocator, sel, value);
+            if (filledDP) {
+              console.log(`[IFRAME][DATEPICKER] ${sel} = ${value}`);
+              return true;
+            }
+          } catch {}
         }
         return false;
       };
 
-      const iframeFillGuests = async (): Promise<boolean> => {
-        const allSelectors = [...selMap.guests, ...genericSelectors.guests];
-        const used = new Set<string>();
-        for (const sel of allSelectors) {
-          if (!sel || used.has(sel)) continue;
-          used.add(sel);
+      const checkinOk = await iframeFill(selMap.checkin, checkin);
+      await page.waitForTimeout(300);
+      const checkoutOk = await iframeFill(selMap.checkout, checkout);
+      await page.waitForTimeout(300);
 
-          try {
-            const loc = frameLocator.locator(sel).first();
-            const count = await loc.count().catch(() => 0);
-            if (count === 0) continue;
-            const visible = await loc.isVisible().catch(() => false);
-            if (!visible) continue;
-
-            await loc.scrollIntoViewIfNeeded().catch(() => {});
-            const tag = await loc.evaluate((el: any) => el?.tagName?.toLowerCase?.() || "").catch(() => "");
-            if (tag === "select") {
-              await loc.selectOption(guests).catch(async () => {
-                await loc.selectOption({ label: guests }).catch(() => {});
-              });
-            } else {
-              await loc.click({ timeout: 1500 }).catch(() => {});
-              await loc.fill("", { timeout: 1000 }).catch(() => {});
-              await loc.fill(guests, { timeout: 2000 }).catch(() => {});
-              await page.keyboard.press("Tab").catch(() => {});
-            }
-
-            await page.waitForTimeout(250);
-            console.log(`[IFRAME][GUESTS][OK] sel=${sel} guests=${guests}`);
-            return true;
-          } catch (e) {
-            console.log(`[IFRAME][GUESTS][ERR] sel=${sel} ${(e as Error)?.message || e}`);
+      // Guests (optional)
+      try {
+        for (const sel of selMap.guests) {
+          const loc = frameLocator.locator(sel).first();
+          const count = await loc.count().catch(() => 0);
+          if (count === 0) continue;
+          const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
+          if (tag === "select") {
+            await loc.selectOption(guests).catch(() => {});
+          } else {
+            await loc.fill(guests).catch(() => {});
           }
+          await page.waitForTimeout(200);
+          break;
         }
+      } catch {}
 
+      // Click search inside iframe
+      let searchClicked = false;
+      for (const sel of selMap.search) {
         try {
-          const plusButtons = [
-            'button:has-text("+")',
-            '[aria-label*="adult"] button:has-text("+")',
-            '[class*="guest"] button:has-text("+")',
-            '[class*="adult"] button:has-text("+")',
-          ];
-          const target = Math.max(Number(guests || "2"), 1);
-          for (const plusSel of plusButtons) {
-            const loc = frameLocator.locator(plusSel).first();
-            const count = await loc.count().catch(() => 0);
-            if (!count) continue;
-            const visible = await loc.isVisible().catch(() => false);
-            if (!visible) continue;
-
-            for (let i = 1; i < target; i++) {
-              await loc.click({ timeout: 1200 }).catch(() => {});
-              await page.waitForTimeout(150);
-            }
-            console.log(`[IFRAME][GUESTS][PLUS] sel=${plusSel} guests=${guests}`);
-            return true;
-          }
+          const loc = frameLocator.locator(sel).first();
+          const count = await loc.count().catch(() => 0);
+          if (count === 0) continue;
+          const visible = await loc.isVisible().catch(() => false);
+          if (!visible) continue;
+          await loc.click({ timeout: 3000 });
+          searchClicked = true;
+          console.log(`[IFRAME][SEARCH] clicked ${sel}`);
+          break;
         } catch {}
-
-        return false;
-      };
-
-      const clickSearch = async (): Promise<boolean> => {
-        const allSelectors = [...selMap.search, ...genericSelectors.search];
-        const used = new Set<string>();
-        for (const sel of allSelectors) {
-          if (!sel || used.has(sel)) continue;
-          used.add(sel);
-
-          try {
-            const loc = frameLocator.locator(sel).first();
-            const count = await loc.count().catch(() => 0);
-            if (count === 0) continue;
-            const visible = await loc.isVisible().catch(() => false);
-            if (!visible) continue;
-
-            const text = (await loc.innerText().catch(() => "")).toLowerCase();
-            const tag = await loc.evaluate((el: any) => el?.tagName?.toLowerCase?.() || "").catch(() => "");
-            if (tag === "a" && !/search|check|book|резерв|провери|търси/.test(text)) continue;
-
-            await loc.scrollIntoViewIfNeeded().catch(() => {});
-            await loc.click({ timeout: 2500 }).catch(async () => {
-              await loc.dispatchEvent("click").catch(() => {});
-            });
-            await page.waitForTimeout(500);
-            console.log(`[IFRAME][SEARCH][OK] sel=${sel}`);
-            return true;
-          } catch (e) {
-            console.log(`[IFRAME][SEARCH][ERR] sel=${sel} ${(e as Error)?.message || e}`);
-          }
-        }
-        return false;
-      };
-
-      const checkinOk = await iframeFillDate(selMap.checkin, checkin, "checkin");
-      await page.waitForTimeout(300);
-      const checkoutOk = await iframeFillDate(selMap.checkout, checkout, "checkout");
-      await page.waitForTimeout(300);
-      const guestsOk = await iframeFillGuests();
-      await page.waitForTimeout(300);
-
-      console.log(`[IFRAME] fill summary checkin=${checkinOk} checkout=${checkoutOk} guests=${guestsOk}`);
-
-      const searchClicked = await clickSearch();
-      if (!searchClicked) {
-        console.log("[IFRAME] search click failed — taking screenshot anyway");
       }
 
       await this.waitForAvailabilityResults(page);
-      const screenshot_base64 = await safeScreenshot();
-
-      if (!screenshot_base64) {
-        return {
-          ok: false,
-          message: "iframe_no_screenshot",
-        };
-      }
+      const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
       return {
-        ok: checkinOk && checkoutOk,
+        ok: true,
         message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
         screenshot_base64,
       };
+    
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[IFRAME] Error: ${msg}`);
-      const screenshot_base64 = await safeScreenshot();
-      return screenshot_base64
-        ? { ok: false, message: `iframe_error_screenshot: ${msg}`, screenshot_base64 }
-        : { ok: false, message: `Iframe error: ${msg}` };
+      // Fallback screenshot
+      try {
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return { ok: true, message: "iframe_error_screenshot", screenshot_base64 };
+      } catch {
+        return { ok: false, message: `Iframe error: ${msg}` };
+      }
     }
   }
 
@@ -4371,9 +4191,10 @@ rooms: rooms,
       }
     }
 
-    return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
-  }
+  return { ok: false, phase: req.phase, message: `Unknown phase: ${req.phase}` };
 }
+
+
 // ───────────────────────────────────────────────────────────────
 // Server
 // ───────────────────────────────────────────────────────────────
