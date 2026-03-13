@@ -2640,10 +2640,9 @@ class HotSessionManager {
               checkout: true,
               guests: true,
             },
-            search_clicked: /ready|partial|fallback/i.test(String(iframeResult.message || "")),
+            search_clicked: true,
           },
         };
-
       }
 
       // ── 3. Navigate to availability URL ───────────────────────
@@ -3227,70 +3226,12 @@ class HotSessionManager {
 
       // ── Vendor-specific date selectors ────────────────────
       const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
-        quendoo: {
-          checkin: [
-            'input[name*="check"]',
-            'input[name*="arrival"]',
-            'input[id*="check"]',
-            'input[id*="arrival"]',
-            'input[placeholder*="Настаняване"]',
-            'input[placeholder*="Пристигане"]',
-            'input[placeholder*="Check-in"]',
-            'input[placeholder*="Arrival"]',
-            '[data-testid*="checkin"] input',
-            '[data-testid*="arrival"] input',
-          ],
-          checkout: [
-            'input[name*="out"]',
-            'input[name*="departure"]',
-            'input[id*="out"]',
-            'input[id*="departure"]',
-            'input[placeholder*="Освобождаване"]',
-            'input[placeholder*="Заминаване"]',
-            'input[placeholder*="Check-out"]',
-            'input[placeholder*="Departure"]',
-            '[data-testid*="checkout"] input',
-            '[data-testid*="departure"] input',
-          ],
-          guests: [
-            'select[name*="guest"]',
-            'select[name*="adult"]',
-            'input[name*="guest"]',
-            'input[name*="adult"]',
-            'input[id*="guest"]',
-            'input[id*="adult"]',
-            '[data-testid*="guest"] input',
-            '[data-testid*="adult"] input',
-            'button[aria-label*="гост"]',
-            'button[aria-label*="adult"]',
-          ],
-          search: [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button:has-text("РЕЗЕРВИРАЙ")',
-            'button:has-text("Резервирай")',
-            'button:has-text("ПРОВЕРИ")',
-            'button:has-text("Провери")',
-            'button:has-text("ТЪРСИ")',
-            'button:has-text("Търси")',
-            'button:has-text("Search")',
-            'button:has-text("Check")',
-            'button:has-text("Reserve")',
-            '[role="button"]:has-text("Резервирай")',
-            '[role="button"]:has-text("Провери")',
-            '[class*="book"]',
-            '[class*="reserve"]',
-            '[class*="search"]',
-            '[class*="submit"]',
-          ],
-        },
         cloudbeds: {
           checkin: ['input[name="checkin"]', '.cb-checkin input', '#checkin', 'input[placeholder*="Check-in"]'],
           checkout: ['input[name="checkout"]', '.cb-checkout input', '#checkout', 'input[placeholder*="Check-out"]'],
           guests: ['select[name="adults"]', '#adults', 'input[name="adults"]'],
           search: ['button[type="submit"]', '.cb-search-btn', 'button:has-text("Search")'],
         },
-
         beds24: {
           checkin: ['input[name="firstday"]', '#firstday', 'input[name="arrival"]'],
           checkout: ['input[name="lastday"]', '#lastday', 'input[name="departure"]'],
@@ -3363,13 +3304,11 @@ class HotSessionManager {
       const selMap = vendorDateSelectors[vendor] || genericSelectors;
 
       // Helper: try to fill an element inside the iframe
-      const iframeFill = async (selectors: string[], value: string, fallbackSelectors: string[] = []): Promise<boolean> => {
-        const allSels = Array.from(new Set([...(selectors || []), ...(fallbackSelectors || [])])).filter(Boolean);
-
-        for (const sel of allSels) {
+      const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
+        const allSels = [...selectors, ...genericSelectors.checkin.slice(0, 3)];
+        for (const sel of selectors) {
           try {
             const loc = frameLocator.locator(sel).first();
-
             const count = await loc.count().catch(() => 0);
             if (count === 0) continue;
             const visible = await loc.isVisible().catch(() => false);
@@ -3399,17 +3338,15 @@ class HotSessionManager {
         return false;
       };
 
-      const checkinOk = await iframeFill(selMap.checkin, checkin, genericSelectors.checkin);
+      const checkinOk = await iframeFill(selMap.checkin, checkin);
       await page.waitForTimeout(300);
-      const checkoutOk = await iframeFill(selMap.checkout, checkout, genericSelectors.checkout);
+      const checkoutOk = await iframeFill(selMap.checkout, checkout);
       await page.waitForTimeout(300);
-
 
       // Guests (optional)
       try {
-        for (const sel of Array.from(new Set([...(selMap.guests || []), ...genericSelectors.guests]))) {
+        for (const sel of selMap.guests) {
           const loc = frameLocator.locator(sel).first();
-
           const count = await loc.count().catch(() => 0);
           if (count === 0) continue;
           const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
@@ -3423,42 +3360,23 @@ class HotSessionManager {
         }
       } catch {}
 
-      // Click search / next / reserve inside iframe
+      // Click search inside iframe
       let searchClicked = false;
-
-      for (const sel of Array.from(new Set([...(selMap.search || []), ...genericSelectors.search]))) {
+      for (const sel of selMap.search) {
         try {
           const loc = frameLocator.locator(sel).first();
           const count = await loc.count().catch(() => 0);
           if (count === 0) continue;
           const visible = await loc.isVisible().catch(() => false);
           if (!visible) continue;
-          await loc.scrollIntoViewIfNeeded().catch(() => {});
-          await loc.click({ timeout: 3000, force: true });
+          await loc.click({ timeout: 3000 });
           searchClicked = true;
-          console.log(`[IFRAME][SEARCH] clicked exact selector ${sel}`);
+          console.log(`[IFRAME][SEARCH] clicked ${sel}`);
           break;
         } catch {}
       }
 
-      if (!searchClicked) {
-        searchClicked = await this.clickLikelyIframeAction(frameLocator, vendor);
-      }
-
-      if (!searchClicked) {
-        searchClicked = await this.clickAvailabilitySearch(page);
-        if (searchClicked) {
-          console.log("[IFRAME][SEARCH] clicked fallback main-page CTA");
-        }
-      }
-
-      console.log(
-        `[IFRAME][STATE] checkinOk=${checkinOk} checkoutOk=${checkoutOk} guests=${guests} rooms=${rooms} searchClicked=${searchClicked}`
-      );
-
       await this.waitForAvailabilityResults(page);
-      await page.waitForTimeout(1800);
-
 
       const screenshots = await this.takeAvailabilityScreenshotSet(page, iframeSrc, vendor);
 
@@ -3481,83 +3399,8 @@ class HotSessionManager {
     }
   }
 
-  private async clickLikelyIframeAction(frameLocator: any, vendor: string): Promise<boolean> {
-    try {
-      const actionTexts = [
-        "резервирай",
-        "резервация",
-        "провери",
-        "търси",
-        "покажи",
-        "напред",
-        "продължи",
-        "виж",
-        "search",
-        "check",
-        "reserve",
-        "book",
-        "continue",
-        "next",
-        "show",
-      ];
-
-      const clicked = await frameLocator.locator("button, a, [role='button'], input[type='submit'], input[type='button']").evaluateAll(
-        (els: any[], texts: string[]) => {
-          const norm = (s: unknown) =>
-            String(s ?? "")
-              .toLowerCase()
-              .normalize("NFKD")
-              .replace(/[\u0300-\u036f]/g, "")
-              .replace(/[“”"']/g, " ")
-              .replace(/[(){}\[\]:;,.!?/\\|<>+=_-]/g, " ")
-              .replace(/\s+/g, " ")
-              .trim();
-
-          const isVisible = (el: any) => {
-            if (!el) return false;
-            const style = window.getComputedStyle(el);
-            if (!style) return false;
-            if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-            const r = el.getBoundingClientRect?.();
-            return !!r && r.width > 0 && r.height > 0;
-          };
-
-          const candidates = els
-            .filter((el) => isVisible(el))
-            .map((el) => {
-              const text = norm(el.innerText || el.textContent || el.value || el.getAttribute?.("aria-label") || "");
-              const rect = el.getBoundingClientRect?.() || { width: 0, height: 0, top: 0 };
-              return { el, text, area: rect.width * rect.height, top: rect.top };
-            })
-            .filter((x) => x.text && texts.some((t) => x.text.includes(norm(t))));
-
-          if (!candidates.length) return false;
-
-          candidates.sort((a, b) => {
-            if (b.area !== a.area) return b.area - a.area;
-            return a.top - b.top;
-          });
-
-          const picked = candidates[0];
-          picked.el.click();
-          return true;
-        },
-        actionTexts
-      ).catch(() => false);
-
-      if (clicked) {
-        console.log(`[IFRAME][SEARCH] clicked heuristic CTA vendor=${vendor}`);
-        await new Promise((r) => setTimeout(r, 600));
-        return true;
-      }
-    } catch {}
-
-    return false;
-  }
-
   // ─────────────────────────────────────────────────────────
   // fillCustomDatepicker — handles non-native date pickers
-
   // Flatpickr, Pikaday, React DatePicker, AirDatepicker, jQuery UI
   // ─────────────────────────────────────────────────────────
 
