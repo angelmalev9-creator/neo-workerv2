@@ -298,6 +298,91 @@ function labelSoftIncludes(a: string, b: string): boolean {
   return A.includes(B) || B.includes(A);
 }
 
+async function getClickableDebugLabel(loc: any): Promise<string> {
+  try {
+    const meta = await loc.evaluate((el: any) => {
+      const text = String(el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+      const value = String(el?.value || "").replace(/\s+/g, " ").trim();
+      const aria = String(el?.getAttribute?.("aria-label") || "").replace(/\s+/g, " ").trim();
+      const title = String(el?.getAttribute?.("title") || "").replace(/\s+/g, " ").trim();
+      const placeholder = String(el?.getAttribute?.("placeholder") || "").replace(/\s+/g, " ").trim();
+      const cls = String(el?.className || "").replace(/\s+/g, " ").trim();
+      const tag = String(el?.tagName || "").toLowerCase();
+      const type = String(el?.type || "").toLowerCase();
+      return { text, value, aria, title, placeholder, cls, tag, type };
+    });
+
+    const parts = [
+      meta?.text ? `text="${meta.text}"` : "",
+      meta?.value ? `value="${meta.value}"` : "",
+      meta?.aria ? `aria="${meta.aria}"` : "",
+      meta?.title ? `title="${meta.title}"` : "",
+      meta?.placeholder ? `placeholder="${meta.placeholder}"` : "",
+      meta?.tag ? `tag=${meta.tag}` : "",
+      meta?.type ? `type=${meta.type}` : "",
+      meta?.cls ? `class="${String(meta.cls).slice(0, 120)}"` : "",
+    ].filter(Boolean);
+
+    return parts.join(" ");
+  } catch {
+    return "";
+  }
+}
+
+function roomTextMatches(containerTextRaw: string, wantedRoomRaw: string): boolean {
+  const text = normLabel(containerTextRaw || "");
+  const wanted = normLabel(wantedRoomRaw || "");
+  if (!text || !wanted) return false;
+
+  const exactPhrase = new RegExp(`(^|\\s)${wanted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`, "i");
+  if (exactPhrase.test(text)) return true;
+
+  return false;
+}
+
+function isBadClickableLabel(raw: string): boolean {
+
+  const s = normLabel(raw || "");
+  if (!s) return true;
+
+  return [
+    "lens",
+    "chevron left",
+    "chevron right",
+    "fullscreen",
+    "expand more",
+    "expand less",
+    "close",
+    "menu",
+    "search",
+    "favorite",
+    "share",
+    "prev",
+    "next",
+    "zoom",
+    "галерия",
+    "снимка",
+    "картина",
+    "person",
+    "profile",
+    "profile or sign in",
+    "sign in",
+    "shopping cart",
+    "cart",
+    "event",
+    "grid view",
+    "sell",
+    "arrow back",
+    "arrow drop down",
+    "toggle details",
+    "language",
+    "български",
+    "english",
+  ].some((x) => s === x || s.startsWith(x) || s.includes(x));
+}
+
+
+
 // ───────────────────────────────────────────────────────────────
 // Select normalization + matching
 // ───────────────────────────────────────────────────────────────
@@ -1983,10 +2068,12 @@ class HotSessionManager {
             .filter((b) => isVisible(b));
           if (siblings.length < 2) return;
 
-          // Filter out nav/submit
+          // Material Icons: snake_case single word (person, shopping_cart, arrow_drop_down...)
+          const isMaterialIconText = (t: string) => /^[a-z]+(_[a-z]+)*$/.test(t) && !/ /.test(t) && t.length <= 30;
+          // Filter out nav/submit and Material Icon glyphs
           const optBtns = siblings.filter((b) => {
             const t = ((b as any).textContent || "").trim();
-            return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
+            return t.length >= 1 && t.length <= 30 && !submitRe.test(t) && !isMaterialIconText(t);
           });
           if (optBtns.length < 2) return;
 
@@ -2118,13 +2205,12 @@ class HotSessionManager {
     payment_required: boolean;
     can_continue: boolean;
   }> {
- try {
-      // Prefer booking iframe for scanning — avoids false positives from main page nav/buttons
+    try {
+      // Prefer booking iframe for scanning — avoids false positives from main page nav
       const _scanBf = page.frames().find(f => {
-        const n = String((f as any).name?.() || f.name?.() || "");
+        const n = String(f.name?.() || "");
         const u = f.url();
-        return n.includes("clock") || n.includes("wbe") || n.includes("booking") ||
-               u.includes("clock-pms") || u.includes("wbe") || u.includes("booking-engine");
+        return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
       });
       const _scanCtx = (_scanBf as any) as Page;
       const _useFrame = !!_scanBf;
@@ -2140,9 +2226,12 @@ class HotSessionManager {
         ? (await _scanBf!.locator("body").innerText().catch(() => "")).toLowerCase()
         : (await page.locator("body").innerText().catch(() => "")).toLowerCase();
       const currentUrl = page.url().toLowerCase();
+
       const paymentRequired =
-        /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
+        /cvv|cvc|expiry|exp date|expiration|card number|credit card number|name on card|stripe/i.test(bodyText) ||
+        /номер на карта|валидна до|име на карта|cvv|cvc/i.test(bodyText) ||
         /payment|checkout|stripe|pay/.test(currentUrl);
+
 
       const out: string[] = [];
       const seen = new Set<string>();
@@ -2156,24 +2245,22 @@ class HotSessionManager {
         out.push(label);
       };
 
-      for (const lbl of unfilled.labels || []) push(lbl);
+      const requiredFieldLabels = (scanned.fields || [])
+        .filter((f: any) => !!f?.required)
+        .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
+        .filter(Boolean);
 
-      for (const f of scanned.fields || []) {
-        if (!f?.required) continue;
-        const label =
-          String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
-        if (!label) continue;
-        push(label);
-      }
+      const requiredChoiceLabels = (scanned.choiceGroups || [])
+        .filter((g: any) => !!g?.required)
+        .map((g: any) =>
+          String(g.label || g.name || "").trim() ||
+          (Array.isArray(g.options) ? g.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "")
+        )
+        .filter(Boolean);
 
-      for (const group of scanned.choiceGroups || []) {
-        if (!group?.required) continue;
-        const groupLabel =
-          String(group.label || group.name || "").trim() ||
-          (Array.isArray(group.options) ? group.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "");
-        if (!groupLabel) continue;
-        push(groupLabel);
-      }
+      for (const lbl of requiredFieldLabels) push(lbl);
+      for (const lbl of requiredChoiceLabels) push(lbl);
+
 
       console.log(
         `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} current_step=${paymentRequired ? "payment" : "reserve"} missing=${out.join(" | ") || "none"}`
@@ -2185,32 +2272,25 @@ class HotSessionManager {
         );
       }
 
-      if ((scanned.fields || []).length) {
-        const requiredFieldLabels = (scanned.fields || [])
-          .filter((f: any) => !!f?.required)
-          .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
-          .filter(Boolean);
-        console.log(
-          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_FIELDS] ${requiredFieldLabels.join(" | ") || "none"}`
-        );
-      }
+      console.log(
+        `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_FIELDS] ${requiredFieldLabels.join(" | ") || "none"}`
+      );
 
-      if ((scanned.choiceGroups || []).length) {
-        const requiredChoiceLabels = (scanned.choiceGroups || [])
-          .filter((g: any) => !!g?.required)
-          .map((g: any) => String(g.label || g.name || "").trim() || (Array.isArray(g.options) ? g.options.map((o: any) => o.text).filter(Boolean).join(" / ") : ""))
-          .filter(Boolean);
-        console.log(
-          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_CHOICES] ${requiredChoiceLabels.join(" | ") || "none"}`
-        );
-      }
+      console.log(
+        `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_CHOICES] ${requiredChoiceLabels.join(" | ") || "none"}`
+      );
 
+
+
+      // Filter known nav/decoration noise from Clock PMS and main page
+      const _STEP_NOISE = /^(бонус\s*код|bonus\s*code|избор:\s*[/|]|емоция|сватби|бизнес|конферентни|почивка|релакс|person|shopping.?cart|arrow|grid.?view|sell|event|bg|en)/i;
+      const cleanOut = out.filter(s => !_STEP_NOISE.test(s.trim())).slice(0, 20);
 
       return {
-        missing_required: out.slice(0, 20),
+        missing_required: cleanOut,
         current_step: paymentRequired ? "payment" : "reserve",
         payment_required: paymentRequired,
-        can_continue: out.length === 0,
+        can_continue: cleanOut.length === 0,
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2806,12 +2886,11 @@ class HotSessionManager {
       // ── 5. Wait for results to load ────────────────────────────
       await this.waitForAvailabilityResults(page);
 
-// ── 6. Extract rooms from iframe DOM (free) + screenshot fallback ──
-      const domRooms = await this.extractIframeRooms(page);
+      // ── 6. Take full-page screenshot ───────────────────────────
       const screenshotBase64 = await this.takeAvailabilityScreenshot(page);
 
       const timing = Date.now() - t0;
-      console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars dom_rooms=${domRooms.length}`);
+      console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars`);
 
       return {
         ok: true,
@@ -2823,7 +2902,6 @@ class HotSessionManager {
           guests,
           rooms,
           screenshot_base64: screenshotBase64,
-          dom_rooms: domRooms,   // ← НЕО може да ползва това вместо Vision
           url: page.url(),
           timing_ms: timing,
           fill_result: filled,
@@ -3703,163 +3781,70 @@ class HotSessionManager {
   // Phase "reserve": fills guest details, stops before payment, returns URL
   // ─────────────────────────────────────────────────────────
 
-  // ─────────────────────────────────────────────────────────
-  // clockPmsNavigateToCheckout — handles steps AFTER room card selection:
-  //   Тарифи step → set adults → click ИЗБЕРИ → Завършване step
-  // Returns true if reached checkout/contact-data form
-  // ─────────────────────────────────────────────────────────
   private async clockPmsNavigateToCheckout(page: Page, guests: string): Promise<boolean> {
     const bf = page.frames().find(f => {
-      const n = String((f as any).name?.() || f.name?.() || "");
+      const n = String(f.name?.() || "");
       return n.includes("clock") || n.includes("wbe") || f.url().includes("clock-pms");
     });
-    if (!bf) {
-      console.log("[CLOCK_PMS] No booking iframe found");
-      return false;
-    }
-
+    if (!bf) { console.log("[CLOCK_PMS] No booking iframe found"); return false; }
     const guestNum = parseInt(guests || "2") || 2;
     console.log(`[CLOCK_PMS] Starting tariff/checkout navigator guests=${guestNum}`);
-
-    for (let step = 0; step < 6; step++) {
-      await page.waitForTimeout(800);
+    for (let step = 0; step < 8; step++) {
+      await page.waitForTimeout(600);
       const frameText = (await bf.locator("body").innerText().catch(() => "")).toLowerCase();
-
-      // ── Тарифи step: select adults, click ИЗБЕРИ ──────────
-      const onTariffStep = /тариф|standard.?rate|bb|rate|plan|нощувка.?с/.test(frameText) &&
-        !/данни\s*за\s*контакт|contact|завършване\s*\n|checkout/.test(frameText);
-
-      if (onTariffStep) {
+      // Reached checkout/contact form
+      if (/данни\s*за\s*контакт|contact|собствено\s*име|first.?name|e-?mail|завършване/i.test(frameText)) {
+        console.log("[CLOCK_PMS] Reached checkout step ✓"); return true;
+      }
+      // Tariff step: set adults, click ИЗБЕРИ
+      if (/тариф|standard.?rate|bb|rate|план|нощувка\s*с/i.test(frameText)) {
         console.log("[CLOCK_PMS] On tariff step — setting adults and clicking ИЗБЕРИ");
-
-        // Set adults dropdown
         try {
-          const adultsLoc = bf.locator('select, [class*="select"], [class*="dropdown"]').filter({ hasText: /възрастни|adult/i }).first();
-          if (await adultsLoc.count().catch(() => 0) > 0) {
-            const tag = await adultsLoc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
-            if (tag === "select") {
-              await adultsLoc.selectOption(String(guestNum)).catch(() => {});
-            } else {
-              await adultsLoc.click().catch(() => {});
-              await page.waitForTimeout(300);
-              const optionLoc = bf.locator(`[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}")`).first();
-              if (await optionLoc.isVisible().catch(() => false)) {
-                await optionLoc.click().catch(() => {});
-              }
+          const selLoc = bf.locator("select").first();
+          if (await selLoc.count().catch(() => 0) > 0) {
+            await selLoc.selectOption(String(guestNum)).catch(() => {});
+            await page.waitForTimeout(300);
+          } else {
+            const dropdownLoc = bf.locator('[class*="select"], [class*="dropdown"]').first();
+            if (await dropdownLoc.isVisible().catch(() => false)) {
+              await dropdownLoc.click().catch(() => {});
+              await page.waitForTimeout(200);
+              await bf.locator(`li:has-text("${guestNum}"), [role="option"]:has-text("${guestNum}")`).first().click().catch(() => {});
             }
-            console.log(`[CLOCK_PMS] Set adults=${guestNum}`);
-            await page.waitForTimeout(400);
           }
-        } catch (e) {
-          console.log("[CLOCK_PMS] Adults set failed:", e);
-        }
-
-        // Click ИЗБЕРИ / SELECT on tariff card
-        const chooseBtns = await bf.locator('button, [role="button"]').all().catch(() => []);
+        } catch {}
+        const chooseBtns = await bf.locator("button").all().catch(() => []);
         for (const btn of chooseBtns) {
           const t = (await btn.innerText().catch(() => "")).trim().toLowerCase();
-          if (/избери|select|book|reserv|добав|add|продълж|continue|next/i.test(t) && t.length <= 30) {
-            const visible = await btn.isVisible().catch(() => false);
-            if (!visible) continue;
-            await btn.scrollIntoViewIfNeeded().catch(() => {});
-            await btn.click({ timeout: 2000 }).catch(() => {});
-            console.log(`[CLOCK_PMS] Clicked tariff CTA: "${t}"`);
-            break;
+          if (/избери|select|book|резерв|добав|add/i.test(t) && t.length <= 30) {
+            if (await btn.isVisible().catch(() => false)) {
+              await btn.scrollIntoViewIfNeeded().catch(() => {});
+              await btn.click({ timeout: 2000 }).catch(() => {});
+              console.log(`[CLOCK_PMS] Clicked tariff CTA: "${t}"`);
+              break;
+            }
           }
         }
         continue;
       }
-
-      // ── Завършване / checkout step ─────────────────────────
-      const onCheckout = /данни\s*за\s*контакт|contact|собствено\s*име|first.?name|email|завършване/i.test(frameText);
-      if (onCheckout) {
-        console.log("[CLOCK_PMS] Reached checkout/contact-data step ✓");
-        return true;
+      // Login prompt — toggle guest booking
+      if (/вход\s*с|login|sign.?in|google|имейл.*влез/i.test(frameText)) {
+        const lbl = bf.locator("label").filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for/i }).first();
+        if (await lbl.isVisible().catch(() => false)) { await lbl.click().catch(() => {}); await page.waitForTimeout(400); continue; }
       }
-
-      // ── Login prompt — skip, proceed as guest ─────────────
-      const onLogin = /вход\s*с|login|sign.?in|регистр|google|имейл.*влез/i.test(frameText) &&
-        /резервирам\s*за\s*някой\s*друг|book\s*for\s*someone/i.test(frameText);
-      if (onLogin) {
-        console.log("[CLOCK_PMS] Login prompt — enabling guest booking toggle");
-        try {
-          const toggleLoc = bf.locator('[type="checkbox"], [role="checkbox"], [class*="toggle"], [class*="switch"]')
-            .filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for\s*someone/i }).first();
-          if (await toggleLoc.count().catch(() => 0) > 0) {
-            await toggleLoc.click().catch(() => {});
-            console.log("[CLOCK_PMS] Guest toggle clicked");
-          } else {
-            // Try clicking parent label
-            const lblLoc = bf.locator('label').filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for/i }).first();
-            if (await lblLoc.isVisible().catch(() => false)) {
-              await lblLoc.click().catch(() => {});
-            }
-          }
-          await page.waitForTimeout(600);
-        } catch {}
-        continue;
-      }
-
-      // If we're on a step we don't recognise, try to find a forward button
-      const fwdBtns = await bf.locator('button, [role="button"]').all().catch(() => []);
+      // Generic forward
+      const fwdBtns = await bf.locator("button").all().catch(() => []);
       let clicked = false;
       for (const btn of fwdBtns) {
         const t = (await btn.innerText().catch(() => "")).trim();
-        if (/продълж|напред|next|continue|forward/i.test(t) && t.length <= 30) {
-          if (await btn.isVisible().catch(() => false)) {
-            await btn.click({ timeout: 1500 }).catch(() => {});
-            console.log(`[CLOCK_PMS] Forwarded with: "${t}"`);
-            clicked = true;
-            break;
-          }
+        if (/продълж|напред|next|continue/i.test(t) && t.length <= 30 && await btn.isVisible().catch(() => false)) {
+          await btn.click({ timeout: 1500 }).catch(() => {});
+          console.log(`[CLOCK_PMS] Forwarded with: "${t}"`); clicked = true; break;
         }
       }
       if (!clicked) break;
     }
-
     return false;
-  }
-
-  // ─────────────────────────────────────────────────────────
-  // extractIframeRooms — reads available rooms/prices from booking iframe DOM
-  // Returns structured data — avoids Vision API for availability
-  // ─────────────────────────────────────────────────────────
-  private async extractIframeRooms(page: Page): Promise<Array<{ name: string; price: string; available: boolean; currency: string }>> {
-    const bf = page.frames().find(f => {
-      const n = String((f as any).name?.() || f.name?.() || "");
-      return n.includes("clock") || n.includes("wbe") || f.url().includes("clock-pms");
-    });
-    if (!bf) return [];
-
-    try {
-      return await (bf as any).evaluate(() => {
-        const cards = Array.from(document.querySelectorAll('[class*="card"], article, [class*="room-item"], [class*="room_item"]'))
-          .filter((el: any) => el.offsetHeight > 0 && el.offsetParent !== null);
-
-        return cards.map((card: any) => {
-          const nameEl = card.querySelector('h1, h2, h3, h4, [class*="title"], [class*="name"], strong') as any;
-          const priceEl = card.querySelector('[class*="price"], [class*="rate"], [class*="amount"], [class*="cost"]') as any;
-          const unavailEl = card.querySelector('[class*="unavailable"], [class*="sold"], [class*="not-available"], [class*="na-"]') as any;
-          const unavailText = unavailEl ? (unavailEl.textContent || "") : "";
-          const pageUnavail = (card.textContent || "").includes("Не е налично") ||
-                              (card.textContent || "").includes("Not available") ||
-                              (card.textContent || "").includes("Unavailable");
-
-          const priceText = priceEl ? priceEl.textContent?.trim() : "";
-          const currency = /bgn|лв/i.test(priceText || "") ? "BGN" : /eur|€/.test(priceText || "") ? "EUR" : "BGN";
-
-          return {
-            name: nameEl ? nameEl.textContent?.trim() : "",
-            price: priceText || "",
-            available: !unavailEl && !pageUnavail && !!unavailText === false,
-            currency,
-          };
-        }).filter((r: any) => r.name && r.name.length > 1);
-      });
-    } catch (e) {
-      console.log("[EXTRACT_ROOMS] Failed:", e);
-      return [];
-    }
   }
 
   async makeReservation(req: MakeReservationRequest): Promise<{
@@ -4065,22 +4050,27 @@ rooms: rooms,
 
           const isBadRoomNavigation = (fromUrl: string, toUrl: string) => {
             if (!toUrl || toUrl === fromUrl) return false;
+            // If booking widget query param was present and now gone → widget closed
+            const hadWidget = /clock-pms-wbe|[?&]wbe=/.test(fromUrl);
+            const hasWidget = /clock-pms-wbe|[?&]wbe=/.test(toUrl);
+            if (hadWidget && !hasWidget) return true;
+            // Navigation to room detail or accommodation listing pages
             const lower = toUrl.toLowerCase();
-            return /\/room\//.test(lower) || /\/accommodation\//.test(lower) === false;
+            return /\/room\//.test(lower) || /\/accommodation\//.test(lower);
           };
 
-          // Capture booking iframe snapshot BEFORE any clicks — used for change detection
+          // Capture Clock PMS iframe body BEFORE any clicks for change detection
           const _findBookingFrame = () => page.frames().find(f => {
-            const n = String((f as any).name?.() || f.name?.() || "");
+            const n = String(f.name?.() || "");
             const u = f.url();
-            return n.includes("clock") || n.includes("wbe") || n.includes("booking") ||
-                   u.includes("clock-pms") || u.includes("wbe") || u.includes("booking-engine");
+            return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
           });
-          let _iframeSnapBefore = "";
-          const _bf0 = _findBookingFrame();
-          if (_bf0) {
-            _iframeSnapBefore = (await _bf0.locator("body").innerText().catch(() => "")).slice(0, 1000);
-          }
+          const _iframeSnapBefore = await (async () => {
+            try {
+              const bf = _findBookingFrame();
+              return bf ? (await bf.locator("body").innerText().catch(() => "")).slice(0, 1200) : "";
+            } catch { return ""; }
+          })();
 
           const indicatesBookingProgress = async () => {
             const afterUrl = page.url();
@@ -4092,21 +4082,22 @@ rooms: rooms,
               return false;
             }
 
-            if (afterUrl !== beforeUrl) return true;
+            // URL changed to a valid booking step → progress
+            if (afterUrl !== beforeUrl && !isBadRoomNavigation(beforeUrl, afterUrl)) return true;
 
-            // Primary check: did the booking iframe content change?
-            const bf = _findBookingFrame();
-            if (bf) {
-              try {
-                const newSnap = (await bf.locator("body").innerText().catch(() => "")).slice(0, 1000);
-                if (newSnap && newSnap !== _iframeSnapBefore && newSnap.length > 50) {
-                  console.log(`[RESERVATION][ROOM] iframe content changed — booking progressed`);
+            // Primary: did the Clock PMS iframe content change?
+            try {
+              const bf = _findBookingFrame();
+              if (bf) {
+                const newSnap = (await bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                if (newSnap && _iframeSnapBefore && newSnap !== _iframeSnapBefore && newSnap.length > 100) {
+                  console.log("[RESERVATION][ROOM] iframe content changed — booking progressed");
                   return true;
                 }
-              } catch {}
-            }
+              }
+            } catch {}
 
-            // Fallback: booking form input fields appeared on page (outside iframe)
+            // Fallback: guest input form appeared in main page (not iframe)
             const formVisible = await page.locator(
               'input[type="email"], input[name*="email"], input[name*="phone"], input[name*="tel"]'
             ).first().isVisible().catch(() => false);
@@ -4114,26 +4105,17 @@ rooms: rooms,
           };
 
           const clickRoomInContext = async (ctx: any, label: string) => {
-// Universal CTA scoring — widget/language/vendor agnostic
-            const _CTA_POS = /резервир|тариф|покажи|виж\s*цен|избери|продълж|напред|потвърди|завърши|добави|book(?!mark)|reserv|select(?!\s*all)|continu|confirm|next\b|show.?rate|view.?rate|choose|checkout|check[\s-]?out|submit|proceed|available|цена|наличн|add.?cart|добав/i;
-            const _CTA_NEG = /^(back|prev|назад|cancel|отказ|close|затвори|reject|skip|decline|no\b|не\b|later|по-късно)$/i;
-            const _ICON_WORD = /^[a-z]+(_[a-z]+)+$/; // snake_case = Material Icon
-            const scoreCtaButton = (text: string, aria = ""): number => {
-              const raw = text.trim();
-              if (!raw) return -1;
-              // Material Icons: single snake_case word, no spaces, ≤25 chars
-              if (_ICON_WORD.test(raw.replace(/\s/g, "_")) && !/ /.test(raw) && raw.length <= 25) return -1;
-              // Very short non-digit string is likely an icon glyph
-              if (raw.length <= 2 && !/\d/.test(raw)) return -1;
-              // Explicitly navigation/destructive
-              if (_CTA_NEG.test(raw)) return -1;
-              const hay = (raw + " " + aria).toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-              if (_CTA_POS.test(hay)) return 100;
-              // Generic button with meaningful text (4-50 chars)
-              if (raw.length >= 4 && raw.length <= 50) return 20;
-              return 5;
-            };
             const ctaSelectors = [
+              `button:has-text("Резервирай")`,
+              `button:has-text("Избери")`,
+              `button:has-text("Book")`,
+              `button:has-text("Reserve")`,
+              `button:has-text("Select")`,
+              `[role="button"]:has-text("Резервирай")`,
+              `[role="button"]:has-text("Избери")`,
+              `[role="button"]:has-text("Book")`,
+              `[role="button"]:has-text("Reserve")`,
+              `[role="button"]:has-text("Select")`,
               `input[type="submit"]`,
               `input[type="button"]`,
               `button`,
@@ -4145,9 +4127,10 @@ rooms: rooms,
               `[class*="room"]:has-text("${req.room_type}")`,
               `[class*="rate"]:has-text("${req.room_type}")`,
               `[class*="card"]:has-text("${req.room_type}")`,
+              `[class*="item"]:has-text("${req.room_type}")`,
               `li:has-text("${req.room_type}")`,
-              `div:has-text("${req.room_type}")`,
             ];
+
 
             for (const containerSel of containerSelectors) {
               const containers = ctx.locator(containerSel);
@@ -4161,95 +4144,119 @@ rooms: rooms,
                   `[RESERVATION][ROOM][SCAN] label=${label} containerSel=${containerSel} idx=${i} text="${rawText.slice(0, 300).replace(/\s+/g, " ")}"`
                 );
 
-                if (!text || !text.includes(normRoom)) continue;
+                if (!text || !roomTextMatches(rawText, String(req.room_type || ""))) continue;
+
 
                 console.log(
                   `[RESERVATION][ROOM][MATCH] label=${label} containerSel=${containerSel} idx=${i} matched_room="${req.room_type}"`
                 );
 
 
-// Collect all buttons, score universally, try best first
-                type _CtaCand = { loc: any; sel: string; score: number; text: string };
-                const _cands: _CtaCand[] = [];
                 for (const ctaSel of ctaSelectors) {
-                  try {
-                    const locs = container.locator(ctaSel);
-                    const cnt = Math.min(await locs.count().catch(() => 0), 8);
-                    for (let j = 0; j < cnt; j++) {
-                      const loc = locs.nth(j);
-                      if (!(await loc.isVisible().catch(() => false))) continue;
-                      const _tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
-                      if (_tag === "a") continue;
-                      const ctaText = String(await loc.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-                      const ariaLabel = String(await loc.getAttribute("aria-label").catch(() => "") || "");
-                      const score = scoreCtaButton(ctaText, ariaLabel);
-                      // Deduplicate by text+score
-                      if (!_cands.some(c => c.text === ctaText && c.score === score)) {
-                        _cands.push({ loc, sel: ctaSel, score, text: ctaText });
-                      }
+                  const ctas = container.locator(ctaSel);
+                  const ctaCount = Math.min(await ctas.count().catch(() => 0), 4);
+                  for (let j = 0; j < ctaCount; j++) {
+                    const cta = ctas.nth(j);
+                    const tag = await cta.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                    const debugLabel = await getClickableDebugLabel(cta);
+
+                    if (tag === "a") {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=anchor ${debugLabel}`
+                      );
+                      continue;
                     }
-                  } catch {}
-                }
-                _cands.sort((a, b) => b.score - a.score);
 
-                for (const { loc: cta, sel: ctaSel, score, text: ctaText } of _cands) {
-                  if (score < 0) {
-                    console.log(`[RESERVATION][ROOM][CTA][SKIP] label=${label} ctaSel=${ctaSel} reason=icon score=${score} text="${ctaText}"`);
-                    continue;
-                  }
-                  console.log(`[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} score=${score} text="${ctaText}"`);
+                    if (!(await cta.isVisible().catch(() => false))) {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=hidden ${debugLabel}`
+                      );
+                      continue;
+                    }
 
-                  await cta.scrollIntoViewIfNeeded().catch(() => {});
-                  await cta.click({ timeout: 1800 }).catch(async () => {
-                    console.log(`[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} ctaSel=${ctaSel}`);
-                    await cta.dispatchEvent("click").catch(() => {});
-                  });
-                  await page.waitForTimeout(1200);
+                    if (isBadClickableLabel(debugLabel)) {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=bad_label ${debugLabel}`
+                      );
+                      continue;
+                    }
 
-                  const progressed = await indicatesBookingProgress();
-                  console.log(`[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} score=${score} progressed=${progressed} url="${page.url()}"`);
+                    console.log(
+                      `[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} ${debugLabel}`
+                    );
 
-                  if (progressed) {
-                    console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel} text="${ctaText}"`);
-                    return true;
+                    await cta.scrollIntoViewIfNeeded().catch(() => {});
+                    await cta.click({ timeout: 1800 }).catch(async () => {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} ${debugLabel}`
+                      );
+                      await cta.dispatchEvent("click").catch(() => {});
+                    });
+                    await page.waitForTimeout(1200);
+
+                    const progressed = await indicatesBookingProgress();
+                    console.log(
+                      `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
+                    );
+
+                    if (progressed) {
+                      console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel} ${debugLabel}`);
+                      return true;
+                    }
                   }
                 }
 
                 const fallbackButtons = container.locator(`button, [role="button"], a, input[type="button"], input[type="submit"]`);
-                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 4);
+                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 5);
 
                 for (let j = 0; j < fallbackCount; j++) {
                   const btn = fallbackButtons.nth(j);
-                  const btnText = String(await btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
                   const btnTag = await btn.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                  const debugLabel = await getClickableDebugLabel(btn);
+
                   if (!(await btn.isVisible().catch(() => false))) {
                     console.log(
-                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=hidden tag=${btnTag} text="${btnText}"`
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=hidden ${debugLabel}`
+                    );
+                    continue;
+                  }
+
+                  if (btnTag === "a") {
+                    console.log(
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=anchor ${debugLabel}`
+                    );
+                    continue;
+                  }
+
+                  if (isBadClickableLabel(debugLabel)) {
+                    console.log(
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=bad_label ${debugLabel}`
                     );
                     continue;
                   }
 
                   console.log(
-                    `[RESERVATION][ROOM][FALLBACK][TRY] label=${label} idx=${j} tag=${btnTag} text="${btnText}"`
+                    `[RESERVATION][ROOM][FALLBACK][TRY] label=${label} idx=${j} ${debugLabel}`
                   );
 
                   await btn.scrollIntoViewIfNeeded().catch(() => {});
                   await btn.click({ timeout: 1800 }).catch(async () => {
-                    console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j}`);
+                    console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j} ${debugLabel}`);
                     await btn.dispatchEvent("click").catch(() => {});
                   });
                   await page.waitForTimeout(1200);
 
                   const progressed = await indicatesBookingProgress();
                   console.log(
-                    `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}"`
+                    `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                   );
 
                   if (progressed) {
-                    console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container`);
+                    console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container ${debugLabel}`);
                     return true;
                   }
                 }
+
 
               }
             }
@@ -4296,7 +4303,23 @@ rooms: rooms,
           };
 
           const frames = page.frames().filter((f) => f !== page.mainFrame());
-          for (const frame of frames) {
+
+          const bookingFrames = frames.filter((frame) => {
+            const frameUrl = String(frame.url() || "").toLowerCase();
+            const frameName = String((frame as any).name?.() || "").toLowerCase();
+            const hay = `${frameUrl} ${frameName}`;
+            return (
+              hay.includes("book") ||
+              hay.includes("reserv") ||
+              hay.includes("clock-pms") ||
+              hay.includes("wbe") ||
+              hay.includes("hotel") ||
+              hay.includes("checkout") ||
+              hay.includes("availability")
+            );
+          });
+
+          for (const frame of bookingFrames) {
             const frameUrl = String(frame.url() || "");
             const frameName = String((frame as any).name?.() || "");
             const label = `frame(${frameName || frameUrl || "unknown"})`;
@@ -4306,9 +4329,35 @@ rooms: rooms,
             }
           }
 
-          if (!roomSelectionSucceeded) {
-            roomSelectionSucceeded = await clickRoomInContext(page as any, "page");
+          if (!roomSelectionSucceeded && bookingFrames.length === 0) {
+            const bookingLikeContainers = [
+              'form',
+              '[class*="booking"]',
+              '[class*="reservation"]',
+              '[class*="widget"]',
+              '[id*="booking"]',
+              '[id*="reservation"]',
+            ];
+
+            for (const rootSel of bookingLikeContainers) {
+              const root = page.locator(rootSel).first();
+              const count = await page.locator(rootSel).count().catch(() => 0);
+              if (!count) continue;
+              const visible = await root.isVisible().catch(() => false);
+              if (!visible) continue;
+
+              const scopedCtx = {
+                locator: (sel: string) => root.locator(sel),
+              } as any;
+
+              if (await clickRoomInContext(scopedCtx, `page-root(${rootSel})`)) {
+                roomSelectionSucceeded = true;
+                break;
+              }
+            }
           }
+
+
 
           if (!roomSelectionSucceeded) {
             console.log("[RESERVATION][ROOM] safe room click not confirmed inside booking context");
@@ -4346,29 +4395,26 @@ rooms: rooms,
         }
 
 
-// STEP 2: after room selection, navigate Clock PMS to checkout step if possible
+        // Navigate Clock PMS through Tariff step to Checkout step
         if (roomSelectionSucceeded) {
-          console.log("[RESERVATION] Room selected — running Clock PMS step navigator");
           const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
           console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(500);
         }
 
+        // STEP 2: after room selection, return the REAL missing fields from the current booking step
         const hasGuestIdentity =
           !!String(req.guest_name || "").trim() &&
           !!String(req.guest_email || "").trim() &&
           !!String(req.guest_phone || "").trim();
 
         if (req.room_type && !hasGuestIdentity) {
-          // Re-read step needs after clock pms navigation
-          const stepNeedsNow = await this.inferCurrentBookingStepNeeds(page);
-          const ssNow = await this.takeAvailabilityScreenshot(page);
           return {
             ok: true,
             phase: "reserve",
             message: "reserve_current_step_needs_input",
-            booking_url: stepNeedsNow.payment_required ? page.url() : "",
-            screenshot_base64: ssNow,
+            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
+            screenshot_base64: screenshotAfterRoom,
             observation: {
               url: currentUrlAfterRoom,
               before_url: beforeUrl,
