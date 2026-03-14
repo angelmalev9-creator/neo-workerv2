@@ -4627,98 +4627,66 @@ class HotSessionManager {
         !hasTariffContent
       );
       if (isRoomStep) {
-        console.log("[BOOKING_NAV] On room selection step — DOM-based available room finder");
+        console.log("[BOOKING_NAV] On room selection step — searching for available CTA in frame");
 
-        // ✅ PRIMARY: DOM evaluate — find ALL buttons in the frame, skip unavailable cards,
-        // click the first non-icon visible button. This works regardless of scroll position.
-        const domClicked = await ctx.evaluate((): string | null => {
-          const ICON_TEXTS = new Set([
-            "lens","chevron_left","chevron_right","fullscreen","expand_more","expand_less",
-            "close","search","favorite","share","prev","next","zoom","person","shopping_cart",
-            "arrow_back","arrow_drop_down","toggle details","calendar_today","date_range",
-            "schedule","calendar на заетостта", // Clock PMS availability button
-          ]);
-          const isIcon = (t: string) => {
-            const s = t.toLowerCase().replace(/\s+/g, " ").trim();
-            if (!s || s.length < 2) return true;
-            return ICON_TEXTS.has(s) || s.length <= 3;
-          };
-          const isVisible = (el: Element): boolean => {
-            const r = (el as any).getBoundingClientRect?.();
-            if (!r || r.width === 0 || r.height === 0) return false;
-            const s = window.getComputedStyle(el as any);
-            return s.display !== "none" && s.visibility !== "hidden" && parseFloat(s.opacity) > 0.05;
-          };
+        // Search for "ПОКАЖИ ТАРИФИТЕ" (or equivalent) in ANY available card
+        // STRICTLY inside ctx (booking iframe) — no main page interaction
+        let roomClicked = false;
 
-          // Walk all buttons, skip those inside "unavailable" wrappers
-          const allBtns = Array.from(document.querySelectorAll("button, [role='button']"));
-          for (const btn of allBtns) {
-            const t = ((btn as any).innerText || "").replace(/\s+/g, " ").trim();
-            if (isIcon(t)) continue;
-            if (!isVisible(btn)) continue;
-            // Check if any ancestor card/container has "не е налично" text
-            let anc: Element | null = btn;
-            let unavailable = false;
-            for (let d = 0; d < 8 && anc; d++) {
-              const cls = ((anc as any).className || "").toLowerCase();
-              const txt = ((anc as any).innerText || "").toLowerCase();
-              if (/не\s*е\s*налично|not\s*available|unavailable|sold.?out/.test(txt) &&
-                  /не\s*е\s*налично|not\s*available|sold.?out/.test(txt.slice(0, 300))) {
-                unavailable = true; break;
+        const _roomCTASels = [
+          'button:has-text("ПОКАЖИ ТАРИФИТЕ")',
+          '[role="button"]:has-text("ПОКАЖИ ТАРИФИТЕ")',
+          'button:has-text("Покажи тарифите")',
+          'button:has-text("Check rates")',
+          'button:has-text("Show rates")',
+        ];
+        for (const _rSel of _roomCTASels) {
+          const _rBtns = await ctx.locator(_rSel).all().catch(() => []);
+          for (const _rb of _rBtns) {
+            if (!(await _rb.isVisible().catch(() => false))) continue;
+            // Skip if button is inside an "Не е налично" card
+            const _unavail = await _rb.evaluate((el: any): boolean => {
+              let p: Element | null = el;
+              for (let i = 0; i < 8 && p; i++) {
+                if (/не\s*е\s*налично|not\s*available|sold.?out/i.test(
+                  ((p as any).innerText || "").slice(0, 400))) return true;
+                p = p.parentElement;
               }
-              if (cls.includes("overlay") || cls.includes("badge-unavail")) {
-                unavailable = true; break;
-              }
-              anc = anc.parentElement;
-            }
-            if (unavailable) continue;
-            (btn as any).scrollIntoView?.({ behavior: "instant", block: "center" });
-            (btn as HTMLElement).click?.();
-            return t;
+              return false;
+            }).catch(() => false);
+            if (_unavail) continue;
+            await _rb.scrollIntoViewIfNeeded().catch(() => {});
+            await _rb.click({ timeout: 2000 }).catch(() => {});
+            console.log(`[BOOKING_NAV] ✓ Clicked room CTA: "${_rSel}"`);
+            roomClicked = true; break;
           }
-          return null;
-        }).catch(() => null);
-
-        if (domClicked) {
-          console.log(`[BOOKING_NAV] DOM-clicked room button: "${domClicked}"`);
-          await page.waitForTimeout(1200);
-          continue;
+          if (roomClicked) break;
         }
 
-        // ✅ FALLBACK: scroll through iframe systematically and click first CTA-like button
-        let roomClicked = false;
-        try {
-          // Scroll the iframe body to see all content
-          for (let scrollY = 0; scrollY <= 2000; scrollY += 300) {
-            await ctx.evaluate((y: number) => window.scrollTo(0, y), scrollY).catch(() => {});
-            await page.waitForTimeout(200);
-            const btns = await ctx.locator("button, [role='button']").all().catch(() => []);
-            for (const btn of btns) {
-              const t = (await btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-              if (!t || isBadClickableLabel(t)) continue;
-              // Specifically prefer "ПОКАЖИ ТАРИФИТЕ" / booking action buttons
-              const isActionBtn = /покажи|тариф|book|select|резерв|избери|continue|напред|виж|show|view\s*rate/i.test(t);
-              if (!isActionBtn && t.length > 40) continue;
-              if (!(await btn.isVisible().catch(() => false))) continue;
-              // Skip if in unavailable card
-              const cardText = (await btn.evaluate((el: any) => {
-                let p: Element | null = el;
-                for (let i = 0; i < 6 && p; i++) {
-                  const cls = ((p as any).className || "").toLowerCase();
-                  if (cls.includes("card") || cls.includes("room-item")) return (p as any).innerText || "";
-                  p = p.parentElement;
-                }
-                return "";
-              }).catch(() => "")).toLowerCase();
-              if (/не\s*е\s*налично|not\s*available|sold.?out/i.test(cardText)) continue;
-              await btn.scrollIntoViewIfNeeded().catch(() => {});
-              await btn.click({ timeout: 2000 }).catch(() => {});
-              console.log(`[BOOKING_NAV] Clicked room action (scroll-found): "${t}"`);
-              roomClicked = true; break;
-            }
-            if (roomClicked) break;
+        if (!roomClicked) {
+          // Fallback: any visible non-icon, non-calendar button not in unavailable card
+          const _allBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+          for (const _btn of _allBtns) {
+            const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+            if (!_t || isBadClickableLabel(_t)) continue;
+            if (/календар|заетост|calendar/i.test(_t)) continue;
+            if (!(await _btn.isVisible().catch(() => false))) continue;
+            const _unavail = await _btn.evaluate((el: any): boolean => {
+              let p: Element | null = el;
+              for (let i = 0; i < 8 && p; i++) {
+                if (/не\s*е\s*налично|not\s*available|sold.?out/i.test(
+                  ((p as any).innerText || "").slice(0, 400))) return true;
+                p = p.parentElement;
+              }
+              return false;
+            }).catch(() => false);
+            if (_unavail) continue;
+            await _btn.scrollIntoViewIfNeeded().catch(() => {});
+            await _btn.click({ timeout: 2000 }).catch(() => {});
+            console.log(`[BOOKING_NAV] ✓ Clicked fallback room btn: "${_t}"`);
+            roomClicked = true; break;
           }
-        } catch {}
+        }
 
         await page.waitForTimeout(900); continue;
       }
@@ -4788,58 +4756,21 @@ class HotSessionManager {
           }
         }
 
-        // ── Step B: Click ИЗБЕРИ / rate CTA ──
-        // ✅ Use DOM evaluate to find and click regardless of scroll position
+        // ── Step B: Click ИЗБЕРИ / rate CTA — strictly inside ctx (booking iframe) ──
         await page.waitForTimeout(200);
         let _izberiClicked = false;
 
-        // DOM-based click — works even if button is below fold
-        const _izberiDom = await ctx.evaluate((): string | null => {
-          const allBtns = Array.from(document.querySelectorAll("button, [role='button']"));
-          // Scroll to bottom first to ensure all lazy content is loaded
-          window.scrollTo(0, document.body.scrollHeight);
-          for (const btn of allBtns) {
-            const t = ((btn as any).innerText || "").replace(/\s+/g, " ").trim().toUpperCase();
-            if (!t) continue;
-            if (/ИЗБЕРИ|SELECT|BOOK|РЕЗЕРВ|CHOOSE|RESERVE|ДОБАВ|CONTINUE|НАПРЕД|NEXT/.test(t) && t.length <= 50) {
-              const s = window.getComputedStyle(btn as any);
-              if (s.display === "none" || s.visibility === "hidden") continue;
-              (btn as any).scrollIntoView?.({ behavior: "instant", block: "center" });
-              (btn as HTMLElement).click?.();
-              return t;
-            }
-          }
-          // Also try arrow_downward ИЗБЕРИ (Clock PMS specific — icon + text)
-          for (const btn of allBtns) {
-            const t = ((btn as any).innerText || "").replace(/\s+/g, " ").trim();
-            if (/избери/i.test(t)) {
-              (btn as any).scrollIntoView?.({ behavior: "instant", block: "center" });
-              (btn as HTMLElement).click?.();
-              return t;
-            }
-          }
-          return null;
-        }).catch(() => null);
-
-        if (_izberiDom) {
-          console.log(`[BOOKING_NAV] DOM-clicked rate CTA: "${_izberiDom}"`);
-          _izberiClicked = true;
-        }
-
-        // Playwright locator fallback if DOM click didn't work
-        if (!_izberiClicked) {
-          const _ctaBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
-          for (const _btn of _ctaBtns) {
-            const _t = (await _btn.innerText().catch(() => "")).trim();
-            if (!_t) continue;
-            if (/избери|select|book|резерв|добав|add|choose|reserve/i.test(_t) && _t.length <= 50) {
-              if (await _btn.isVisible().catch(() => false)) {
-                await _btn.scrollIntoViewIfNeeded().catch(() => {});
-                await _btn.click({ timeout: 2000 }).catch(() => {});
-                console.log(`[BOOKING_NAV] Clicked rate CTA (locator): "${_t.replace(/\s+/g, " ")}"`);
-                _izberiClicked = true;
-                break;
-              }
+        const _ctaBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+        for (const _btn of _ctaBtns) {
+          const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+          if (!_t) continue;
+          if (/избери|select|book|резерв|choose|reserve/i.test(_t) && _t.length <= 60) {
+            if (await _btn.isVisible().catch(() => false)) {
+              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+              await _btn.click({ timeout: 2000 }).catch(() => {});
+              console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
+              _izberiClicked = true;
+              break;
             }
           }
         }
@@ -4868,59 +4799,33 @@ class HotSessionManager {
           if (_hasOverlay) {
             console.log(`[BOOKING_NAV] Clock PMS overlay detected on main page (attempt ${_od + 1})`);
 
-            // ✅ Use DOM evaluate to click Quasar toggle reliably
-            // The toggle "Резервирам за някой друг" is a Quasar q-toggle —
-            // clicking the thumb/inner element is required (not just the label)
-            const _toggleDom = await page.evaluate((): boolean => {
-              // Priority: find the toggle thumb directly
-              const thumb = document.querySelector('.q-toggle__thumb') as HTMLElement | null;
-              if (thumb) { thumb.click(); return true; }
-              const inner = document.querySelector('.q-toggle__inner') as HTMLElement | null;
-              if (inner) { inner.click(); return true; }
-              // Fallback: find label containing "резервирам" text and click it
-              const labels = Array.from(document.querySelectorAll('label, [class*="toggle"], [class*="q-toggle"]'));
-              for (const el of labels) {
-                const t = ((el as any).innerText || "").toLowerCase();
-                if (t.includes("резервирам") || t.includes("reserving for")) {
-                  (el as HTMLElement).click?.();
-                  return true;
-                }
-              }
-              return false;
-            }).catch(() => false);
-
-            let _toggled = _toggleDom;
-            if (_toggled) {
-              console.log("[BOOKING_NAV] DOM-clicked guest toggle");
-            }
-
-            // Playwright locator fallback
-            if (!_toggled) {
-              const _toggleSelectors = [
-                '.q-toggle__thumb',
-                '.q-toggle__inner',
-                '[class*="q-toggle__track"]',
-                'label:has-text("Резервирам за някой друг")',
-                '[class*="q-toggle"]:has-text("Резервирам")',
-                'label:has-text("Резервирам")',
-              ];
-              for (const _tSel of _toggleSelectors) {
-                try {
-                  const _tEl = page.locator(_tSel).first();
-                  if (await _tEl.count().catch(() => 0) === 0) continue;
-                  if (!(await _tEl.isVisible({ timeout: 600 }).catch(() => false))) continue;
-                  await _tEl.scrollIntoViewIfNeeded().catch(() => {});
-                  await _tEl.click({ timeout: 1500, force: true }).catch(() => {});
-                  console.log(`[BOOKING_NAV] Clicked guest toggle (locator): "${_tSel}"`);
-                  _toggled = true;
-                  break;
-                } catch {}
-              }
+            // The "Резервирам за някой друг" toggle is a Quasar q-toggle on the MAIN PAGE
+            // (Clock PMS renders the checkout overlay outside the iframe)
+            // We must click it on the main page — this is unavoidable for Clock PMS
+            const _toggleSelectors = [
+              '.q-toggle__thumb',
+              '.q-toggle__inner',
+              '[class*="q-toggle__track"]',
+              'label:has-text("Резервирам за някой друг")',
+              '[class*="q-toggle"]:has-text("Резервирам")',
+              'label:has-text("Резервирам")',
+            ];
+            let _toggled = false;
+            for (const _tSel of _toggleSelectors) {
+              try {
+                const _tEl = page.locator(_tSel).first();
+                if (await _tEl.count().catch(() => 0) === 0) continue;
+                if (!(await _tEl.isVisible({ timeout: 600 }).catch(() => false))) continue;
+                await _tEl.scrollIntoViewIfNeeded().catch(() => {});
+                await _tEl.click({ timeout: 1500, force: true }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
+                _toggled = true;
+                break;
+              } catch {}
             }
 
             if (_toggled) {
               _sameTextCount = 0; _prevFrameText = "";
-              // Wait up to 4s for checkout to appear
               for (let _cw2 = 0; _cw2 < 6; _cw2++) {
                 await page.waitForTimeout(600);
                 if (await this.isAtCheckoutStep(page)) {
@@ -4932,10 +4837,9 @@ class HotSessionManager {
                   return true;
                 }
               }
-              // Toggle was clicked but checkout not detected yet — continue loop
               break;
             }
-            break; // no toggle found, continue loop
+            break;
           }
 
           // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
@@ -5643,83 +5547,71 @@ rooms: rooms,
               }
             }
 
-            // ✅ LAST RESORT: DOM evaluate — scroll through all content, find first
-            // non-icon action button that's NOT inside an unavailable card wrapper.
-            // This handles cases where:
-            //   a) The requested room is unavailable but another is available
-            //   b) The CTA button is below the fold
-            //   c) Clock PMS lazy-renders the button after scroll
-            console.log(`[RESERVATION][ROOM][DOM_SCROLL] label=${label} trying DOM scroll-and-click`);
-            const domResult = await ctx.evaluate((_wantedRoom: string): string | null => {
-              const ICON = new Set([
-                "lens","chevron_left","chevron_right","fullscreen","expand_more","expand_less",
-                "close","search","favorite","share","prev","next","zoom","person","shopping_cart",
-                "arrow_back","arrow_drop_down","toggle details",
-              ]);
-              const isIcon = (t: string) => {
-                const s = t.toLowerCase().replace(/\s+/g, " ").trim();
-                return !s || s.length <= 2 || ICON.has(s);
-              };
-              const isVisible = (el: Element): boolean => {
-                const r = (el as any).getBoundingClientRect?.();
-                if (!r || r.width === 0 || r.height === 0) return false;
-                const s = window.getComputedStyle(el as any);
-                return s.display !== "none" && s.visibility !== "hidden";
-              };
+            // ── FRAME-WIDE CTA SEARCH ────────────────────────────────────────
+            // The target room may be unavailable — its card has no CTA buttons.
+            // Search the ENTIRE booking frame for ANY available CTA button.
+            // STRICTLY inside ctx (booking iframe) — never touches main page.
+            console.log(`[RESERVATION][ROOM][FRAME_WIDE] label=${label} searching frame for available CTA`);
 
-              // First: try to find and click "ПОКАЖИ ТАРИФИТЕ" or equivalent
-              // in an available room card (not "Не е налично")
-              const allBtns = Array.from(document.querySelectorAll("button, [role='button']"));
-
-              // Sort: prefer buttons whose ancestor card contains the wanted room name
-              const wanted = (_wantedRoom || "").toLowerCase();
-              allBtns.sort((a, b) => {
-                const aCard = (a as any).closest?.('[class*="card"], [class*="room"], article')?.innerText?.toLowerCase() || "";
-                const bCard = (b as any).closest?.('[class*="card"], [class*="room"], article')?.innerText?.toLowerCase() || "";
-                const aMatch = wanted && aCard.includes(wanted) ? -1 : 0;
-                const bMatch = wanted && bCard.includes(wanted) ? -1 : 0;
-                return aMatch - bMatch;
-              });
-
-              for (const btn of allBtns) {
-                const t = ((btn as any).innerText || "").replace(/\s+/g, " ").trim();
-                if (isIcon(t)) continue;
-                // Skip "КАЛЕНДАР НА ЗАЕТОСТТА" (availability calendar — not a booking button)
-                if (/календар|заетост|availability.?calendar/i.test(t)) continue;
-                // Skip non-booking texts
-                if (t.length > 60) continue;
-
-                // Check ancestor for "не е налично"
-                let p: Element | null = btn;
-                let unavail = false;
-                for (let d = 0; d < 8 && p; d++) {
-                  const pText = ((p as any).innerText || "").toLowerCase();
-                  if (/не\s*е\s*налично|not\s*available|sold.?out/.test(pText.slice(0, 500))) {
-                    unavail = true; break;
+            // Priority 1: explicit "ПОКАЖИ ТАРИФИТЕ" in ANY available card
+            const _pokażiSels = [
+              'button:has-text("ПОКАЖИ ТАРИФИТЕ")',
+              '[role="button"]:has-text("ПОКАЖИ ТАРИФИТЕ")',
+              'button:has-text("Покажи тарифите")',
+              'button:has-text("SHOW RATES")',
+              'button:has-text("Check rates")',
+            ];
+            for (const _ps of _pokażiSels) {
+              const _pbBtns = await ctx.locator(_ps).all().catch(() => []);
+              for (const _pb of _pbBtns) {
+                if (!(await _pb.isVisible().catch(() => false))) continue;
+                // Ensure it's NOT inside an "Не е налично" card
+                const _unavail = await _pb.evaluate((el: any): boolean => {
+                  let p: Element | null = el;
+                  for (let i = 0; i < 8 && p; i++) {
+                    if (/не\s*е\s*налично|not\s*available|sold.?out/i.test(
+                      ((p as any).innerText || "").slice(0, 400))) return true;
+                    p = p.parentElement;
                   }
-                  p = p.parentElement;
-                }
-                if (unavail) continue;
-
-                // Scroll into view and click
-                (btn as any).scrollIntoView?.({ behavior: "instant", block: "center" });
-                (btn as HTMLElement).click?.();
-                return t;
-              }
-              return null;
-            }, String(req.room_type || "")).catch(() => null);
-
-            if (domResult) {
-              console.log(`[RESERVATION][ROOM][DOM_SCROLL] Clicked: "${domResult}"`);
-              await page.waitForTimeout(1500);
-              const progressed = await indicatesBookingProgress();
-              if (progressed) {
-                console.log(`[RESERVATION][ROOM] selected via DOM scroll → "${domResult}"`);
+                  return false;
+                }).catch(() => false);
+                if (_unavail) continue;
+                await _pb.scrollIntoViewIfNeeded().catch(() => {});
+                await _pb.click({ timeout: 2000 }).catch(async () => {
+                  await _pb.dispatchEvent("click").catch(() => {});
+                });
+                console.log(`[RESERVATION][ROOM][FRAME_WIDE] ✓ Clicked "${_ps}" in available card`);
+                await page.waitForTimeout(1500);
+                // optimistic: navigateBookingWidgetToCheckout takes it from here
                 return true;
               }
-              // Even if not "progressed", let the navigator continue — Clock PMS may need 2 clicks
-              console.log(`[RESERVATION][ROOM][DOM_SCROLL] Click sent but progress not confirmed — continuing nav`);
-              return true; // optimistic: let navigateBookingWidgetToCheckout take over
+            }
+
+            // Priority 2: ANY visible non-icon non-calendar button in the frame
+            // that is NOT inside an unavailable card
+            const _allFrameBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+            for (const _fb of _allFrameBtns) {
+              const _ft = (await _fb.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+              if (!_ft || isBadClickableLabel(_ft)) continue;
+              if (/календар|заетост|calendar/i.test(_ft)) continue;
+              if (!(await _fb.isVisible().catch(() => false))) continue;
+              const _unavail = await _fb.evaluate((el: any): boolean => {
+                let p: Element | null = el;
+                for (let i = 0; i < 8 && p; i++) {
+                  if (/не\s*е\s*налично|not\s*available|sold.?out/i.test(
+                    ((p as any).innerText || "").slice(0, 400))) return true;
+                  p = p.parentElement;
+                }
+                return false;
+              }).catch(() => false);
+              if (_unavail) continue;
+              await _fb.scrollIntoViewIfNeeded().catch(() => {});
+              await _fb.click({ timeout: 2000 }).catch(async () => {
+                await _fb.dispatchEvent("click").catch(() => {});
+              });
+              console.log(`[RESERVATION][ROOM][FRAME_WIDE] ✓ Clicked fallback btn: "${_ft}"`);
+              await page.waitForTimeout(1500);
+              return true;
             }
 
             return false;
