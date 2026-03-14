@@ -4535,6 +4535,9 @@ rooms: rooms,
             const _checkoutFieldsEarly: Array<{ sel: string[]; val: string; label: string }> = [
               { label: "Собствено име", sel: ["input[placeholder*='Собствено']","input[name*='first']","input[id*='first']","input[placeholder*='First']"], val: String(req.guest_name || "").split(" ")[0] },
               { label: "Фамилия",       sel: ["input[placeholder*='Фамил']","input[name*='last']","input[id*='last']","input[placeholder*='Last']"], val: String(req.guest_name || "").split(" ").slice(1).join(" ") || String(req.guest_name || "") },
+              { label: "ЕГН",           sel: ["input[placeholder*='ЕГН']","input[placeholder*='EGN']","input[name*='egn']","input[id*='egn']","input[name*='pid']","input[id*='pid']"], val: req.guest_egn || "" },
+              { label: "Дата на раждане", sel: ["input[placeholder*='Дата']","input[placeholder*='Date']","input[name*='birth']","input[id*='birth']","input[name*='dob']","input[type='date']"], val: req.guest_birthdate || "" },
+              { label: "Номер на документ", sel: ["input[placeholder*='Номер на документ']","input[placeholder*='Document']","input[name*='doc']","input[id*='doc']","input[name*='passport']","input[id*='passport']"], val: req.guest_doc_number || "" },
               { label: "E-mail",        sel: ["input[type='email']","input[placeholder*='mail']","input[name*='email']","input[id*='email']"], val: req.guest_email || "" },
               { label: "Телефон",       sel: ["input[type='tel']","input[placeholder*='елефон']","input[placeholder*='Phone']","input[name*='phone']","input[name*='tel']"], val: req.guest_phone || "" },
             ];
@@ -5084,6 +5087,9 @@ rooms: rooms,
           const _checkoutFields: Array<{ sel: string[]; val: string; label: string }> = [
             { label: "Собствено име",  sel: ["input[placeholder*='Собствено']", "input[name*='first']", "input[name*='given']", "input[id*='first']", "input[placeholder*='First']"], val: String(req.guest_name || "").split(" ")[0] },
             { label: "Фамилия",        sel: ["input[placeholder*='Фамил']", "input[name*='last']", "input[name*='family']", "input[id*='last']", "input[placeholder*='Last']"], val: String(req.guest_name || "").split(" ").slice(1).join(" ") || String(req.guest_name || "") },
+            { label: "ЕГН",            sel: ["input[placeholder*='ЕГН']", "input[placeholder*='EGN']", "input[name*='egn']", "input[id*='egn']", "input[name*='pid']", "input[id*='pid']"], val: req.guest_egn || "" },
+            { label: "Дата на раждане", sel: ["input[placeholder*='Дата']", "input[placeholder*='Date of birth']", "input[name*='birth']", "input[id*='birth']", "input[name*='dob']", "input[type='date']"], val: req.guest_birthdate || "" },
+            { label: "Номер на документ", sel: ["input[placeholder*='Номер на документ']", "input[placeholder*='Document']", "input[name*='doc']", "input[id*='doc']", "input[name*='passport']"], val: req.guest_doc_number || "" },
             { label: "E-mail",         sel: ["input[type='email']", "input[placeholder*='mail']", "input[placeholder*='Mail']", "input[name*='email']", "input[id*='email']"], val: req.guest_email || "" },
             { label: "Телефон",        sel: ["input[type='tel']", "input[placeholder*='елефон']", "input[placeholder*='Phone']", "input[name*='phone']", "input[name*='tel']", "input[id*='phone']"], val: req.guest_phone || "" },
           ];
@@ -5097,7 +5103,20 @@ rooms: rooms,
                 if (!(await loc.isVisible().catch(() => false))) continue;
                 await loc.scrollIntoViewIfNeeded().catch(() => {});
                 await loc.click({ timeout: 1500 }).catch(() => {});
+                // Quasar Vue inputs need triple-click to select + type + dispatch events
+                await loc.click({ clickCount: 3, timeout: 1000 }).catch(() => {});
                 await loc.fill(fld.val, { timeout: 1500 }).catch(() => {});
+                // Trigger Vue reactivity: dispatch input + change events
+                await _clockFrame.evaluate(({ sel, val }: { sel: string; val: string }) => {
+                  const el = document.querySelector(sel) as HTMLInputElement | null;
+                  if (!el) return;
+                  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                  if (nativeInputValueSetter) nativeInputValueSetter.call(el, val);
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+                }, { sel, val: fld.val }).catch(() => {});
+                await page.waitForTimeout(100);
                 console.log(`[RESERVATION][STEP3][IFRAME] Filled ${fld.label}: ${fld.val.slice(0,20)}`);
                 _filledCount++;
                 break;
@@ -5115,6 +5134,49 @@ rooms: rooms,
           if (_filledCount > 0) {
             _iframeCheckoutFilled = true;
             console.log(`[RESERVATION][STEP3][IFRAME] Filled ${_filledCount} fields in Clock PMS checkout`);
+          }
+
+          // After filling, check if there are STILL missing required fields
+          if (_iframeCheckoutFilled) {
+            await page.waitForTimeout(400);
+            const _stepAfterFill = await this.inferCurrentBookingStepNeeds(page);
+            const _stillMissing = (_stepAfterFill.missing_required || []).filter((f: string) =>
+              // Exclude already-provided fields
+              !/(собствено|фамил|e.?mail|телефон)/i.test(f)
+            );
+            console.log(`[RESERVATION][STEP3][IFRAME] After fill: missing=${_stepAfterFill.missing_required.join(" | ") || "none"} stillNeedExtra=${_stillMissing.join(" | ") || "none"}`);
+
+            // If there are still required fields beyond basic ones → ask for them
+            if (_stepAfterFill.missing_required.length > 0) {
+              return {
+                ok: true,
+                success: true,
+                phase: "reserve",
+                stage: "reservation_reserve_needs_input",
+                message: "reserve_current_step_needs_input",
+                needs_input: true,
+                missing_required: _stepAfterFill.missing_required,
+                booking_url: "",
+                screenshot_base64: screenshotAfterRoom,
+                current_step: "reserve",
+                can_continue: false,
+              };
+            }
+
+            // All filled — return success with current URL
+            const _finalUrl = page.url();
+            return {
+              ok: true,
+              success: true,
+              phase: "reserve",
+              stage: "reservation_reserve_checkout_filled",
+              message: "reserve_checkout_filled",
+              needs_input: false,
+              missing_required: [],
+              booking_url: _finalUrl,
+              current_step: "checkout_filled",
+              can_continue: true,
+            };
           }
         }
 
