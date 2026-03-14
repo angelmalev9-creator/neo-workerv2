@@ -3820,9 +3820,15 @@ class HotSessionManager {
     const guestNum = parseInt(guests || "2") || 2;
     console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
 
+    // Initial wait for iframe to load
+    await page.waitForTimeout(1500);
+
     for (let step = 0; step < 14; step++) {
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(step === 0 ? 800 : 700);
       const frameText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
+      console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 100).replace(/\s+/g, " ")}"`);
+      // Wait if iframe not loaded yet
+      if (frameText.trim().length < 20) { await page.waitForTimeout(2000); continue; }
 
       // ── Already at checkout ──────────────────────────────
       if (await this.isAtCheckoutStep(ctx)) {
@@ -3830,10 +3836,15 @@ class HotSessionManager {
       }
 
       // ── Room/accommodation selection step ────────────────
-      // Detect: shows room cards but no tariff/rate details yet
+      // NOTE: room card buttons may contain "тариф" (e.g. "ПОКАЖИ ТАРИФИТЕ")
+      // so we detect ACTUAL tariff content by price-per-night patterns or rate plan names
+      const hasTariffContent = (
+        /standard.?rate|нощувка\s*с|meal\s*plan|breakfast\s*included|закуска\s*включ/i.test(frameText) ||
+        /\d+[\.,]\d+\s*(лв|bgn|eur|€|\$)\s*[\/на]\s*нощ/i.test(frameText)
+      );
       const isRoomStep = (
         /апартамент|единична|двойна|студио|suite|room|стая|accommodation|камер/i.test(frameText) &&
-        !/тариф|standard.?rate|bb|план|нощувка\s*с|rate\s*name|rate\s*type|meal\s*plan/i.test(frameText)
+        !hasTariffContent
       );
       if (isRoomStep) {
         console.log("[BOOKING_NAV] On room selection step — finding available room action button");
@@ -3882,7 +3893,8 @@ class HotSessionManager {
       }
 
       // ── Tariff/rate selection step ───────────────────────
-      const isTariffStep = /тариф|standard.?rate|bb|rate|план|нощувка\s*с|meal\s*plan|rate\s*name/i.test(frameText);
+      // isTariffStep: iframe shows tariff/rate details (after clicking ПОКАЖИ ТАРИФИТЕ or similar)
+      const isTariffStep = hasTariffContent || /standard.?rate|нощувка\s*с|meal\s*plan|rate\s*name/i.test(frameText);
       if (isTariffStep) {
         console.log("[BOOKING_NAV] On tariff/rate step — setting guests and clicking select");
         // Set guest count — try select, then custom dropdown, then stepper buttons
@@ -3974,8 +3986,22 @@ class HotSessionManager {
         } catch {}
       }
       if (!fwdClicked) {
-        console.log(`[BOOKING_NAV] No forward button found at step=${step} — stopping`);
-        break;
+        // Catch-all: try any visible non-icon button in the iframe
+        console.log(`[BOOKING_NAV] No named forward button at step=${step} — trying any action button`);
+        const anyBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+        for (const btn of anyBtns) {
+          const t = (await btn.innerText().catch(() => "")).trim();
+          if (!t || isBadClickableLabel(t)) continue;
+          if (!(await btn.isVisible().catch(() => false))) continue;
+          await btn.scrollIntoViewIfNeeded().catch(() => {});
+          await btn.click({ timeout: 1500 }).catch(() => {});
+          console.log(`[BOOKING_NAV] Catch-all clicked: "${t}"`);
+          fwdClicked = true; break;
+        }
+        if (!fwdClicked) {
+          console.log(`[BOOKING_NAV] No clickable button at step=${step} — stopping`);
+          break;
+        }
       }
     }
     // Final check
