@@ -3917,38 +3917,91 @@ class HotSessionManager {
         _sameTextCount++;
         if (_sameTextCount >= 2) {
           console.log(`[BOOKING_NAV] Frame text unchanged for ${_sameTextCount} steps — trying modal/overlay detection`);
-          // Check for modal overlay on main page (login, confirmation, etc.)
+
+          // Check MAIN PAGE for Clock PMS checkout overlay
+          const _mainPageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainPageText);
+
+          if (_hasOverlay) {
+            console.log("[BOOKING_NAV] Clock PMS login overlay detected — clicking Резервирам за някой друг toggle");
+
+            // Try ALL possible toggle selectors — Quasar toggle needs inner element clicked
+            const _toggleSelectors = [
+              '.q-toggle__thumb',                              // Quasar thumb (most reliable)
+              '.q-toggle__inner',                              // Quasar inner track
+              '[class*="q-toggle__track"]',
+              '[class*="toggle__thumb"]',
+              '[class*="toggle__inner"]',
+              'label:has-text("Резервирам за някой друг")',   // Label text
+              'label:has-text("Резервирам")',
+              '[class*="q-toggle"]',                           // The whole toggle component
+            ];
+
+            let _didToggle = false;
+            for (const _ts of _toggleSelectors) {
+              try {
+                const _tel = page.locator(_ts).first();
+                if (await _tel.count().catch(() => 0) === 0) continue;
+                if (!(await _tel.isVisible({ timeout: 500 }).catch(() => false))) continue;
+                await _tel.scrollIntoViewIfNeeded().catch(() => {});
+                await _tel.click({ timeout: 1500, force: true }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked toggle: "${_ts}"`);
+                _didToggle = true;
+                break;
+              } catch {}
+            }
+
+            if (_didToggle) {
+              // Wait for checkout form to appear on main page
+              for (let _cw = 0; _cw < 6; _cw++) {
+                await page.waitForTimeout(600);
+                if (await this.isAtCheckoutStep(page)) {
+                  console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
+                  return true;
+                }
+                if (await this.isAtCheckoutStep(ctx)) {
+                  console.log("[BOOKING_NAV] Checkout appeared in iframe after toggle ✓");
+                  return true;
+                }
+                // Check if iframe content changed (sometimes checkout loads in iframe)
+                const _newFt = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
+                if (_newFt !== frameText && _newFt.length > 100) {
+                  console.log("[BOOKING_NAV] iframe changed after toggle — continuing");
+                  _sameTextCount = 0; _prevFrameText = "";
+                  break;
+                }
+              }
+              _sameTextCount = 0; _prevFrameText = "";
+              continue;
+            }
+          }
+
+          // Check for Quasar dialog/overlay even without specific text
           const modalVisible = await page.locator(
-            '[class*="modal"], [class*="overlay"], [class*="dialog"], [role="dialog"], ' +
-            '[class*="popup"], .q-dialog, .q-overlay'
+            '.q-dialog__backdrop, .q-overlay, [class*="q-dialog"]'
           ).first().isVisible().catch(() => false);
           if (modalVisible) {
-            console.log("[BOOKING_NAV] Modal/overlay detected on main page — handling");
-            // Try clicking through login/auth modals
-            const modalCtx = page;
-            const guestToggle = modalCtx.locator("label").filter({ hasText: /резервирам за някой|book for|guest|без регистрация/i }).first();
-            if (await guestToggle.isVisible().catch(() => false)) {
-              await guestToggle.click().catch(() => {});
-              console.log("[BOOKING_NAV] Clicked guest toggle in modal");
-              _sameTextCount = 0; await page.waitForTimeout(600); continue;
-            }
-            // Try any forward button in modal
-            const modalFwd = modalCtx.locator('[class*="modal"] button, [class*="dialog"] button, .q-dialog button').first();
-            if (await modalFwd.isVisible().catch(() => false)) {
-              const mt = (await modalFwd.innerText().catch(() => "")).trim();
-              if (!isBadClickableLabel(mt)) {
-                await modalFwd.click({ timeout: 1500 }).catch(() => {});
-                console.log(`[BOOKING_NAV] Clicked modal button: "${mt}"`);
-                _sameTextCount = 0; await page.waitForTimeout(600); continue;
+            console.log("[BOOKING_NAV] Quasar dialog detected — checking for any action buttons");
+            const _dlgBtns = await page.locator('.q-dialog button, [class*="q-dialog"] button').all().catch(() => []);
+            for (const _db of _dlgBtns) {
+              const _dt = (await _db.innerText().catch(() => "")).trim();
+              if (!_dt || isBadClickableLabel(_dt)) continue;
+              if (await _db.isVisible().catch(() => false)) {
+                await _db.click({ timeout: 1500 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked dialog button: "${_dt}"`);
+                _sameTextCount = 0; await page.waitForTimeout(800);
+                break;
               }
             }
           }
-          // Also check if we're at checkout in the iframe itself (maybe it changed but re-check)
-          if (await this.isAtCheckoutStep(ctx)) {
-            console.log("[BOOKING_NAV] Reached checkout step (detected after same-text loop) ✓"); return true;
+
+          // Re-check checkout
+          if (await this.isAtCheckoutStep(page) || await this.isAtCheckoutStep(ctx)) {
+            console.log("[BOOKING_NAV] Checkout reached after modal handling ✓"); return true;
           }
-          if (_sameTextCount >= 3) {
-            console.log("[BOOKING_NAV] Stuck — same frame text 3+ times, stopping");
+
+          if (_sameTextCount >= 4) {
+            console.log("[BOOKING_NAV] Stuck — same frame text 4+ times, stopping");
             break;
           }
           continue;
@@ -4128,8 +4181,13 @@ class HotSessionManager {
             console.log(`[BOOKING_NAV] Clock PMS overlay detected on main page (attempt ${_od + 1})`);
 
             // Toggle "Резервирам за някой друг. Няма да отсядам в хотела."
-            // Try clicking the toggle/label
+            // Quasar q-toggle: MUST click .q-toggle__thumb or .q-toggle__inner for the toggle to work
             const _toggleSelectors = [
+              '.q-toggle__thumb',                            // Most reliable for Quasar
+              '.q-toggle__inner',
+              '[class*="q-toggle__track"]',
+              '[class*="toggle__thumb"]',
+              '[class*="toggle__inner"]',
               'label:has-text("Резервирам за някой друг")',
               '[class*="q-toggle"]:has-text("Резервирам")',
               '[class*="toggle"]:has-text("Резервирам")',
@@ -4139,36 +4197,34 @@ class HotSessionManager {
             for (const _tSel of _toggleSelectors) {
               try {
                 const _tEl = page.locator(_tSel).first();
-                if (await _tEl.isVisible({ timeout: 800 }).catch(() => false)) {
-                  await _tEl.click({ timeout: 1500 }).catch(() => {});
-                  console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
-                  _toggled = true;
-                  await page.waitForTimeout(800);
-                  break;
-                }
-              } catch {}
-            }
-
-            // If toggle not found, try clicking the toggle INPUT directly
-            if (!_toggled) {
-              const _toggleInput = page.locator('.q-toggle__inner, [class*="q-toggle"] .q-toggle__track, [class*="toggle__track"]').first();
-              if (await _toggleInput.isVisible().catch(() => false)) {
-                await _toggleInput.click({ timeout: 1500 }).catch(() => {});
-                console.log("[BOOKING_NAV] Clicked toggle track");
+                if (await _tEl.count().catch(() => 0) === 0) continue;
+                if (!(await _tEl.isVisible({ timeout: 600 }).catch(() => false))) continue;
+                await _tEl.scrollIntoViewIfNeeded().catch(() => {});
+                await _tEl.click({ timeout: 1500, force: true }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
                 _toggled = true;
-                await page.waitForTimeout(800);
-              }
+                break;
+              } catch {}
             }
 
             if (_toggled) {
               _sameTextCount = 0; _prevFrameText = "";
-              // Check if checkout appeared after toggle
-              if (await this.isAtCheckoutStep(page)) {
-                console.log("[BOOKING_NAV] Checkout appeared after toggle ✓");
-                return true;
+              // Wait up to 4s for checkout to appear
+              for (let _cw2 = 0; _cw2 < 6; _cw2++) {
+                await page.waitForTimeout(700);
+                if (await this.isAtCheckoutStep(page)) {
+                  console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
+                  return true;
+                }
+                if (await this.isAtCheckoutStep(ctx)) {
+                  console.log("[BOOKING_NAV] Checkout appeared in iframe after toggle ✓");
+                  return true;
+                }
               }
+              // Toggle was clicked but checkout not detected yet — continue loop
+              break;
             }
-            break; // handled overlay, continue loop
+            break; // no toggle found, continue loop
           }
 
           // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
