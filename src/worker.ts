@@ -278,6 +278,20 @@ function isMessageField(f: FormSchemaField): boolean {
 // Wizard label normalization
 // ───────────────────────────────────────────────────────────────
 
+// ── Material Design icon names that prefix field labels in Clock PMS / Quasar ──
+const MATERIAL_ICON_PREFIXES = /^(edit|email|phone|public|event|person|lock|search|home|info|check|close|add|remove|delete|save|send|star|favorite|settings|help|warning|error|done|clear|arrow_drop_down|arrow_forward|arrow_back|chevron_right|chevron_left|expand_more|expand_less|shopping_cart|calendar_today|date_range|schedule|location_on|place|flag|notes|description|attach_file|image|photo|camera|visibility|visibility_off|account_circle|group|business|store|credit_card|payment|security|vpn_key|fingerprint|badge|card_travel|luggage|backpack|hotel|flight|directions_car|local_taxi|train|tram|directions_bus|map|navigation|explore|language|translate|text_fields|format_list|format_quote|link|grid_view|grid_on|view_list|view_module|sell|label|local_offer|discount|percent)\s*/i;
+
+function cleanFieldLabel(raw: unknown): string {
+  let s = String(raw || "").trim();
+  // Remove leading Material icon name (e.g. "editСобствено име *" → "Собствено име *")
+  s = s.replace(MATERIAL_ICON_PREFIXES, "");
+  // Remove trailing asterisk with spaces
+  s = s.replace(/\s*\*\s*$/, "").trim();
+  // Remove leading asterisk
+  s = s.replace(/^\*\s*/, "").trim();
+  return s;
+}
+
 function normLabel(s: unknown): string {
   const t = String(s ?? "")
     .toLowerCase()
@@ -2224,7 +2238,7 @@ class HotSessionManager {
 
       const requiredFieldLabels = (scanned.fields || [])
         .filter((f: any) => !!f?.required)
-        .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
+        .map((f: any) => cleanFieldLabel(f.label || f.aria_label || f.placeholder || f.name || f.id || ""))
         .filter(Boolean);
 
       const requiredChoiceLabels = (scanned.choiceGroups || [])
@@ -2260,8 +2274,13 @@ class HotSessionManager {
 
 
       // Filter known nav/decoration noise from Clock PMS and main page
-      const _STEP_NOISE = /^(бонус\s*код|bonus\s*code|избор:\s*[/|]|емоция|сватби|бизнес|конферентни|почивка|релакс|person|shopping.?cart|arrow|grid.?view|sell|event|bg|en)/i;
-      const cleanOut = out.filter(s => !_STEP_NOISE.test(s.trim())).slice(0, 20);
+      // Also apply cleanFieldLabel to remove any remaining icon prefixes
+      const _STEP_NOISE = /^(бонус|bonus.?code|избор:|емоция|сватби|бизнес|конферентни|почивка|релакс|person|shopping|arrow|grid.?view|sell|event\b|bg\b|en\b)/i;
+      const cleanOut = out
+        .map(s => cleanFieldLabel(s))
+        .filter(s => s.length > 1)
+        .filter(s => !_STEP_NOISE.test(s.trim()))
+        .slice(0, 12);
 
       return {
         missing_required: cleanOut,
