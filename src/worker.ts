@@ -3789,15 +3789,53 @@ class HotSessionManager {
     if (!bf) { console.log("[CLOCK_PMS] No booking iframe found"); return false; }
     const guestNum = parseInt(guests || "2") || 2;
     console.log(`[CLOCK_PMS] Starting tariff/checkout navigator guests=${guestNum}`);
-    for (let step = 0; step < 8; step++) {
-      await page.waitForTimeout(600);
+    for (let step = 0; step < 12; step++) {
+      await page.waitForTimeout(700);
       const frameText = (await bf.locator("body").innerText().catch(() => "")).toLowerCase();
       // Reached checkout/contact form
       if (/данни\s*за\s*контакт|contact|собствено\s*име|first.?name|e-?mail|завършване/i.test(frameText)) {
         console.log("[CLOCK_PMS] Reached checkout step ✓"); return true;
       }
+      // Room selection step — find the available room card and click its action button (e.g. "ПОКАЖИ ТАРИФИТЕ")
+      if (/апартамент|единична|двойна|студио|suite|room|стая/i.test(frameText) && !/тариф|standard.?rate|bb\b|план|нощувка\s*с/i.test(frameText)) {
+        console.log("[CLOCK_PMS] On room selection step — looking for available room action button");
+        const allCards = await bf.locator('[class*="card"], [class*="room"], [class*="item"]').all().catch(() => []);
+        let roomClicked = false;
+        for (const card of allCards) {
+          const cardText = (await card.innerText().catch(() => "")).toLowerCase();
+          if (!cardText || cardText.trim().length < 5) continue;
+          // Skip unavailable cards
+          if (/не\s*е\s*налично|not\s*available|unavailable/i.test(cardText)) continue;
+          // Find action buttons — skip icon-only ones
+          const cardBtns = await card.locator("button").all().catch(() => []);
+          for (const btn of cardBtns) {
+            const btnText = (await btn.innerText().catch(() => "")).trim();
+            if (!btnText || isBadClickableLabel(btnText)) continue;
+            if (!(await btn.isVisible().catch(() => false))) continue;
+            await btn.scrollIntoViewIfNeeded().catch(() => {});
+            await btn.click({ timeout: 2000 }).catch(() => {});
+            console.log(`[CLOCK_PMS] Clicked room action button: "${btnText}"`);
+            roomClicked = true;
+            break;
+          }
+          if (roomClicked) break;
+        }
+        if (roomClicked) { await page.waitForTimeout(800); continue; }
+        // If no card button found, try any visible non-icon button in the iframe
+        const allBtns = await bf.locator("button").all().catch(() => []);
+        for (const btn of allBtns) {
+          const t = (await btn.innerText().catch(() => "")).trim();
+          if (!t || isBadClickableLabel(t)) continue;
+          if (!(await btn.isVisible().catch(() => false))) continue;
+          await btn.scrollIntoViewIfNeeded().catch(() => {});
+          await btn.click({ timeout: 2000 }).catch(() => {});
+          console.log(`[CLOCK_PMS] Clicked fallback room button: "${t}"`);
+          break;
+        }
+        await page.waitForTimeout(800); continue;
+      }
       // Tariff step: set adults, click ИЗБЕРИ
-      if (/тариф|standard.?rate|bb|rate|план|нощувка\s*с/i.test(frameText)) {
+      if (/тариф|standard.?rate|bb\b|rate|план|нощувка\s*с/i.test(frameText)) {
         console.log("[CLOCK_PMS] On tariff step — setting adults and clicking ИЗБЕРИ");
         try {
           const selLoc = bf.locator("select").first();
@@ -4094,6 +4132,17 @@ rooms: rooms,
                   console.log("[RESERVATION][ROOM] iframe content changed — booking progressed");
                   return true;
                 }
+                // Even if snapshot text didn't change in length, check for tariff/checkout keywords appearing
+                const newSnapLower = newSnap.toLowerCase();
+                if (/тариф|standard.?rate|bb\b|нощувка\s*с|plan|покажи тарифите/i.test(newSnapLower) &&
+                    !/апартамент.*апартамент.*апартамент/i.test(newSnapLower)) {
+                  console.log("[RESERVATION][ROOM] tariff step detected in iframe — booking progressed");
+                  return true;
+                }
+                if (/данни\s*за\s*контакт|собствено\s*име|e-?mail.*попълни|завършване/i.test(newSnapLower)) {
+                  console.log("[RESERVATION][ROOM] checkout step detected in iframe — booking progressed");
+                  return true;
+                }
               }
             } catch {}
 
@@ -4106,11 +4155,19 @@ rooms: rooms,
 
           const clickRoomInContext = async (ctx: any, label: string) => {
             const ctaSelectors = [
+              `button:has-text("ПОКАЖИ ТАРИФИТЕ")`,
+              `button:has-text("Покажи тарифите")`,
+              `button:has-text("Покажи")`,
+              `button:has-text("Тарифи")`,
               `button:has-text("Резервирай")`,
               `button:has-text("Избери")`,
               `button:has-text("Book")`,
               `button:has-text("Reserve")`,
               `button:has-text("Select")`,
+              `button:has-text("Check rates")`,
+              `button:has-text("Show rates")`,
+              `[role="button"]:has-text("ПОКАЖИ ТАРИФИТЕ")`,
+              `[role="button"]:has-text("Покажи тарифите")`,
               `[role="button"]:has-text("Резервирай")`,
               `[role="button"]:has-text("Избери")`,
               `[role="button"]:has-text("Book")`,
@@ -4375,27 +4432,45 @@ rooms: rooms,
 
 
         if (roomSelectionAttempted && !roomSelectionSucceeded) {
-          return {
-            ok: false,
-            phase: "reserve",
-            message: "room_selection_not_confirmed",
-            booking_url: "",
-            screenshot_base64: screenshotAfterRoom,
-            observation: {
-              url: currentUrlAfterRoom,
-              before_url: beforeUrl,
-              room_type: req.room_type || "",
-              current_step: stepNeedsAfterRoom.current_step,
-              missing_required: stepNeedsAfterRoom.missing_required,
-              can_continue: stepNeedsAfterRoom.can_continue,
-              payment_required: stepNeedsAfterRoom.payment_required,
-              finalized: false,
-            },
-          };
+          // For Clock PMS iframes: attempt full navigation regardless —
+          // the room click may have changed the iframe state without triggering indicatesBookingProgress
+          const hasClockPmsFrame = page.frames().some(f => {
+            const n = String(f.name?.() || "");
+            const u = f.url();
+            return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
+          });
+          if (hasClockPmsFrame) {
+            console.log("[RESERVATION][ROOM] room click unconfirmed but Clock PMS iframe present — attempting clockPmsNavigateToCheckout anyway");
+            const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
+            console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
+            if (reachedCheckout) roomSelectionSucceeded = true;
+            await page.waitForTimeout(500);
+          }
+
+          if (!roomSelectionSucceeded) {
+            const screenshotRoomFail = await this.takeAvailabilityScreenshot(page);
+            const stepNeedsRoomFail = await this.inferCurrentBookingStepNeeds(page);
+            return {
+              ok: false,
+              phase: "reserve",
+              message: "room_selection_not_confirmed",
+              booking_url: "",
+              screenshot_base64: screenshotRoomFail,
+              observation: {
+                url: page.url(),
+                before_url: beforeUrl,
+                room_type: req.room_type || "",
+                current_step: stepNeedsRoomFail.current_step,
+                missing_required: stepNeedsRoomFail.missing_required,
+                can_continue: stepNeedsRoomFail.can_continue,
+                payment_required: stepNeedsRoomFail.payment_required,
+                finalized: false,
+              },
+            };
+          }
         }
 
-
-        // Navigate Clock PMS through Tariff step to Checkout step
+        // Navigate Clock PMS through Tariff step to Checkout step (when room was already selected)
         if (roomSelectionSucceeded) {
           const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
           console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
