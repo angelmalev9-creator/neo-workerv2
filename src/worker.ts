@@ -3983,9 +3983,9 @@ class HotSessionManager {
           let cur: Element | null = el;
           for (let d = 0; d < 6 && cur; d++) {
             const tag = cur.tagName.toLowerCase();
-            const par = cur.parentElement;
+            const par: Element | null = cur.parentElement;
             if (!par) break;
-            const siblings = Array.from(par.children).filter((c: Element) => c.tagName === cur!.tagName);
+            const siblings = Array.from(par.children as HTMLCollectionOf<Element>).filter((c: Element) => c.tagName === cur!.tagName);
             parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(cur) + 1})`);
             cur = par;
             if (tag === "form" || tag === "main" || tag === "body") break;
@@ -5820,31 +5820,33 @@ rooms: rooms,
             if (_stepAfterFill.missing_required.length > 0) {
               return {
                 ok: true,
-                success: true,
                 phase: "reserve",
-                stage: "reservation_reserve_needs_input",
                 message: "reserve_current_step_needs_input",
-                needs_input: true,
-                missing_required: _stepAfterFill.missing_required,
                 booking_url: "",
                 screenshot_base64: screenshotAfterRoom,
-                current_step: _stepAfterFill.current_step,
-                can_continue: false,
+                observation: {
+                  stage: "reservation_reserve_needs_input",
+                  needs_input: true,
+                  missing_required: _stepAfterFill.missing_required,
+                  current_step: _stepAfterFill.current_step,
+                  can_continue: false,
+                },
               };
             }
 
             const _finalUrl = page.url();
             return {
               ok: true,
-              success: true,
               phase: "reserve",
-              stage: "reservation_reserve_checkout_filled",
               message: "reserve_checkout_filled",
-              needs_input: false,
-              missing_required: [],
               booking_url: _finalUrl,
-              current_step: "checkout_filled",
-              can_continue: true,
+              observation: {
+                stage: "reservation_reserve_checkout_filled",
+                needs_input: false,
+                missing_required: [],
+                current_step: "checkout_filled",
+                can_continue: true,
+              },
             };
           }
         }
@@ -5906,22 +5908,27 @@ rooms: rooms,
             console.log(`[RESERVATION][STEP3][FALLBACK] After fill: missing=${_stepAfterFill.missing_required.join(" | ") || "none"}`);
             if (_stepAfterFill.missing_required.length > 0) {
               return {
-                ok: true, success: true, phase: "reserve",
-                stage: "reservation_reserve_needs_input",
+                ok: true, phase: "reserve",
                 message: "reserve_current_step_needs_input",
-                needs_input: true,
-                missing_required: _stepAfterFill.missing_required,
                 booking_url: "", screenshot_base64: screenshotAfterRoom,
-                current_step: "reserve", can_continue: false,
+                observation: {
+                  stage: "reservation_reserve_needs_input",
+                  needs_input: true,
+                  missing_required: _stepAfterFill.missing_required,
+                  current_step: "reserve", can_continue: false,
+                },
               };
             }
             const _finalUrl = page.url();
             return {
-              ok: true, success: true, phase: "reserve",
-              stage: "reservation_reserve_checkout_filled",
+              ok: true, phase: "reserve",
               message: "reserve_checkout_filled",
-              needs_input: false, missing_required: [],
-              booking_url: _finalUrl, current_step: "checkout_filled", can_continue: true,
+              booking_url: _finalUrl,
+              observation: {
+                stage: "reservation_reserve_checkout_filled",
+                needs_input: false, missing_required: [],
+                current_step: "checkout_filled", can_continue: true,
+              },
             };
           }
           }
