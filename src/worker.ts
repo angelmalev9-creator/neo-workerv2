@@ -341,44 +341,25 @@ function roomTextMatches(containerTextRaw: string, wantedRoomRaw: string): boole
 }
 
 function isBadClickableLabel(raw: string): boolean {
-
   const s = normLabel(raw || "");
   if (!s) return true;
 
-  return [
-    "lens",
-    "chevron left",
-    "chevron right",
-    "fullscreen",
-    "expand more",
-    "expand less",
-    "close",
-    "menu",
-    "search",
-    "favorite",
-    "share",
-    "prev",
-    "next",
-    "zoom",
-    "галерия",
-    "снимка",
-    "картина",
-    "person",
-    "profile",
-    "profile or sign in",
-    "sign in",
-    "shopping cart",
-    "cart",
-    "event",
-    "grid view",
-    "sell",
-    "arrow back",
-    "arrow drop down",
-    "toggle details",
-    "language",
-    "български",
-    "english",
-  ].some((x) => s === x || s.startsWith(x) || s.includes(x));
+  // Exact match — pure icon-only labels
+  const exactBad = new Set([
+    "lens", "chevron left", "chevron right", "fullscreen", "expand more",
+    "expand less", "close", "menu", "search", "favorite", "share", "prev",
+    "next", "zoom", "галерия", "снимка", "картина", "person", "profile",
+    "sign in", "shopping cart", "cart", "event", "grid view", "sell",
+    "arrow back", "arrow drop down", "toggle details", "language",
+    "български", "english", "profile or sign in",
+  ]);
+  if (exactBad.has(s)) return true;
+
+  // Bad if label ENDS with an icon word (e.g. "покажи повече expand_more" → bad)
+  const badSuffixes = ["expand more", "expand less", "chevron right", "chevron left", "arrow drop down"];
+  if (badSuffixes.some(suf => s.endsWith(suf))) return true;
+
+  return false;
 }
 
 
@@ -4070,6 +4051,42 @@ rooms: rooms,
         console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
         await page.waitForTimeout(800);
 
+        // Early exit: if Clock PMS iframe is already at checkout, skip room selection
+        const _earlyClockFrame = page.frames().find(f => {
+          const n = String(f.name?.() || ""); const u = f.url();
+          return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
+        });
+        if (_earlyClockFrame) {
+          const _earlyFt = (await _earlyClockFrame.locator("body").innerText().catch(() => "")).toLowerCase();
+          if (/data|данни\s*за\s*контакт|собствено\s*име|e-?mail|завършване/i.test(_earlyFt)) {
+            console.log("[RESERVATION][RESERVE] iframe already at checkout — skipping room selection");
+            const _hasGuest = !!String(req.guest_name || "").trim() && !!String(req.guest_email || "").trim();
+            if (!_hasGuest) {
+              const _ss = await this.takeAvailabilityScreenshot(page);
+              const _sn = await this.inferCurrentBookingStepNeeds(page);
+              return {
+                ok: true,
+                phase: "reserve",
+                message: "reserve_current_step_needs_input",
+                booking_url: null as any,
+                screenshot_base64: _ss,
+                observation: {
+                  url: beforeUrl,
+                  before_url: beforeUrl,
+                  room_type: req.room_type || "",
+                  room_selection_attempted: false,
+                  room_selection_succeeded: true,
+                  current_step: _sn.current_step,
+                  missing_required: _sn.missing_required,
+                  can_continue: _sn.can_continue,
+                  payment_required: _sn.payment_required,
+                  finalized: false,
+                },
+              };
+            }
+          }
+        }
+
         // STEP 1: first select the chosen room on the CURRENT booking page / iframe context
         let roomSelectionAttempted = false;
         let roomSelectionSucceeded = false;
@@ -4249,9 +4266,21 @@ rooms: rooms,
                       );
                       await cta.dispatchEvent("click").catch(() => {});
                     });
-                    await page.waitForTimeout(1200);
-
-                    const progressed = await indicatesBookingProgress();
+                    // Wait longer for Clock PMS async view transition, then retry up to 3x
+                    let progressed = false;
+                    for (let _w = 0; _w < 3; _w++) {
+                      await page.waitForTimeout(1200);
+                      progressed = await indicatesBookingProgress();
+                      if (progressed) break;
+                      // Extra: check if iframe text changed since _iframeSnapBefore
+                      try {
+                        const _bf = _findBookingFrame();
+                        if (_bf) {
+                          const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                          if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                        }
+                      } catch {}
+                    }
                     console.log(
                       `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                     );
@@ -4301,9 +4330,19 @@ rooms: rooms,
                     console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j} ${debugLabel}`);
                     await btn.dispatchEvent("click").catch(() => {});
                   });
-                  await page.waitForTimeout(1200);
-
-                  const progressed = await indicatesBookingProgress();
+                  let progressed = false;
+                  for (let _w = 0; _w < 3; _w++) {
+                    await page.waitForTimeout(1200);
+                    progressed = await indicatesBookingProgress();
+                    if (progressed) break;
+                    try {
+                      const _bf = _findBookingFrame();
+                      if (_bf) {
+                        const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                        if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                      }
+                    } catch {}
+                  }
                   console.log(
                     `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                   );
@@ -4344,9 +4383,19 @@ rooms: rooms,
                 console.log(`[RESERVATION][ROOM][DIRECT][DISPATCH] label=${label} sel=${sel}`);
                 await loc.dispatchEvent("click").catch(() => {});
               });
-              await page.waitForTimeout(1200);
-
-              const progressed = await indicatesBookingProgress();
+              let progressed = false;
+              for (let _w = 0; _w < 3; _w++) {
+                await page.waitForTimeout(1200);
+                progressed = await indicatesBookingProgress();
+                if (progressed) break;
+                try {
+                  const _bf = _findBookingFrame();
+                  if (_bf) {
+                    const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                    if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                  }
+                } catch {}
+              }
               console.log(`[RESERVATION][ROOM][DIRECT][RESULT] label=${label} sel=${sel} progressed=${progressed} url="${page.url()}"`);
 
               if (progressed) {
@@ -4470,11 +4519,24 @@ rooms: rooms,
           }
         }
 
-        // Navigate Clock PMS through Tariff step to Checkout step (when room was already selected)
+        // Navigate Clock PMS through Tariff step to Checkout step (only if not already navigated via fallback gate)
         if (roomSelectionSucceeded) {
-          const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
-          console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
-          await page.waitForTimeout(500);
+          const _alreadyAtCheckout = await (async () => {
+            const _bf2 = page.frames().find(f => {
+              const n = String(f.name?.() || ''); const u = f.url();
+              return n.includes('clock') || n.includes('wbe') || u.includes('clock-pms') || u.includes('wbe');
+            });
+            if (!_bf2) return false;
+            const _ft2 = (await _bf2.locator('body').innerText().catch(() => '')).toLowerCase();
+            return /данни\s*за\s*контакт|собствено\s*име|e-?mail|завършване/i.test(_ft2);
+          })();
+          if (!_alreadyAtCheckout) {
+            const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
+            console.log(`[RESERVATION] Clock PMS navigator (2nd call guard): reachedCheckout=${reachedCheckout}`);
+            await page.waitForTimeout(500);
+          } else {
+            console.log('[RESERVATION] Already at checkout — skipping duplicate clockPmsNavigateToCheckout');
+          }
         }
 
         // STEP 2: after room selection, return the REAL missing fields from the current booking step
@@ -4505,12 +4567,58 @@ rooms: rooms,
           };
         }
 
-        // STEP 3: only now try to fill personal data on the CURRENT page/state
+        // STEP 3: fill personal data — prefer Clock PMS checkout iframe, fallback to schema
+        // First attempt: fill directly inside the Clock PMS iframe checkout form
+        const _clockFrame = page.frames().find(f => {
+          const n = String(f.name?.() || ""); const u = f.url();
+          return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
+        });
+        let _iframeCheckoutFilled = false;
+        if (_clockFrame && req.guest_name) {
+          console.log("[RESERVATION][STEP3] Attempting to fill checkout form in Clock PMS iframe");
+          const _checkoutFields: Array<{ sel: string[]; val: string; label: string }> = [
+            { label: "Собствено име",  sel: ["input[placeholder*='Собствено']", "input[name*='first']", "input[name*='given']", "input[id*='first']", "input[placeholder*='First']"], val: String(req.guest_name || "").split(" ")[0] },
+            { label: "Фамилия",        sel: ["input[placeholder*='Фамил']", "input[name*='last']", "input[name*='family']", "input[id*='last']", "input[placeholder*='Last']"], val: String(req.guest_name || "").split(" ").slice(1).join(" ") || String(req.guest_name || "") },
+            { label: "E-mail",         sel: ["input[type='email']", "input[placeholder*='mail']", "input[placeholder*='Mail']", "input[name*='email']", "input[id*='email']"], val: req.guest_email || "" },
+            { label: "Телефон",        sel: ["input[type='tel']", "input[placeholder*='елефон']", "input[placeholder*='Phone']", "input[name*='phone']", "input[name*='tel']", "input[id*='phone']"], val: req.guest_phone || "" },
+          ];
+          let _filledCount = 0;
+          for (const fld of _checkoutFields) {
+            if (!fld.val) continue;
+            for (const sel of fld.sel) {
+              try {
+                const loc = _clockFrame.locator(sel).first();
+                if (await loc.count().catch(() => 0) === 0) continue;
+                if (!(await loc.isVisible().catch(() => false))) continue;
+                await loc.scrollIntoViewIfNeeded().catch(() => {});
+                await loc.click({ timeout: 1500 }).catch(() => {});
+                await loc.fill(fld.val, { timeout: 1500 }).catch(() => {});
+                console.log(`[RESERVATION][STEP3][IFRAME] Filled ${fld.label}: ${fld.val.slice(0,20)}`);
+                _filledCount++;
+                break;
+              } catch {}
+            }
+          }
+          // Accept terms checkbox if present
+          try {
+            const chk = _clockFrame.locator("input[type='checkbox']").first();
+            if (await chk.count().catch(() => 0) > 0 && !(await chk.isChecked().catch(() => false))) {
+              await chk.check({ timeout: 1500 }).catch(() => {});
+              console.log("[RESERVATION][STEP3][IFRAME] Checked terms checkbox");
+            }
+          } catch {}
+          if (_filledCount > 0) {
+            _iframeCheckoutFilled = true;
+            console.log(`[RESERVATION][STEP3][IFRAME] Filled ${_filledCount} fields in Clock PMS checkout`);
+          }
+        }
+
         const formSchema = session.formSchemas.find(
           (s) => s.kind === "form" || s.kind === "wizard"
         );
 
-               if (formSchema) {
+        // Only use schema-based fill if iframe fill did not work
+        if (!_iframeCheckoutFilled && formSchema) {
           if (formSchema.schema.choices?.length) {
             const choiceActions = await this.fillStyledChoiceGroups(
               page,
@@ -4518,6 +4626,12 @@ rooms: rooms,
               guestData
             );
             choiceActions.forEach((a) => console.log(`[RESERVATION][CHOICE][CURRENT] ${a}`));
+          }
+        }
+
+               if (!_iframeCheckoutFilled && formSchema) {
+          if (formSchema.schema.choices?.length) {
+            // Already handled above
           }
 
           const fillResult =
