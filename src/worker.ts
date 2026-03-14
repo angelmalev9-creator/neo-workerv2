@@ -329,7 +329,19 @@ async function getClickableDebugLabel(loc: any): Promise<string> {
   }
 }
 
+function roomTextMatches(containerTextRaw: string, wantedRoomRaw: string): boolean {
+  const text = normLabel(containerTextRaw || "");
+  const wanted = normLabel(wantedRoomRaw || "");
+  if (!text || !wanted) return false;
+
+  const exactPhrase = new RegExp(`(^|\\s)${wanted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`, "i");
+  if (exactPhrase.test(text)) return true;
+
+  return false;
+}
+
 function isBadClickableLabel(raw: string): boolean {
+
   const s = normLabel(raw || "");
   if (!s) return true;
 
@@ -351,8 +363,24 @@ function isBadClickableLabel(raw: string): boolean {
     "галерия",
     "снимка",
     "картина",
+    "person",
+    "profile",
+    "profile or sign in",
+    "sign in",
+    "shopping cart",
+    "cart",
+    "event",
+    "grid view",
+    "sell",
+    "arrow back",
+    "arrow drop down",
+    "toggle details",
+    "language",
+    "български",
+    "english",
   ].some((x) => s === x || s.startsWith(x) || s.includes(x));
 }
+
 
 
 // ───────────────────────────────────────────────────────────────
@@ -2187,8 +2215,10 @@ class HotSessionManager {
       const currentUrl = page.url().toLowerCase();
 
       const paymentRequired =
-        /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
+        /cvv|cvc|expiry|exp date|expiration|card number|credit card number|name on card|stripe/i.test(bodyText) ||
+        /номер на карта|валидна до|име на карта|cvv|cvc/i.test(bodyText) ||
         /payment|checkout|stripe|pay/.test(currentUrl);
+
 
       const out: string[] = [];
       const seen = new Set<string>();
@@ -3958,18 +3988,37 @@ rooms: rooms,
               return false;
             }
 
-            return (
-              afterUrl !== beforeUrl ||
+            const hasRealContactStep =
               pageText.includes("име") ||
               pageText.includes("email") ||
               pageText.includes("имейл") ||
               pageText.includes("телефон") ||
-              pageText.includes("card") ||
-              pageText.includes("плащ") ||
-              pageText.includes("резервац") ||
-              (Array.isArray((stepNeeds as any)?.missing_required) && (stepNeeds as any).missing_required.length > 0) ||
-              !!(stepNeeds as any)?.payment_required
+              pageText.includes("first name") ||
+              pageText.includes("last name") ||
+              pageText.includes("guest name");
+
+            const hasRealMissingFields =
+              Array.isArray((stepNeeds as any)?.missing_required) &&
+              (stepNeeds as any).missing_required.length > 0;
+
+            const hasRealPaymentStep =
+              (stepNeeds as any)?.payment_required === true &&
+              (
+                pageText.includes("cvv") ||
+                pageText.includes("cvc") ||
+                pageText.includes("expiry") ||
+                pageText.includes("card number") ||
+                pageText.includes("номер на карта") ||
+                pageText.includes("валидна до")
+              );
+
+            return (
+              afterUrl !== beforeUrl ||
+              hasRealContactStep ||
+              hasRealMissingFields ||
+              hasRealPaymentStep
             );
+
           };
 
           const clickRoomInContext = async (ctx: any, label: string) => {
@@ -3995,9 +4044,10 @@ rooms: rooms,
               `[class*="room"]:has-text("${req.room_type}")`,
               `[class*="rate"]:has-text("${req.room_type}")`,
               `[class*="card"]:has-text("${req.room_type}")`,
+              `[class*="item"]:has-text("${req.room_type}")`,
               `li:has-text("${req.room_type}")`,
-              `div:has-text("${req.room_type}")`,
             ];
+
 
             for (const containerSel of containerSelectors) {
               const containers = ctx.locator(containerSel);
@@ -4011,7 +4061,8 @@ rooms: rooms,
                   `[RESERVATION][ROOM][SCAN] label=${label} containerSel=${containerSel} idx=${i} text="${rawText.slice(0, 300).replace(/\s+/g, " ")}"`
                 );
 
-                if (!text || !text.includes(normRoom)) continue;
+                if (!text || !roomTextMatches(rawText, String(req.room_type || ""))) continue;
+
 
                 console.log(
                   `[RESERVATION][ROOM][MATCH] label=${label} containerSel=${containerSel} idx=${i} matched_room="${req.room_type}"`
@@ -4169,7 +4220,23 @@ rooms: rooms,
           };
 
           const frames = page.frames().filter((f) => f !== page.mainFrame());
-          for (const frame of frames) {
+
+          const bookingFrames = frames.filter((frame) => {
+            const frameUrl = String(frame.url() || "").toLowerCase();
+            const frameName = String((frame as any).name?.() || "").toLowerCase();
+            const hay = `${frameUrl} ${frameName}`;
+            return (
+              hay.includes("book") ||
+              hay.includes("reserv") ||
+              hay.includes("clock-pms") ||
+              hay.includes("wbe") ||
+              hay.includes("hotel") ||
+              hay.includes("checkout") ||
+              hay.includes("availability")
+            );
+          });
+
+          for (const frame of bookingFrames) {
             const frameUrl = String(frame.url() || "");
             const frameName = String((frame as any).name?.() || "");
             const label = `frame(${frameName || frameUrl || "unknown"})`;
@@ -4179,9 +4246,35 @@ rooms: rooms,
             }
           }
 
-          if (!roomSelectionSucceeded) {
-            roomSelectionSucceeded = await clickRoomInContext(page as any, "page");
+          if (!roomSelectionSucceeded && bookingFrames.length === 0) {
+            const bookingLikeContainers = [
+              'form',
+              '[class*="booking"]',
+              '[class*="reservation"]',
+              '[class*="widget"]',
+              '[id*="booking"]',
+              '[id*="reservation"]',
+            ];
+
+            for (const rootSel of bookingLikeContainers) {
+              const root = page.locator(rootSel).first();
+              const count = await page.locator(rootSel).count().catch(() => 0);
+              if (!count) continue;
+              const visible = await root.isVisible().catch(() => false);
+              if (!visible) continue;
+
+              const scopedCtx = {
+                locator: (sel: string) => root.locator(sel),
+              } as any;
+
+              if (await clickRoomInContext(scopedCtx, `page-root(${rootSel})`)) {
+                roomSelectionSucceeded = true;
+                break;
+              }
+            }
           }
+
+
 
           if (!roomSelectionSucceeded) {
             console.log("[RESERVATION][ROOM] safe room click not confirmed inside booking context");
