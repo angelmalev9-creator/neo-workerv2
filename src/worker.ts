@@ -2118,17 +2118,28 @@ class HotSessionManager {
     payment_required: boolean;
     can_continue: boolean;
   }> {
-    try {
-      const unfilled = await this.countUnfilledVisibleFields(page);
-      const scanned = await this.scanWizardStep(page).catch(() => ({
+ try {
+      // Prefer booking iframe for scanning — avoids false positives from main page nav/buttons
+      const _scanBf = page.frames().find(f => {
+        const n = String((f as any).name?.() || f.name?.() || "");
+        const u = f.url();
+        return n.includes("clock") || n.includes("wbe") || n.includes("booking") ||
+               u.includes("clock-pms") || u.includes("wbe") || u.includes("booking-engine");
+      });
+      const _scanCtx = (_scanBf as any) as Page;
+      const _useFrame = !!_scanBf;
+
+      const unfilled = await this.countUnfilledVisibleFields(_useFrame ? _scanCtx : page);
+      const scanned = await this.scanWizardStep(_useFrame ? _scanCtx : page).catch(() => ({
         fields: [],
         choices: [],
         choiceGroups: [],
       }));
 
-      const bodyText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const bodyText = _useFrame
+        ? (await _scanBf!.locator("body").innerText().catch(() => "")).toLowerCase()
+        : (await page.locator("body").innerText().catch(() => "")).toLowerCase();
       const currentUrl = page.url().toLowerCase();
-
       const paymentRequired =
         /card|credit card|cvv|expiry|payment|pay now|checkout|stripe|плащ|плащане|карта/.test(bodyText) ||
         /payment|checkout|stripe|pay/.test(currentUrl);
@@ -2795,11 +2806,12 @@ class HotSessionManager {
       // ── 5. Wait for results to load ────────────────────────────
       await this.waitForAvailabilityResults(page);
 
-      // ── 6. Take full-page screenshot ───────────────────────────
+// ── 6. Extract rooms from iframe DOM (free) + screenshot fallback ──
+      const domRooms = await this.extractIframeRooms(page);
       const screenshotBase64 = await this.takeAvailabilityScreenshot(page);
 
       const timing = Date.now() - t0;
-      console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars`);
+      console.log(`[AVAIL] Done in ${timing}ms, screenshot=${screenshotBase64.length} chars dom_rooms=${domRooms.length}`);
 
       return {
         ok: true,
@@ -2811,6 +2823,7 @@ class HotSessionManager {
           guests,
           rooms,
           screenshot_base64: screenshotBase64,
+          dom_rooms: domRooms,   // ← НЕО може да ползва това вместо Vision
           url: page.url(),
           timing_ms: timing,
           fill_result: filled,
@@ -3690,6 +3703,165 @@ class HotSessionManager {
   // Phase "reserve": fills guest details, stops before payment, returns URL
   // ─────────────────────────────────────────────────────────
 
+  // ─────────────────────────────────────────────────────────
+  // clockPmsNavigateToCheckout — handles steps AFTER room card selection:
+  //   Тарифи step → set adults → click ИЗБЕРИ → Завършване step
+  // Returns true if reached checkout/contact-data form
+  // ─────────────────────────────────────────────────────────
+  private async clockPmsNavigateToCheckout(page: Page, guests: string): Promise<boolean> {
+    const bf = page.frames().find(f => {
+      const n = String((f as any).name?.() || f.name?.() || "");
+      return n.includes("clock") || n.includes("wbe") || f.url().includes("clock-pms");
+    });
+    if (!bf) {
+      console.log("[CLOCK_PMS] No booking iframe found");
+      return false;
+    }
+
+    const guestNum = parseInt(guests || "2") || 2;
+    console.log(`[CLOCK_PMS] Starting tariff/checkout navigator guests=${guestNum}`);
+
+    for (let step = 0; step < 6; step++) {
+      await page.waitForTimeout(800);
+      const frameText = (await bf.locator("body").innerText().catch(() => "")).toLowerCase();
+
+      // ── Тарифи step: select adults, click ИЗБЕРИ ──────────
+      const onTariffStep = /тариф|standard.?rate|bb|rate|plan|нощувка.?с/.test(frameText) &&
+        !/данни\s*за\s*контакт|contact|завършване\s*\n|checkout/.test(frameText);
+
+      if (onTariffStep) {
+        console.log("[CLOCK_PMS] On tariff step — setting adults and clicking ИЗБЕРИ");
+
+        // Set adults dropdown
+        try {
+          const adultsLoc = bf.locator('select, [class*="select"], [class*="dropdown"]').filter({ hasText: /възрастни|adult/i }).first();
+          if (await adultsLoc.count().catch(() => 0) > 0) {
+            const tag = await adultsLoc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
+            if (tag === "select") {
+              await adultsLoc.selectOption(String(guestNum)).catch(() => {});
+            } else {
+              await adultsLoc.click().catch(() => {});
+              await page.waitForTimeout(300);
+              const optionLoc = bf.locator(`[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}")`).first();
+              if (await optionLoc.isVisible().catch(() => false)) {
+                await optionLoc.click().catch(() => {});
+              }
+            }
+            console.log(`[CLOCK_PMS] Set adults=${guestNum}`);
+            await page.waitForTimeout(400);
+          }
+        } catch (e) {
+          console.log("[CLOCK_PMS] Adults set failed:", e);
+        }
+
+        // Click ИЗБЕРИ / SELECT on tariff card
+        const chooseBtns = await bf.locator('button, [role="button"]').all().catch(() => []);
+        for (const btn of chooseBtns) {
+          const t = (await btn.innerText().catch(() => "")).trim().toLowerCase();
+          if (/избери|select|book|reserv|добав|add|продълж|continue|next/i.test(t) && t.length <= 30) {
+            const visible = await btn.isVisible().catch(() => false);
+            if (!visible) continue;
+            await btn.scrollIntoViewIfNeeded().catch(() => {});
+            await btn.click({ timeout: 2000 }).catch(() => {});
+            console.log(`[CLOCK_PMS] Clicked tariff CTA: "${t}"`);
+            break;
+          }
+        }
+        continue;
+      }
+
+      // ── Завършване / checkout step ─────────────────────────
+      const onCheckout = /данни\s*за\s*контакт|contact|собствено\s*име|first.?name|email|завършване/i.test(frameText);
+      if (onCheckout) {
+        console.log("[CLOCK_PMS] Reached checkout/contact-data step ✓");
+        return true;
+      }
+
+      // ── Login prompt — skip, proceed as guest ─────────────
+      const onLogin = /вход\s*с|login|sign.?in|регистр|google|имейл.*влез/i.test(frameText) &&
+        /резервирам\s*за\s*някой\s*друг|book\s*for\s*someone/i.test(frameText);
+      if (onLogin) {
+        console.log("[CLOCK_PMS] Login prompt — enabling guest booking toggle");
+        try {
+          const toggleLoc = bf.locator('[type="checkbox"], [role="checkbox"], [class*="toggle"], [class*="switch"]')
+            .filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for\s*someone/i }).first();
+          if (await toggleLoc.count().catch(() => 0) > 0) {
+            await toggleLoc.click().catch(() => {});
+            console.log("[CLOCK_PMS] Guest toggle clicked");
+          } else {
+            // Try clicking parent label
+            const lblLoc = bf.locator('label').filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for/i }).first();
+            if (await lblLoc.isVisible().catch(() => false)) {
+              await lblLoc.click().catch(() => {});
+            }
+          }
+          await page.waitForTimeout(600);
+        } catch {}
+        continue;
+      }
+
+      // If we're on a step we don't recognise, try to find a forward button
+      const fwdBtns = await bf.locator('button, [role="button"]').all().catch(() => []);
+      let clicked = false;
+      for (const btn of fwdBtns) {
+        const t = (await btn.innerText().catch(() => "")).trim();
+        if (/продълж|напред|next|continue|forward/i.test(t) && t.length <= 30) {
+          if (await btn.isVisible().catch(() => false)) {
+            await btn.click({ timeout: 1500 }).catch(() => {});
+            console.log(`[CLOCK_PMS] Forwarded with: "${t}"`);
+            clicked = true;
+            break;
+          }
+        }
+      }
+      if (!clicked) break;
+    }
+
+    return false;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // extractIframeRooms — reads available rooms/prices from booking iframe DOM
+  // Returns structured data — avoids Vision API for availability
+  // ─────────────────────────────────────────────────────────
+  private async extractIframeRooms(page: Page): Promise<Array<{ name: string; price: string; available: boolean; currency: string }>> {
+    const bf = page.frames().find(f => {
+      const n = String((f as any).name?.() || f.name?.() || "");
+      return n.includes("clock") || n.includes("wbe") || f.url().includes("clock-pms");
+    });
+    if (!bf) return [];
+
+    try {
+      return await (bf as any).evaluate(() => {
+        const cards = Array.from(document.querySelectorAll('[class*="card"], article, [class*="room-item"], [class*="room_item"]'))
+          .filter((el: any) => el.offsetHeight > 0 && el.offsetParent !== null);
+
+        return cards.map((card: any) => {
+          const nameEl = card.querySelector('h1, h2, h3, h4, [class*="title"], [class*="name"], strong') as any;
+          const priceEl = card.querySelector('[class*="price"], [class*="rate"], [class*="amount"], [class*="cost"]') as any;
+          const unavailEl = card.querySelector('[class*="unavailable"], [class*="sold"], [class*="not-available"], [class*="na-"]') as any;
+          const unavailText = unavailEl ? (unavailEl.textContent || "") : "";
+          const pageUnavail = (card.textContent || "").includes("Не е налично") ||
+                              (card.textContent || "").includes("Not available") ||
+                              (card.textContent || "").includes("Unavailable");
+
+          const priceText = priceEl ? priceEl.textContent?.trim() : "";
+          const currency = /bgn|лв/i.test(priceText || "") ? "BGN" : /eur|€/.test(priceText || "") ? "EUR" : "BGN";
+
+          return {
+            name: nameEl ? nameEl.textContent?.trim() : "",
+            price: priceText || "",
+            available: !unavailEl && !pageUnavail && !!unavailText === false,
+            currency,
+          };
+        }).filter((r: any) => r.name && r.name.length > 1);
+      });
+    } catch (e) {
+      console.log("[EXTRACT_ROOMS] Failed:", e);
+      return [];
+    }
+  }
+
   async makeReservation(req: MakeReservationRequest): Promise<{
     ok: boolean;
     phase: string;
@@ -3897,15 +4069,21 @@ rooms: rooms,
             return /\/room\//.test(lower) || /\/accommodation\//.test(lower) === false;
           };
 
+          // Capture booking iframe snapshot BEFORE any clicks — used for change detection
+          const _findBookingFrame = () => page.frames().find(f => {
+            const n = String((f as any).name?.() || f.name?.() || "");
+            const u = f.url();
+            return n.includes("clock") || n.includes("wbe") || n.includes("booking") ||
+                   u.includes("clock-pms") || u.includes("wbe") || u.includes("booking-engine");
+          });
+          let _iframeSnapBefore = "";
+          const _bf0 = _findBookingFrame();
+          if (_bf0) {
+            _iframeSnapBefore = (await _bf0.locator("body").innerText().catch(() => "")).slice(0, 1000);
+          }
+
           const indicatesBookingProgress = async () => {
             const afterUrl = page.url();
-            const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-            const stepNeeds = await this.inferCurrentBookingStepNeeds(page).catch(() => ({
-              current_step: "",
-              missing_required: [],
-              can_continue: true,
-              payment_required: false,
-            }));
 
             if (isBadRoomNavigation(beforeUrl, afterUrl)) {
               console.log(`[RESERVATION][ROOM] ignored navigation outside booking flow: ${afterUrl}`);
@@ -3914,32 +4092,48 @@ rooms: rooms,
               return false;
             }
 
-            return (
-              afterUrl !== beforeUrl ||
-              pageText.includes("име") ||
-              pageText.includes("email") ||
-              pageText.includes("имейл") ||
-              pageText.includes("телефон") ||
-              pageText.includes("card") ||
-              pageText.includes("плащ") ||
-              pageText.includes("резервац") ||
-              (Array.isArray((stepNeeds as any)?.missing_required) && (stepNeeds as any).missing_required.length > 0) ||
-              !!(stepNeeds as any)?.payment_required
-            );
+            if (afterUrl !== beforeUrl) return true;
+
+            // Primary check: did the booking iframe content change?
+            const bf = _findBookingFrame();
+            if (bf) {
+              try {
+                const newSnap = (await bf.locator("body").innerText().catch(() => "")).slice(0, 1000);
+                if (newSnap && newSnap !== _iframeSnapBefore && newSnap.length > 50) {
+                  console.log(`[RESERVATION][ROOM] iframe content changed — booking progressed`);
+                  return true;
+                }
+              } catch {}
+            }
+
+            // Fallback: booking form input fields appeared on page (outside iframe)
+            const formVisible = await page.locator(
+              'input[type="email"], input[name*="email"], input[name*="phone"], input[name*="tel"]'
+            ).first().isVisible().catch(() => false);
+            return formVisible;
           };
 
           const clickRoomInContext = async (ctx: any, label: string) => {
+// Universal CTA scoring — widget/language/vendor agnostic
+            const _CTA_POS = /резервир|тариф|покажи|виж\s*цен|избери|продълж|напред|потвърди|завърши|добави|book(?!mark)|reserv|select(?!\s*all)|continu|confirm|next\b|show.?rate|view.?rate|choose|checkout|check[\s-]?out|submit|proceed|available|цена|наличн|add.?cart|добав/i;
+            const _CTA_NEG = /^(back|prev|назад|cancel|отказ|close|затвори|reject|skip|decline|no\b|не\b|later|по-късно)$/i;
+            const _ICON_WORD = /^[a-z]+(_[a-z]+)+$/; // snake_case = Material Icon
+            const scoreCtaButton = (text: string, aria = ""): number => {
+              const raw = text.trim();
+              if (!raw) return -1;
+              // Material Icons: single snake_case word, no spaces, ≤25 chars
+              if (_ICON_WORD.test(raw.replace(/\s/g, "_")) && !/ /.test(raw) && raw.length <= 25) return -1;
+              // Very short non-digit string is likely an icon glyph
+              if (raw.length <= 2 && !/\d/.test(raw)) return -1;
+              // Explicitly navigation/destructive
+              if (_CTA_NEG.test(raw)) return -1;
+              const hay = (raw + " " + aria).toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+              if (_CTA_POS.test(hay)) return 100;
+              // Generic button with meaningful text (4-50 chars)
+              if (raw.length >= 4 && raw.length <= 50) return 20;
+              return 5;
+            };
             const ctaSelectors = [
-              `button:has-text("Резервирай")`,
-              `button:has-text("Избери")`,
-              `button:has-text("Book")`,
-              `button:has-text("Reserve")`,
-              `button:has-text("Select")`,
-              `[role="button"]:has-text("Резервирай")`,
-              `[role="button"]:has-text("Избери")`,
-              `[role="button"]:has-text("Book")`,
-              `[role="button"]:has-text("Reserve")`,
-              `[role="button"]:has-text("Select")`,
               `input[type="submit"]`,
               `input[type="button"]`,
               `button`,
@@ -3974,49 +4168,50 @@ rooms: rooms,
                 );
 
 
+// Collect all buttons, score universally, try best first
+                type _CtaCand = { loc: any; sel: string; score: number; text: string };
+                const _cands: _CtaCand[] = [];
                 for (const ctaSel of ctaSelectors) {
-                  const ctas = container.locator(ctaSel);
-                  const ctaCount = Math.min(await ctas.count().catch(() => 0), 3);
-                  for (let j = 0; j < ctaCount; j++) {
-                    const cta = ctas.nth(j);
-                    const tag = await cta.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
-                    const ctaText = String(await cta.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-                    if (tag === "a") {
-                      console.log(
-                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=anchor text="${ctaText}"`
-                      );
-                      continue;
+                  try {
+                    const locs = container.locator(ctaSel);
+                    const cnt = Math.min(await locs.count().catch(() => 0), 8);
+                    for (let j = 0; j < cnt; j++) {
+                      const loc = locs.nth(j);
+                      if (!(await loc.isVisible().catch(() => false))) continue;
+                      const _tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                      if (_tag === "a") continue;
+                      const ctaText = String(await loc.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+                      const ariaLabel = String(await loc.getAttribute("aria-label").catch(() => "") || "");
+                      const score = scoreCtaButton(ctaText, ariaLabel);
+                      // Deduplicate by text+score
+                      if (!_cands.some(c => c.text === ctaText && c.score === score)) {
+                        _cands.push({ loc, sel: ctaSel, score, text: ctaText });
+                      }
                     }
-                    if (!(await cta.isVisible().catch(() => false))) {
-                      console.log(
-                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=hidden text="${ctaText}"`
-                      );
-                      continue;
-                    }
+                  } catch {}
+                }
+                _cands.sort((a, b) => b.score - a.score);
 
-                    console.log(
-                      `[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} tag=${tag} text="${ctaText}"`
-                    );
+                for (const { loc: cta, sel: ctaSel, score, text: ctaText } of _cands) {
+                  if (score < 0) {
+                    console.log(`[RESERVATION][ROOM][CTA][SKIP] label=${label} ctaSel=${ctaSel} reason=icon score=${score} text="${ctaText}"`);
+                    continue;
+                  }
+                  console.log(`[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} score=${score} text="${ctaText}"`);
 
-                    await cta.scrollIntoViewIfNeeded().catch(() => {});
-                    await cta.click({ timeout: 1800 }).catch(async () => {
-                      console.log(
-                        `[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j}`
-                      );
-                      await cta.dispatchEvent("click").catch(() => {});
-                    });
-                    await page.waitForTimeout(1200);
+                  await cta.scrollIntoViewIfNeeded().catch(() => {});
+                  await cta.click({ timeout: 1800 }).catch(async () => {
+                    console.log(`[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} ctaSel=${ctaSel}`);
+                    await cta.dispatchEvent("click").catch(() => {});
+                  });
+                  await page.waitForTimeout(1200);
 
-                    const progressed = await indicatesBookingProgress();
-                    console.log(
-                      `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}"`
-                    );
+                  const progressed = await indicatesBookingProgress();
+                  console.log(`[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} score=${score} progressed=${progressed} url="${page.url()}"`);
 
-                    if (progressed) {
-                      console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel}`);
-                      return true;
-                    }
-
+                  if (progressed) {
+                    console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel} text="${ctaText}"`);
+                    return true;
                   }
                 }
 
@@ -4151,19 +4346,29 @@ rooms: rooms,
         }
 
 
-        // STEP 2: after room selection, return the REAL missing fields from the current booking step
+// STEP 2: after room selection, navigate Clock PMS to checkout step if possible
+        if (roomSelectionSucceeded) {
+          console.log("[RESERVATION] Room selected — running Clock PMS step navigator");
+          const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
+          console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
+          await page.waitForTimeout(600);
+        }
+
         const hasGuestIdentity =
           !!String(req.guest_name || "").trim() &&
           !!String(req.guest_email || "").trim() &&
           !!String(req.guest_phone || "").trim();
 
         if (req.room_type && !hasGuestIdentity) {
+          // Re-read step needs after clock pms navigation
+          const stepNeedsNow = await this.inferCurrentBookingStepNeeds(page);
+          const ssNow = await this.takeAvailabilityScreenshot(page);
           return {
             ok: true,
             phase: "reserve",
             message: "reserve_current_step_needs_input",
-            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
-            screenshot_base64: screenshotAfterRoom,
+            booking_url: stepNeedsNow.payment_required ? page.url() : "",
+            screenshot_base64: ssNow,
             observation: {
               url: currentUrlAfterRoom,
               before_url: beforeUrl,
