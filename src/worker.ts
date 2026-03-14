@@ -3831,7 +3831,7 @@ class HotSessionManager {
           }
         } catch {}
       }
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(300);
     }
     // Fallback: return any non-analytics frame even if empty
     const fb = this.findBookingFrame(page);
@@ -3886,7 +3886,7 @@ class HotSessionManager {
   // ─────────────────────────────────────────────────────────
   private async navigateBookingWidgetToCheckout(page: Page, guests: string): Promise<boolean> {
     // Use async frame finder — waits up to 8s for a frame with actual content
-    const bf = await this.findBookingFrameWithContent(page, 8000);
+    const bf = await this.findBookingFrameWithContent(page, 4000);
     if (!bf) {
       if (await this.isAtCheckoutStep(page)) return true;
       console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
@@ -3899,17 +3899,17 @@ class HotSessionManager {
     let _sameTextCount = 0;
 
     for (let step = 0; step < 14; step++) {
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(500);
       // Re-find frame each step in case it changed (e.g. new iframe opened)
       if (bf) {
-        const freshFrame = await this.findBookingFrameWithContent(page, 1500);
+        const freshFrame = await this.findBookingFrameWithContent(page, 800);
         if (freshFrame) ctx = freshFrame;
       }
       const frameText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
       console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 120).replace(/\s+/g, " ")}"`);
       if (frameText.trim().length < 20) {
         console.log("[BOOKING_NAV] iframe content empty — waiting");
-        await page.waitForTimeout(1500); continue;
+        await page.waitForTimeout(800); continue;
       }
 
       // ── Infinite loop detection ──────────────────────────
@@ -4157,11 +4157,11 @@ class HotSessionManager {
         }
 
         // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1200);
 
         // Check main page for Clock PMS checkout overlay
         for (let _od = 0; _od < 5; _od++) {
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(400);
 
           // Did checkout form appear? (on main page)
           if (await this.isAtCheckoutStep(page)) {
@@ -4210,8 +4210,8 @@ class HotSessionManager {
             if (_toggled) {
               _sameTextCount = 0; _prevFrameText = "";
               // Wait up to 4s for checkout to appear
-              for (let _cw2 = 0; _cw2 < 6; _cw2++) {
-                await page.waitForTimeout(700);
+              for (let _cw2 = 0; _cw2 < 5; _cw2++) {
+                await page.waitForTimeout(500);
                 if (await this.isAtCheckoutStep(page)) {
                   console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
                   return true;
@@ -4515,11 +4515,11 @@ rooms: rooms,
 
         const beforeUrl = page.url();
         console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(400);
 
         // Early exit: if Clock PMS iframe is already at checkout, skip ALL room selection
         // Wait briefly for iframe content before checking checkout state
-        const _earlyBookingFrame = await this.findBookingFrameWithContent(page, 3000);
+        const _earlyBookingFrame = await this.findBookingFrameWithContent(page, 2000);
         let _alreadyAtCheckoutEarly = false;
         if (_earlyBookingFrame) {
           if (await this.isAtCheckoutStep(_earlyBookingFrame)) {
@@ -4783,8 +4783,8 @@ rooms: rooms,
                     });
                     // Wait longer for Clock PMS async view transition, then retry up to 4x
                     let progressed = false;
-                    for (let _w = 0; _w < 4; _w++) {
-                      await page.waitForTimeout(1400);
+                    for (let _w = 0; _w < 3; _w++) {
+                      await page.waitForTimeout(1000);
                       progressed = await indicatesBookingProgress();
                       if (progressed) break;
                       // Extra: check if iframe text changed since _iframeSnapBefore
@@ -4850,7 +4850,7 @@ rooms: rooms,
                   });
                   let progressed = false;
                   for (let _w = 0; _w < 3; _w++) {
-                    await page.waitForTimeout(1200);
+                    await page.waitForTimeout(900);
                     progressed = await indicatesBookingProgress();
                     if (progressed) break;
                     try {
