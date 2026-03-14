@@ -3874,6 +3874,9 @@ class HotSessionManager {
     const guestNum = parseInt(guests || "2") || 2;
     console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
 
+    let _prevFrameText = "";
+    let _sameTextCount = 0;
+
     for (let step = 0; step < 14; step++) {
       await page.waitForTimeout(700);
       // Re-find frame each step in case it changed (e.g. new iframe opened)
@@ -3887,6 +3890,52 @@ class HotSessionManager {
         console.log("[BOOKING_NAV] iframe content empty — waiting");
         await page.waitForTimeout(1500); continue;
       }
+
+      // ── Infinite loop detection ──────────────────────────
+      if (frameText === _prevFrameText) {
+        _sameTextCount++;
+        if (_sameTextCount >= 2) {
+          console.log(`[BOOKING_NAV] Frame text unchanged for ${_sameTextCount} steps — trying modal/overlay detection`);
+          // Check for modal overlay on main page (login, confirmation, etc.)
+          const modalVisible = await page.locator(
+            '[class*="modal"], [class*="overlay"], [class*="dialog"], [role="dialog"], ' +
+            '[class*="popup"], .q-dialog, .q-overlay'
+          ).first().isVisible().catch(() => false);
+          if (modalVisible) {
+            console.log("[BOOKING_NAV] Modal/overlay detected on main page — handling");
+            // Try clicking through login/auth modals
+            const modalCtx = page;
+            const guestToggle = modalCtx.locator("label").filter({ hasText: /резервирам за някой|book for|guest|без регистрация/i }).first();
+            if (await guestToggle.isVisible().catch(() => false)) {
+              await guestToggle.click().catch(() => {});
+              console.log("[BOOKING_NAV] Clicked guest toggle in modal");
+              _sameTextCount = 0; await page.waitForTimeout(600); continue;
+            }
+            // Try any forward button in modal
+            const modalFwd = modalCtx.locator('[class*="modal"] button, [class*="dialog"] button, .q-dialog button').first();
+            if (await modalFwd.isVisible().catch(() => false)) {
+              const mt = (await modalFwd.innerText().catch(() => "")).trim();
+              if (!isBadClickableLabel(mt)) {
+                await modalFwd.click({ timeout: 1500 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked modal button: "${mt}"`);
+                _sameTextCount = 0; await page.waitForTimeout(600); continue;
+              }
+            }
+          }
+          // Also check if we're at checkout in the iframe itself (maybe it changed but re-check)
+          if (await this.isAtCheckoutStep(ctx)) {
+            console.log("[BOOKING_NAV] Reached checkout step (detected after same-text loop) ✓"); return true;
+          }
+          if (_sameTextCount >= 3) {
+            console.log("[BOOKING_NAV] Stuck — same frame text 3+ times, stopping");
+            break;
+          }
+          continue;
+        }
+      } else {
+        _sameTextCount = 0;
+      }
+      _prevFrameText = frameText;
 
       // ── Already at checkout ──────────────────────────────
       if (await this.isAtCheckoutStep(ctx)) {
@@ -3951,10 +4000,15 @@ class HotSessionManager {
       }
 
       // ── Tariff/rate selection step ───────────────────────
-      // isTariffStep: iframe shows tariff/rate details (after clicking ПОКАЖИ ТАРИФИТЕ or similar)
-      const isTariffStep = hasTariffContent || /standard.?rate|нощувка\s*с|meal\s*plan|rate\s*name/i.test(frameText);
+      // isTariffStep: iframe shows ACTUAL tariff card content (not just nav tab "sell тарифи")
+      // We require: price pattern OR rate plan name OR visible ИЗБЕРИ button
+      const hasIzberiBtn = await ctx.locator(
+        'button:has-text("ИЗБЕРИ"), button:has-text("Избери"), [role="button"]:has-text("ИЗБЕРИ")'
+      ).count().catch(() => 0) > 0;
+      const isTariffStep = hasTariffContent || hasIzberiBtn ||
+        /standard.?rate|нощувка\s*с\s*закуска|meal\s*plan|rate\s*name|bb\s*plan|закуска\s*включ/i.test(frameText);
       if (isTariffStep) {
-        console.log("[BOOKING_NAV] On tariff/rate step — setting guests and clicking select");
+        console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent} — setting guests and clicking select`);
         // Set guest count — try select, then custom dropdown, then stepper buttons
         try {
           const sel = ctx.locator("select").first();
@@ -3995,7 +4049,15 @@ class HotSessionManager {
             }
           }
         }
-        await page.waitForTimeout(900); continue;
+        // After clicking ИЗБЕРИ, wait longer for Clock PMS to process
+        await page.waitForTimeout(1500);
+        // Immediately check for login/auth step appearing
+        const postClickText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
+        if (/вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account|резервирам за някой/i.test(postClickText)) {
+          console.log("[BOOKING_NAV] Login prompt appeared after ИЗБЕРИ click");
+          _sameTextCount = 0; _prevFrameText = "";
+        }
+        continue;
       }
 
       // ── Login/auth prompt ────────────────────────────────
