@@ -3824,14 +3824,37 @@ class HotSessionManager {
   private async isAtCheckoutStep(frameOrPage: any): Promise<boolean> {
     try {
       const text = (await frameOrPage.locator("body").innerText().catch(() => "")).toLowerCase();
-      return (
-        // Contact/guest data form
-        /данни\s*за\s*контакт|собствено\s*име|first.?name|e-?mail|завършване/i.test(text) ||
-        // Common checkout form fields
-        /checkout|your details|guest details|personal details|contact details/i.test(text) ||
-        // Has email+name inputs visible
-        false
+
+      // IMPORTANT: Clock PMS shows "Завършване" tab on EVERY step — do NOT match it alone.
+      // We require STRONG signals: actual input fields for guest data present.
+
+      // 1. Strong text signal: guest data section heading (NOT just nav tab)
+      const hasStrongText = (
+        /данни\s*за\s*контакт/i.test(text) ||          // БГ section heading
+        /guest\s*details|your\s*details|personal\s*details|contact\s*details/i.test(text) ||
+        /собствено\s*име.*фамил/i.test(text) ||         // both first+last name labels together
+        /first.?name.*last.?name/i.test(text)
       );
+      if (hasStrongText) return true;
+
+      // 2. Actual input fields present for guest data (most reliable)
+      const hasEmailInput = await frameOrPage.locator(
+        "input[type='email'], input[placeholder*='mail'], input[placeholder*='Mail'], input[name*='email'], input[id*='email']"
+      ).count().catch(() => 0) > 0;
+
+      const hasNameInput = await frameOrPage.locator(
+        "input[placeholder*='Собствено'], input[placeholder*='Фамил'], input[placeholder*='First'], input[placeholder*='Last'], input[name*='first'], input[name*='last'], input[id*='first'], input[id*='last']"
+      ).count().catch(() => 0) > 0;
+
+      if (hasEmailInput && hasNameInput) return true;
+      if (hasEmailInput) {
+        // email input alone is a strong signal IF we also have the step indicator active
+        const isOnLastStep = /завършване.*active|active.*завършване/i.test(text) ||
+          await frameOrPage.locator('[class*="active"]:has-text("Завършване"), [class*="current"]:has-text("Завършване")').count().catch(() => 0) > 0;
+        if (isOnLastStep) return true;
+      }
+
+      return false;
     } catch { return false; }
   }
 
@@ -4233,8 +4256,7 @@ rooms: rooms,
         const _earlyBookingFrame = await this.findBookingFrameWithContent(page, 3000);
         let _alreadyAtCheckoutEarly = false;
         if (_earlyBookingFrame) {
-          const _earlyFt = (await _earlyBookingFrame.locator("body").innerText().catch(() => "")).toLowerCase();
-          if (/данни\s*за\s*контакт|собствено\s*име|e-?mail|завършване/i.test(_earlyFt)) {
+          if (await this.isAtCheckoutStep(_earlyBookingFrame)) {
             _alreadyAtCheckoutEarly = true;
             console.log("[RESERVATION][RESERVE] iframe already at checkout — skipping room selection");
           }
@@ -4383,7 +4405,7 @@ rooms: rooms,
                   console.log("[RESERVATION][ROOM] tariff step detected in iframe — booking progressed");
                   return true;
                 }
-                if (/данни\s*за\s*контакт|собствено\s*име|e-?mail.*попълни|завършване/i.test(newSnapLower)) {
+                if (/данни\s*за\s*контакт|guest\s*details|your\s*details/i.test(newSnapLower)) {
                   console.log("[RESERVATION][ROOM] checkout step detected in iframe — booking progressed");
                   return true;
                 }
@@ -4746,13 +4768,9 @@ rooms: rooms,
         // Navigate Clock PMS through Tariff step to Checkout step (only if not already navigated via fallback gate)
         if (roomSelectionSucceeded) {
           const _alreadyAtCheckout = await (async () => {
-            const _bf2 = page.frames().find(f => {
-              const n = String(f.name?.() || ''); const u = f.url();
-              return n.includes('clock') || n.includes('wbe') || u.includes('clock-pms') || u.includes('wbe');
-            });
+            const _bf2 = this.findBookingFrame(page);
             if (!_bf2) return false;
-            const _ft2 = (await _bf2.locator('body').innerText().catch(() => '')).toLowerCase();
-            return /данни\s*за\s*контакт|собствено\s*име|e-?mail|завършване/i.test(_ft2);
+            return await this.isAtCheckoutStep(_bf2);
           })();
           if (!_alreadyAtCheckout) {
             const reachedCheckout = await this.navigateBookingWidgetToCheckout(page, guests);
