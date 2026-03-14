@@ -2188,7 +2188,7 @@ class HotSessionManager {
   }> {
     try {
       // Prefer booking iframe for scanning — avoids false positives from main page nav
-      const _scanBf = this.findBookingFrame(page);
+      const _scanBf = await this.findBookingFrameWithContent(page, 2000).catch(() => this.findBookingFrame(page));
       const _scanCtx = (_scanBf as any) as Page;
       const _useFrame = !!_scanBf;
 
@@ -3762,28 +3762,60 @@ class HotSessionManager {
   // Universal booking frame finder — works for ANY iframe-based widget
   // ─────────────────────────────────────────────────────────
   private findBookingFrame(page: Page) {
-    // Priority: known booking widget patterns
+    // Priority: known booking widget patterns in name or URL
     const knownPatterns = [
       "clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier",
       "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "hotel",
       "checkout", "availability", "widget",
     ];
+    const analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick|trustpilot/i;
     const frames = page.frames().filter(f => f !== page.mainFrame());
     // First pass: known booking patterns
     for (const f of frames) {
       const n = String(f.name?.() || "").toLowerCase();
       const u = f.url().toLowerCase();
+      if (analyticsPattern.test(u)) continue; // skip analytics/maps
       const hay = n + " " + u;
       if (knownPatterns.some(p => hay.includes(p))) return f;
     }
-    // Second pass: any iframe with interactive content (has inputs or buttons)
-    // (we skip Google Maps and analytics iframes by URL)
+    // Second pass: any non-analytics/non-maps iframe
     for (const f of frames) {
       const u = f.url().toLowerCase();
-      if (/google\.com|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle/i.test(u)) continue;
-      return f; // return first non-analytics iframe as fallback
+      if (analyticsPattern.test(u)) continue;
+      if (u === "" || u === "about:blank") continue;
+      return f;
     }
     return undefined;
+  }
+
+  // findBookingFrame with retry — waits up to maxWaitMs for a frame with actual content
+  private async findBookingFrameWithContent(page: Page, maxWaitMs = 6000): Promise<any> {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      const frames = page.frames().filter(f => f !== page.mainFrame());
+      const analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick|trustpilot/i;
+      const knownPatterns = ["clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier", "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "hotel", "checkout", "availability", "widget"];
+      // Look for a frame that: matches known patterns AND has text content
+      for (const f of frames) {
+        const n = String(f.name?.() || "").toLowerCase();
+        const u = f.url().toLowerCase();
+        if (analyticsPattern.test(u)) continue;
+        const hay = n + " " + u;
+        if (!knownPatterns.some(p => hay.includes(p))) continue;
+        try {
+          const text = await f.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+          if (text.trim().length > 30) {
+            console.log(`[BOOKING_NAV] Found loaded booking frame: name="${n || u.slice(0,40)}" len=${text.length}`);
+            return f;
+          }
+        } catch {}
+      }
+      await page.waitForTimeout(500);
+    }
+    // Fallback: return any non-analytics frame even if empty
+    const fb = this.findBookingFrame(page);
+    if (fb) console.log("[BOOKING_NAV] Returning frame without content (timeout)");
+    return fb;
   }
 
   // ─────────────────────────────────────────────────────────
@@ -3809,26 +3841,29 @@ class HotSessionManager {
   //            HotelRunner, Bookero, Amelia, Quendoo, and generic multi-step widgets
   // ─────────────────────────────────────────────────────────
   private async navigateBookingWidgetToCheckout(page: Page, guests: string): Promise<boolean> {
-    const bf = this.findBookingFrame(page);
+    // Use async frame finder — waits up to 8s for a frame with actual content
+    const bf = await this.findBookingFrameWithContent(page, 8000);
     if (!bf) {
-      // No iframe — check if main page is a multi-step booking flow
-      const mainText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
       if (await this.isAtCheckoutStep(page)) return true;
       console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
     }
-    const ctx: any = bf || page;
+    let ctx: any = bf || page;
     const guestNum = parseInt(guests || "2") || 2;
     console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
 
-    // Initial wait for iframe to load
-    await page.waitForTimeout(1500);
-
     for (let step = 0; step < 14; step++) {
-      await page.waitForTimeout(step === 0 ? 800 : 700);
+      await page.waitForTimeout(700);
+      // Re-find frame each step in case it changed (e.g. new iframe opened)
+      if (bf) {
+        const freshFrame = await this.findBookingFrameWithContent(page, 1500);
+        if (freshFrame) ctx = freshFrame;
+      }
       const frameText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
-      console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 100).replace(/\s+/g, " ")}"`);
-      // Wait if iframe not loaded yet
-      if (frameText.trim().length < 20) { await page.waitForTimeout(2000); continue; }
+      console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 120).replace(/\s+/g, " ")}"`);
+      if (frameText.trim().length < 20) {
+        console.log("[BOOKING_NAV] iframe content empty — waiting");
+        await page.waitForTimeout(1500); continue;
+      }
 
       // ── Already at checkout ──────────────────────────────
       if (await this.isAtCheckoutStep(ctx)) {
@@ -4194,7 +4229,8 @@ rooms: rooms,
         await page.waitForTimeout(800);
 
         // Early exit: if Clock PMS iframe is already at checkout, skip ALL room selection
-        const _earlyBookingFrame = this.findBookingFrame(page);
+        // Wait briefly for iframe content before checking checkout state
+        const _earlyBookingFrame = await this.findBookingFrameWithContent(page, 3000);
         let _alreadyAtCheckoutEarly = false;
         if (_earlyBookingFrame) {
           const _earlyFt = (await _earlyBookingFrame.locator("body").innerText().catch(() => "")).toLowerCase();
@@ -4604,14 +4640,23 @@ rooms: rooms,
 
           const frames = page.frames().filter((f) => f !== page.mainFrame());
 
-          // Use universal findBookingFrame — returns THE booking frame
-          const _theBookingFrame = this.findBookingFrame(page);
-          const bookingFrames = _theBookingFrame ? [_theBookingFrame] : [];
+          // Try ALL non-analytics frames, prioritizing known booking patterns
+          const _analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick/i;
+          const _knownPatterns = ["clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier", "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "checkout", "availability", "widget"];
+          const bookingFrames = frames
+            .filter(f => !_analyticsPattern.test(f.url()))
+            .sort((a, b) => {
+              const aHay = (String(a.name?.() || "") + " " + a.url()).toLowerCase();
+              const bHay = (String(b.name?.() || "") + " " + b.url()).toLowerCase();
+              const aScore = _knownPatterns.some(p => aHay.includes(p)) ? 1 : 0;
+              const bScore = _knownPatterns.some(p => bHay.includes(p)) ? 1 : 0;
+              return bScore - aScore; // known patterns first
+            });
 
           for (const frame of bookingFrames) {
             const frameUrl = String(frame.url() || "");
             const frameName = String((frame as any).name?.() || "");
-            const label = `frame(${frameName || frameUrl || "unknown"})`;
+            const label = `frame(${frameName || frameUrl.slice(0, 60) || "unknown"})`;
             if (await clickRoomInContext(frame as any, label)) {
               roomSelectionSucceeded = true;
               break;
