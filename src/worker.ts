@@ -285,6 +285,8 @@ function cleanFieldLabel(raw: unknown): string {
   let s = String(raw || "").trim();
   // Remove leading Material icon name (e.g. "editСобствено име *" → "Собствено име *")
   s = s.replace(MATERIAL_ICON_PREFIXES, "");
+  // Remove trailing Material icon names (e.g. "Държава *arrow_drop_down" → "Държава")
+  s = s.replace(/\s*(arrow_drop_down|arrow_forward|arrow_back|expand_more|expand_less|chevron_right|chevron_left|shopping_cart|add|close|search|edit|check|info|help|warning|done|clear|visibility|visibility_off)\s*$/i, "");
   // Remove trailing asterisk with spaces
   s = s.replace(/\s*\*\s*$/, "").trim();
   // Remove leading asterisk
