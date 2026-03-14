@@ -4000,88 +4000,215 @@ class HotSessionManager {
       }
 
       // ── Tariff/rate selection step ───────────────────────
-      // isTariffStep: iframe shows ACTUAL tariff card content (not just nav tab "sell тарифи")
-      // We require: price pattern OR rate plan name OR visible ИЗБЕРИ button
+      // Clock PMS specific flow (works for other widgets too):
+      //   1st ИЗБЕРИ click → opens guests/rooms dropdown IN iframe
+      //   Select guests value
+      //   2nd ИЗБЕРИ click → triggers main page overlay (login/guest toggle)
+      //   Click "Резервирам за някой друг" → checkout form appears on main page
       const hasIzberiBtn = await ctx.locator(
         'button:has-text("ИЗБЕРИ"), button:has-text("Избери"), [role="button"]:has-text("ИЗБЕРИ")'
       ).count().catch(() => 0) > 0;
       const isTariffStep = hasTariffContent || hasIzberiBtn ||
         /standard.?rate|нощувка\s*с\s*закуска|meal\s*plan|rate\s*name|bb\s*plan|закуска\s*включ/i.test(frameText);
       if (isTariffStep) {
-        console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent} — setting guests and clicking select`);
-        // Set guest count — try select, then custom dropdown, then stepper buttons
-        try {
-          const sel = ctx.locator("select").first();
-          if (await sel.count().catch(() => 0) > 0) {
-            await sel.selectOption(String(guestNum)).catch(async () => {
-              await sel.selectOption({ index: Math.min(guestNum - 1, 2) }).catch(() => {});
-            });
+        console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent}`);
+
+        // ── Step A: Set guest count via select/dropdown/stepper ──
+        let _guestsSet = false;
+        // 1. Native <select>
+        const _selEl = ctx.locator("select").first();
+        if (await _selEl.count().catch(() => 0) > 0) {
+          await _selEl.selectOption(String(guestNum)).catch(async () => {
+            await _selEl.selectOption({ index: Math.min(guestNum - 1, 2) }).catch(() => {});
+          });
+          await page.waitForTimeout(300);
+          _guestsSet = true;
+          console.log(`[BOOKING_NAV] Set guests via <select> to ${guestNum}`);
+        }
+
+        // 2. Clock PMS Quasar dropdown — click to open, then pick value
+        if (!_guestsSet) {
+          const _qDropLabel = ctx.locator('[class*="q-field"], [class*="q-select"]').filter({ hasText: /Възрастни|Adults|Гости|Guests/i }).first();
+          const _qDropAny = ctx.locator('[class*="q-field"], [class*="q-select"]').first();
+          const _dropTarget = (await _qDropLabel.count().catch(() => 0) > 0) ? _qDropLabel : _qDropAny;
+          if (await _dropTarget.isVisible().catch(() => false)) {
+            await _dropTarget.click({ timeout: 1500 }).catch(() => {});
+            await page.waitForTimeout(400);
+            // Pick the right option from the opened list
+            const _optSel = `[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`;
+            const _opt = page.locator(_optSel).first(); // options appear on main page DOM
+            const _optInCtx = ctx.locator(_optSel).first();
+            if (await _opt.isVisible().catch(() => false)) {
+              await _opt.click({ timeout: 1500 }).catch(() => {});
+              _guestsSet = true;
+              console.log(`[BOOKING_NAV] Set guests via Quasar dropdown (main page) to ${guestNum}`);
+            } else if (await _optInCtx.isVisible().catch(() => false)) {
+              await _optInCtx.click({ timeout: 1500 }).catch(() => {});
+              _guestsSet = true;
+              console.log(`[BOOKING_NAV] Set guests via Quasar dropdown (iframe) to ${guestNum}`);
+            }
             await page.waitForTimeout(300);
-          } else {
-            // Custom dropdown (Quevue, SabeeApp style)
-            const drop = ctx.locator('[class*="select"], [class*="dropdown"], [class*="guests"], [class*="adult"]').first();
-            if (await drop.isVisible().catch(() => false)) {
-              await drop.click().catch(() => {});
-              await page.waitForTimeout(200);
-              await ctx.locator(`li:has-text("${guestNum}"), [role="option"]:has-text("${guestNum}")`).first().click().catch(() => {});
-            }
-            // Stepper +/- buttons (Mews, Beds24 style)
-            const plusBtn = ctx.locator('[class*="plus"], [class*="increment"], button:has-text("+"), [aria-label*="add"], [aria-label*="increase"]').first();
-            if (await plusBtn.isVisible().catch(() => false)) {
-              const currentVal = parseInt(await ctx.locator('input[class*="guest"], input[class*="adult"], input[type="number"]').first().inputValue().catch(() => "1")) || 1;
-              for (let p = currentVal; p < guestNum; p++) {
-                await plusBtn.click({ timeout: 1000 }).catch(() => {});
-                await page.waitForTimeout(150);
-              }
-            }
           }
-        } catch {}
-        // Click the rate CTA (ИЗБЕРИ, Select, Book, Add, Reserve, etc.)
-        const ctaBtns = await ctx.locator("button, [role='button'], a[class*='btn']").all().catch(() => []);
-        for (const btn of ctaBtns) {
-          const t = (await btn.innerText().catch(() => "")).trim();
-          if (!t || isBadClickableLabel(t)) continue;
-          if (/избери|select|book|резерв|добав|add|choose|reserve/i.test(t) && t.length <= 40) {
-            if (await btn.isVisible().catch(() => false)) {
-              await btn.scrollIntoViewIfNeeded().catch(() => {});
-              await btn.click({ timeout: 2000 }).catch(() => {});
-              console.log(`[BOOKING_NAV] Clicked rate CTA: "${t}"`); break;
+        }
+
+        // 3. Stepper +/- (Mews, Beds24 style)
+        if (!_guestsSet) {
+          const _plusBtn = ctx.locator('[class*="plus"], [class*="increment"], button:has-text("+"), [aria-label*="add"], [aria-label*="increase"]').first();
+          if (await _plusBtn.isVisible().catch(() => false)) {
+            const _curVal = parseInt(await ctx.locator('input[type="number"]').first().inputValue().catch(() => "1")) || 1;
+            for (let _p = _curVal; _p < guestNum; _p++) {
+              await _plusBtn.click({ timeout: 1000 }).catch(() => {});
+              await page.waitForTimeout(150);
+            }
+            _guestsSet = true;
+          }
+        }
+
+        // ── Step B: Click ИЗБЕРИ / rate CTA ──
+        await page.waitForTimeout(200);
+        let _izberiClicked = false;
+        const _ctaBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+        for (const _btn of _ctaBtns) {
+          const _t = (await _btn.innerText().catch(() => "")).trim();
+          if (!_t) continue;
+          if (/избери|select|book|резерв|добав|add|choose|reserve/i.test(_t) && _t.length <= 50) {
+            if (await _btn.isVisible().catch(() => false)) {
+              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+              await _btn.click({ timeout: 2000 }).catch(() => {});
+              console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
+              _izberiClicked = true;
+              break;
             }
           }
         }
-        // After clicking ИЗБЕРИ, wait longer for Clock PMS to process
-        await page.waitForTimeout(1500);
-        // Immediately check for login/auth step appearing
-        const postClickText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
-        if (/вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account|резервирам за някой/i.test(postClickText)) {
-          console.log("[BOOKING_NAV] Login prompt appeared after ИЗБЕРИ click");
-          _sameTextCount = 0; _prevFrameText = "";
+
+        // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
+        await page.waitForTimeout(2000);
+
+        // Check main page for Clock PMS checkout overlay
+        for (let _od = 0; _od < 5; _od++) {
+          await page.waitForTimeout(600);
+
+          // Did checkout form appear? (on main page)
+          if (await this.isAtCheckoutStep(page)) {
+            console.log("[BOOKING_NAV] Checkout form appeared on main page ✓");
+            return true;
+          }
+          if (await this.isAtCheckoutStep(ctx)) {
+            console.log("[BOOKING_NAV] Checkout form appeared in iframe ✓");
+            return true;
+          }
+
+          // Check for Clock PMS overlay with login + guest toggle
+          const _mainText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainText);
+
+          if (_hasOverlay) {
+            console.log(`[BOOKING_NAV] Clock PMS overlay detected on main page (attempt ${_od + 1})`);
+
+            // Toggle "Резервирам за някой друг. Няма да отсядам в хотела."
+            // Try clicking the toggle/label
+            const _toggleSelectors = [
+              'label:has-text("Резервирам за някой друг")',
+              '[class*="q-toggle"]:has-text("Резервирам")',
+              '[class*="toggle"]:has-text("Резервирам")',
+              'label:has-text("Резервирам")',
+            ];
+            let _toggled = false;
+            for (const _tSel of _toggleSelectors) {
+              try {
+                const _tEl = page.locator(_tSel).first();
+                if (await _tEl.isVisible({ timeout: 800 }).catch(() => false)) {
+                  await _tEl.click({ timeout: 1500 }).catch(() => {});
+                  console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
+                  _toggled = true;
+                  await page.waitForTimeout(800);
+                  break;
+                }
+              } catch {}
+            }
+
+            // If toggle not found, try clicking the toggle INPUT directly
+            if (!_toggled) {
+              const _toggleInput = page.locator('.q-toggle__inner, [class*="q-toggle"] .q-toggle__track, [class*="toggle__track"]').first();
+              if (await _toggleInput.isVisible().catch(() => false)) {
+                await _toggleInput.click({ timeout: 1500 }).catch(() => {});
+                console.log("[BOOKING_NAV] Clicked toggle track");
+                _toggled = true;
+                await page.waitForTimeout(800);
+              }
+            }
+
+            if (_toggled) {
+              _sameTextCount = 0; _prevFrameText = "";
+              // Check if checkout appeared after toggle
+              if (await this.isAtCheckoutStep(page)) {
+                console.log("[BOOKING_NAV] Checkout appeared after toggle ✓");
+                return true;
+              }
+            }
+            break; // handled overlay, continue loop
+          }
+
+          // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
+          // This happens when: first ИЗБЕРИ opens a select/dropdown for Възрастни
+          const _openDropdown = await ctx.locator(
+            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
+          ).first().isVisible().catch(() => false);
+          const _openDropdownPage = await page.locator(
+            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
+          ).first().isVisible().catch(() => false);
+
+          if (_openDropdown || _openDropdownPage) {
+            console.log("[BOOKING_NAV] Dropdown/listbox is open — selecting guest count");
+            const _listCtx = _openDropdownPage ? page : ctx;
+            const _optEl = _listCtx.locator(`[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`).first();
+            if (await _optEl.isVisible().catch(() => false)) {
+              await _optEl.click({ timeout: 1500 }).catch(() => {});
+              console.log(`[BOOKING_NAV] Selected ${guestNum} from open dropdown`);
+              await page.waitForTimeout(400);
+              _sameTextCount = 0; _prevFrameText = "";
+            }
+            break;
+          }
         }
         continue;
       }
 
-      // ── Login/auth prompt ────────────────────────────────
-      if (/вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account/i.test(frameText)) {
-        console.log("[BOOKING_NAV] Login prompt — attempting guest/no-account option");
-        // Try "book as guest" or "continue without account"
-        const guestLabels = [
-          /резервирам\s*за\s*някой\s*друг|book\s*for|continue\s*as\s*guest|без\s*регистрация|guest\s*checkout/i,
+      // ── Login/auth prompt — check BOTH iframe AND main page ────
+      const _mainPageForLogin = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const _loginInFrame = /вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account/i.test(frameText);
+      const _loginOnPage = /вход\s*с|login|sign.?in|google|имейл.*влез|резервирам за някой/i.test(_mainPageForLogin);
+      if (_loginInFrame || _loginOnPage) {
+        console.log(`[BOOKING_NAV] Login/auth prompt detected inFrame=${_loginInFrame} onPage=${_loginOnPage}`);
+        // Try "Резервирам за някой друг" on MAIN page (Clock PMS)
+        const _guestToggleSelectors = [
+          'label:has-text("Резервирам за някой друг")',
+          '[class*="q-toggle"]:has-text("Резервирам")',
+          'label:has-text("Резервирам")',
         ];
-        let bypassed = false;
-        for (const pattern of guestLabels) {
-          const lbl = ctx.locator("label, button, a").filter({ hasText: pattern }).first();
-          if (await lbl.isVisible().catch(() => false)) {
-            await lbl.click().catch(() => {});
-            console.log("[BOOKING_NAV] Bypassed login prompt");
-            bypassed = true; await page.waitForTimeout(400); break;
+        let _handled = false;
+        for (const _s of _guestToggleSelectors) {
+          const _el = page.locator(_s).first();
+          if (await _el.isVisible().catch(() => false)) {
+            await _el.click().catch(() => {});
+            console.log(`[BOOKING_NAV] Clicked guest toggle on main page: "${_s}"`);
+            _handled = true;
+            _sameTextCount = 0; _prevFrameText = "";
+            await page.waitForTimeout(800);
+            if (await this.isAtCheckoutStep(page)) {
+              console.log("[BOOKING_NAV] Checkout appeared after login bypass ✓"); return true;
+            }
+            break;
           }
         }
-        if (!bypassed) {
-          // Try clicking "Continue" or "Next" to skip
-          const contBtn = ctx.locator('button:has-text("Continue"), button:has-text("Next"), button:has-text("Напред"), button:has-text("Продължи")').first();
-          if (await contBtn.isVisible().catch(() => false)) {
-            await contBtn.click({ timeout: 1500 }).catch(() => {});
-            await page.waitForTimeout(400);
+        if (!_handled) {
+          // Try in iframe
+          const _ctxLbl = ctx.locator("label, button").filter({ hasText: /резервирам|guest|без регистрация/i }).first();
+          if (await _ctxLbl.isVisible().catch(() => false)) {
+            await _ctxLbl.click().catch(() => {});
+            _sameTextCount = 0; _prevFrameText = "";
+            await page.waitForTimeout(600);
           }
         }
         continue;
