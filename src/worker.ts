@@ -1,21 +1,35 @@
 /**
- * NEO WORKER v7.0.0-booking — Universal, deterministic, schema-first
+ * NEO WORKER v8.0.0 — Universal Widget Engine
  *
- * v7.0.0-booking — НОВO:
- * - makeReservation(): пълен workflow за резервация
- *     1. Попълва availability form (дати, гости)
- *     2. Взима screenshot → Gemini парсва цени/стаи
- *     3. Ако клиентът е съгласен → попълва reservation details (имена, email, телефон)
- *     4. Спира преди плащане → копира booking URL за клиента
- * - /make-reservation endpoint
- * - fillIframeBookingWidget(): взаимодейства вътре в booking iframes
- *     поддържа: Cloudbeds, Beds24, Mews, Synxis, SabeApp, LittleHotelier, HotelRunner
- *     използва page.frameLocator() за достъп до iframe DOM
- * - fillCustomDatepicker(): universal handler за custom calendar widgets
- *     поддържа: Flatpickr, Pikaday, React DatePicker, AirDatepicker, jQuery UI Datepicker
- *     стратегии: click на ден в calendar grid, keyboard navigation, direct input
- * - fillStyledChoiceGroups(): styled div/li choice groups в form context (не само wizard)
- * - Всички съществуващи функции непроменени
+ * v8.0.0 — НОВА АРХИТЕКТУРА:
+ * ─────────────────────────────────────────────────────────────────
+ * UNIVERSAL WIDGET ENGINE — работи с ВСЯКАКВИ booking уиджети:
+ *   Clock PMS, Beds24, Cloudbeds, Mews, SabeeApp, LittleHotelier,
+ *   HotelRunner, Bookero, Amelia, RMS, Sirvoy, и всеки нов вендор.
+ *
+ * DOM-FIRST подход (без Gemini Vision за form fields):
+ *   • universalScanWidgetDOM()    — сканира DOM за required/optional полета
+ *                                  без да праща screenshot на AI
+ *   • universalFillKnownFields()  — попълва произволен widget семантично
+ *                                  (по label, aria-label, placeholder)
+ *                                  поддържа: Quasar selects, native selects,
+ *                                  React/Vue inputs, custom datepickers
+ *   • universalGetMissingRequired() — точно разпознава кои полета
+ *                                    липсват СЛЕД навигация до checkout
+ *
+ * TIMING FIX (критичен):
+ *   • inferCurrentBookingStepNeeds() се вика СЛЕД navigateBookingWidgetToCheckout
+ *     не преди → коректен списък с required полета
+ *
+ * SCREENSHOT ОПТИМИЗАЦИЯ:
+ *   • JPEG вместо PNG (10× по-малко)
+ *   • само iframe когато е налично
+ *   • Gemini Vision само за availability results (цени/стаи)
+ *
+ * BULGARIAN CLOCK PMS ПОЛЕТА:
+ *   • guest_egn, guest_birthdate, guest_gender, guest_country,
+ *     guest_doc_type, guest_doc_number — пълна поддръжка
+ * ─────────────────────────────────────────────────────────────────
  */
 
 import express, { Request, Response } from "express";
@@ -162,6 +176,13 @@ interface MakeReservationRequest {
   guest_email?: string;
   guest_phone?: string;
   guest_message?: string;
+  // Bulgarian Clock PMS specific guest fields
+  guest_egn?: string;           // ЕГН (Bulgarian personal ID)
+  guest_birthdate?: string;     // Дата на раждане (DD.MM.YYYY or YYYY-MM-DD)
+  guest_gender?: string;        // Пол (код): "M" | "F" | "male" | "female" | "мъж" | "жена"
+  guest_country?: string;       // Държава (country name or ISO code)
+  guest_doc_type?: string;      // Тип документ: "Лична карта" | "Паспорт" | "ID" | "Passport"
+  guest_doc_number?: string;    // Номер на документ
   // Control flags
   phase: "check" | "reserve";  // "check" = само availability screenshot; "reserve" = попълни до плащане
   confirmed_price?: string;     // цената, която клиентът е потвърдил
@@ -278,6 +299,22 @@ function isMessageField(f: FormSchemaField): boolean {
 // Wizard label normalization
 // ───────────────────────────────────────────────────────────────
 
+// ── Material Design icon names that prefix field labels in Clock PMS / Quasar ──
+const MATERIAL_ICON_PREFIXES = /^(edit|email|phone|public|event|person|lock|search|home|info|check|close|add|remove|delete|save|send|star|favorite|settings|help|warning|error|done|clear|arrow_drop_down|arrow_forward|arrow_back|chevron_right|chevron_left|expand_more|expand_less|shopping_cart|calendar_today|date_range|schedule|location_on|place|flag|notes|description|attach_file|image|photo|camera|visibility|visibility_off|account_circle|group|business|store|credit_card|payment|security|vpn_key|fingerprint|badge|card_travel|luggage|backpack|hotel|flight|directions_car|local_taxi|train|tram|directions_bus|map|navigation|explore|language|translate|text_fields|format_list|format_quote|link|grid_view|grid_on|view_list|view_module|sell|label|local_offer|discount|percent)\s*/i;
+
+function cleanFieldLabel(raw: unknown): string {
+  let s = String(raw || "").trim();
+  // Remove leading Material icon name (e.g. "editСобствено име *" → "Собствено име *")
+  s = s.replace(MATERIAL_ICON_PREFIXES, "");
+  // Remove trailing Material icon names (e.g. "Държава *arrow_drop_down" → "Държава")
+  s = s.replace(/\s*(arrow_drop_down|arrow_forward|arrow_back|expand_more|expand_less|chevron_right|chevron_left|shopping_cart|add|close|search|edit|check|info|help|warning|done|clear|visibility|visibility_off)\s*$/i, "");
+  // Remove trailing asterisk with spaces
+  s = s.replace(/\s*\*\s*$/, "").trim();
+  // Remove leading asterisk
+  s = s.replace(/^\*\s*/, "").trim();
+  return s;
+}
+
 function normLabel(s: unknown): string {
   const t = String(s ?? "")
     .toLowerCase()
@@ -341,44 +378,25 @@ function roomTextMatches(containerTextRaw: string, wantedRoomRaw: string): boole
 }
 
 function isBadClickableLabel(raw: string): boolean {
-
   const s = normLabel(raw || "");
   if (!s) return true;
 
-  return [
-    "lens",
-    "chevron left",
-    "chevron right",
-    "fullscreen",
-    "expand more",
-    "expand less",
-    "close",
-    "menu",
-    "search",
-    "favorite",
-    "share",
-    "prev",
-    "next",
-    "zoom",
-    "галерия",
-    "снимка",
-    "картина",
-    "person",
-    "profile",
-    "profile or sign in",
-    "sign in",
-    "shopping cart",
-    "cart",
-    "event",
-    "grid view",
-    "sell",
-    "arrow back",
-    "arrow drop down",
-    "toggle details",
-    "language",
-    "български",
-    "english",
-  ].some((x) => s === x || s.startsWith(x) || s.includes(x));
+  // Exact match — pure icon-only labels
+  const exactBad = new Set([
+    "lens", "chevron left", "chevron right", "fullscreen", "expand more",
+    "expand less", "close", "menu", "search", "favorite", "share", "prev",
+    "next", "zoom", "галерия", "снимка", "картина", "person", "profile",
+    "sign in", "shopping cart", "cart", "event", "grid view", "sell",
+    "arrow back", "arrow drop down", "toggle details", "language",
+    "български", "english", "profile or sign in",
+  ]);
+  if (exactBad.has(s)) return true;
+
+  // Bad if label ENDS with an icon word (e.g. "покажи повече expand_more" → bad)
+  const badSuffixes = ["expand more", "expand less", "chevron right", "chevron left", "arrow drop down"];
+  if (badSuffixes.some(suf => s.endsWith(suf))) return true;
+
+  return false;
 }
 
 
@@ -1596,8 +1614,14 @@ class HotSessionManager {
           if (lab && lab.textContent) return lab.textContent.trim();
         }
         let p: Element | null = el;
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 6; i++) {
           if (!p) break;
+          // ✅ Quasar q-field label: .q-field__label inside the q-field wrapper
+          const qLabel = p.querySelector?.(".q-field__label") as HTMLElement | null;
+          if (qLabel && qLabel.textContent) return qLabel.textContent.trim();
+          // ✅ Quasar q-field__messages / q-field__hint also carry labels sometimes
+          const qLabelEl = p.querySelector?.("[class*='q-field__label']") as HTMLElement | null;
+          if (qLabelEl && qLabelEl.textContent) return qLabelEl.textContent.trim();
           const lab = p.querySelector?.("label") as HTMLElement | null;
           if (lab && lab.textContent) return lab.textContent.trim();
           p = p.parentElement;
@@ -1639,7 +1663,16 @@ class HotSessionManager {
             const ariaReq = (any.getAttribute?.("aria-required") || "").toString().toLowerCase() === "true";
             const dataReq = (any.getAttribute?.("data-required") || "").toString().toLowerCase() === "true";
             const star = (label || "").includes("*");
-            return !!any.required || ariaReq || dataReq || star;
+            // ✅ Quasar q-field--required class on ancestor
+            let qRequired = false;
+            let ancestor: Element | null = el;
+            for (let d = 0; d < 5; d++) {
+              if (!ancestor) break;
+              const cls = (ancestor as any).className || "";
+              if (typeof cls === "string" && cls.includes("q-field--required")) { qRequired = true; break; }
+              ancestor = ancestor.parentElement;
+            }
+            return !!any.required || ariaReq || dataReq || star || qRequired;
           })();
 
           return {
@@ -2205,13 +2238,20 @@ class HotSessionManager {
     payment_required: boolean;
     can_continue: boolean;
   }> {
+    // ✅ PRIMARY: use the universal DOM scanner
     try {
-      // Prefer booking iframe for scanning — avoids false positives from main page nav
-      const _scanBf = page.frames().find(f => {
-        const n = String(f.name?.() || "");
-        const u = f.url();
-        return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
-      });
+      const result = await this.universalGetMissingRequired(page);
+      return {
+        missing_required: result.missing_required,
+        current_step: result.current_step,
+        payment_required: result.payment_required,
+        can_continue: result.can_continue,
+      };
+    } catch {}
+
+    // ── FALLBACK: original scanWizardStep-based approach ──────────
+    try {
+      const _scanBf = await this.findBookingFrameWithContent(page, 2000).catch(() => this.findBookingFrame(page));
       const _scanCtx = (_scanBf as any) as Page;
       const _useFrame = !!_scanBf;
 
@@ -2247,7 +2287,7 @@ class HotSessionManager {
 
       const requiredFieldLabels = (scanned.fields || [])
         .filter((f: any) => !!f?.required)
-        .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
+        .map((f: any) => cleanFieldLabel(f.label || f.aria_label || f.placeholder || f.name || f.id || ""))
         .filter(Boolean);
 
       const requiredChoiceLabels = (scanned.choiceGroups || [])
@@ -2283,8 +2323,13 @@ class HotSessionManager {
 
 
       // Filter known nav/decoration noise from Clock PMS and main page
-      const _STEP_NOISE = /^(бонус\s*код|bonus\s*code|избор:\s*[/|]|емоция|сватби|бизнес|конферентни|почивка|релакс|person|shopping.?cart|arrow|grid.?view|sell|event|bg|en)/i;
-      const cleanOut = out.filter(s => !_STEP_NOISE.test(s.trim())).slice(0, 20);
+      // Also apply cleanFieldLabel to remove any remaining icon prefixes
+      const _STEP_NOISE = /^(бонус|bonus.?code|избор:|емоция|сватби|бизнес|конферентни|почивка|релакс|person|shopping|arrow|grid.?view|sell|event\b|bg\b|en\b)/i;
+      const cleanOut = out
+        .map(s => cleanFieldLabel(s))
+        .filter(s => s.length > 1)
+        .filter(s => !_STEP_NOISE.test(s.trim()))
+        .slice(0, 12);
 
       return {
         missing_required: cleanOut,
@@ -3250,9 +3295,62 @@ class HotSessionManager {
   }
 
   private async takeAvailabilityScreenshot(page: Page): Promise<string> {
-    // Try full-page first, fallback to viewport
+    // Strategy 1: Take screenshot of ONLY the booking iframe element (smallest, most relevant)
     try {
-      const buf = await page.screenshot({ fullPage: true, type: "png" });
+      const iframeSelectors = [
+        'iframe[name="clock-pms-wbe-iframe"]',
+        'iframe[src*="clock"]',
+        'iframe[src*="wbe"]',
+        'iframe[src*="booking"]',
+        'iframe[src*="reserv"]',
+        'iframe[src*="hotel"]',
+        'iframe[src*="beds24"]',
+        'iframe[src*="cloudbeds"]',
+        'iframe[src*="mews"]',
+        'iframe[src*="sabee"]',
+      ];
+      for (const sel of iframeSelectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        const buf = await el.screenshot({ type: "jpeg", quality: 70 }).catch(() => null);
+        if (buf && buf.length > 1000) {
+          console.log(`[SCREENSHOT] iframe-only JPEG via "${sel}" size=${buf.length}`);
+          return Buffer.from(buf).toString("base64");
+        }
+      }
+    } catch {}
+
+    // Strategy 2: Scroll to booking widget container and screenshot viewport
+    try {
+      const widgetSelectors = [
+        '[id*="clock-pms"]', '[class*="booking-widget"]', '[class*="reservation-widget"]',
+        '#booking', '.booking', '[data-widget]',
+      ];
+      for (const sel of widgetSelectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (!el) continue;
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        const buf = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false }).catch(() => null);
+        if (buf && buf.length > 1000) {
+          console.log(`[SCREENSHOT] widget-scrolled JPEG size=${buf.length}`);
+          return Buffer.from(buf).toString("base64");
+        }
+      }
+    } catch {}
+
+    // Strategy 3: Full viewport JPEG (no fullPage — reduces size significantly)
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 65, fullPage: false });
+      console.log(`[SCREENSHOT] viewport JPEG size=${buf.length}`);
+      return Buffer.from(buf).toString("base64");
+    } catch {}
+
+    // Fallback: fullPage JPEG
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: true });
+      console.log(`[SCREENSHOT] fullPage JPEG fallback size=${buf.length}`);
       return Buffer.from(buf).toString("base64");
     } catch {
       const buf = await page.screenshot({ fullPage: false, type: "png" });
@@ -3775,76 +3873,1053 @@ class HotSessionManager {
     return actions;
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // UNIVERSAL WIDGET ENGINE v1.0
+  // Works with ANY booking widget: Clock PMS, Beds24, Cloudbeds, Mews,
+  // SabeeApp, LittleHotelier, HotelRunner, Bookero, Amelia, RMS, etc.
+  // DOM-first — no hardcoded vendor selectors, no Gemini Vision for fields.
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * universalScanWidgetDOM — scan ANY widget context for visible form fields.
+   * Returns semantically labeled required and optional fields.
+   * Works in iframes, shadow DOM, Quasar, React, Vue, Bootstrap, Tailwind.
+   */
+  private async universalScanWidgetDOM(ctx: any): Promise<{
+    required: Array<{ label: string; type: string; selector: string; current_value: string }>;
+    optional: Array<{ label: string; type: string; selector: string; current_value: string }>;
+    dropdowns: Array<{ label: string; selector: string; options: string[]; current_value: string; required: boolean }>;
+    checkboxes: Array<{ label: string; selector: string; checked: boolean; required: boolean }>;
+    step_title: string;
+    is_checkout_step: boolean;
+    is_payment_step: boolean;
+  }> {
+    try {
+      return await ctx.evaluate(() => {
+        // ── helpers ──────────────────────────────────────────────
+        const isVisible = (el: Element): boolean => {
+          if (!el) return false;
+          const s = window.getComputedStyle(el as any);
+          if (s.display === "none" || s.visibility === "hidden" || parseFloat(s.opacity) < 0.05) return false;
+          const r = (el as any).getBoundingClientRect?.();
+          return !!r && r.width > 0 && r.height > 0;
+        };
+
+        const getLabel = (el: Element): string => {
+          const any = el as any;
+          // 1. Quasar q-field__label (covers q-input, q-select, q-date)
+          let p: Element | null = el;
+          for (let i = 0; i < 7; i++) {
+            if (!p) break;
+            const qLbl = p.querySelector?.("[class*='q-field__label'], [class*='q-floating-label']") as HTMLElement | null;
+            if (qLbl?.textContent?.trim()) return qLbl.textContent.trim();
+            p = p.parentElement;
+          }
+          // 2. <label for="id">
+          const id = any.id ? String(any.id) : "";
+          if (id) {
+            const lbl = document.querySelector(`label[for="${id}"]`) as HTMLElement | null;
+            if (lbl?.textContent?.trim()) return lbl.textContent.trim();
+          }
+          // 3. aria-label
+          const aria = any.getAttribute?.("aria-label") || "";
+          if (aria.trim()) return aria.trim();
+          // 4. aria-labelledby
+          const lblby = any.getAttribute?.("aria-labelledby") || "";
+          if (lblby) {
+            const t = lblby.split(/\s+/).map((i: string) => document.getElementById(i)?.textContent?.trim() || "").filter(Boolean).join(" ");
+            if (t) return t;
+          }
+          // 5. placeholder
+          if (any.placeholder?.trim()) return any.placeholder.trim();
+          // 6. Ancestor label
+          let anc: Element | null = el;
+          for (let i = 0; i < 5; i++) {
+            if (!anc) break;
+            const lbl = anc.querySelector?.("label") as HTMLElement | null;
+            if (lbl?.textContent?.trim()) return lbl.textContent.trim();
+            anc = anc.parentElement;
+          }
+          // 7. Previous sibling text (common in custom widgets)
+          const prev = (el as any).parentElement?.previousElementSibling as HTMLElement | null;
+          if (prev?.textContent?.trim() && prev.textContent.trim().length < 60) return prev.textContent.trim();
+          return "";
+        };
+
+        const isRequired = (el: Element, label: string): boolean => {
+          const any = el as any;
+          if (any.required) return true;
+          if ((any.getAttribute?.("aria-required") || "").toLowerCase() === "true") return true;
+          if ((any.getAttribute?.("data-required") || "").toLowerCase() === "true") return true;
+          if (label.includes("*")) return true;
+          // Quasar q-field--required class on ancestor
+          let anc: Element | null = el;
+          for (let i = 0; i < 5; i++) {
+            if (!anc) break;
+            const cls = String((anc as any).className || "");
+            if (cls.includes("q-field--required") || cls.includes("required")) return true;
+            anc = anc.parentElement;
+          }
+          return false;
+        };
+
+        const getSelector = (el: Element): string => {
+          const any = el as any;
+          if (any.id) return `#${CSS.escape ? CSS.escape(any.id) : any.id}`;
+          if (any.name) return `${el.tagName.toLowerCase()}[name="${any.name}"]`;
+          if (any.getAttribute?.("aria-label")) return `${el.tagName.toLowerCase()}[aria-label="${any.getAttribute("aria-label")}"]`;
+          if (any.placeholder) return `${el.tagName.toLowerCase()}[placeholder="${any.placeholder}"]`;
+          // nth-of-type path
+          const parts: string[] = [];
+          let cur: Element | null = el;
+          for (let d = 0; d < 6 && cur; d++) {
+            const tag = cur.tagName.toLowerCase();
+            const par = cur.parentElement;
+            if (!par) break;
+            const siblings = Array.from(par.children).filter((c: Element) => c.tagName === cur!.tagName);
+            parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(cur) + 1})`);
+            cur = par;
+            if (tag === "form" || tag === "main" || tag === "body") break;
+          }
+          return parts.join(" > ") || el.tagName.toLowerCase();
+        };
+
+        const cleanLabel = (s: string): string =>
+          s.replace(/^(edit|email|phone|person|event|lock|search|info|check|done|warning|error|public|badge|fingerprint|date_range|calendar_today|schedule)\s*/i, "")
+           .replace(/\s*(arrow_drop_down|expand_more|expand_less|chevron_right|chevron_left)\s*$/i, "")
+           .replace(/\s*\*\s*$/, "").trim();
+
+        // ── scan ─────────────────────────────────────────────────
+        const body = document.body;
+        const bodyText = (body?.innerText || "").toLowerCase();
+
+        const is_payment_step = /cvv|cvc|expir|card\s*number|credit\s*card|stripe|номер\s*на\s*карта|валидна\s*до/i.test(bodyText);
+        const is_checkout_step = !is_payment_step && (
+          /данни\s*за\s*контакт|guest\s*details|contact\s*details|your\s*details/i.test(bodyText) ||
+          /собствено\s*им|first\s*name/i.test(bodyText)
+        );
+
+        // Detect step title from heading or wizard step indicator
+        let step_title = "";
+        const headings = document.querySelectorAll("h1,h2,h3,[class*='step-title'],[class*='step__title'],[class*='wizard__title']");
+        for (const h of Array.from(headings)) {
+          if (!isVisible(h)) continue;
+          const t = (h.textContent || "").trim();
+          if (t.length > 2 && t.length < 80) { step_title = t; break; }
+        }
+
+        const required: Array<{ label: string; type: string; selector: string; current_value: string }> = [];
+        const optional: Array<{ label: string; type: string; selector: string; current_value: string }> = [];
+        const dropdowns: Array<{ label: string; selector: string; options: string[]; current_value: string; required: boolean }> = [];
+        const checkboxes: Array<{ label: string; selector: string; checked: boolean; required: boolean }> = [];
+
+        const seenSels = new Set<string>();
+
+        // ── text/email/tel/date inputs + textareas ────────────────
+        const inputs = Array.from(document.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]):not([type=reset]):not([type=checkbox]):not([type=radio]), textarea"));
+        for (const el of inputs) {
+          if (!isVisible(el)) continue;
+          if ((el as any).disabled) continue;
+          if ((el as any).getAttribute?.("aria-hidden") === "true") continue;
+          const rawLabel = getLabel(el);
+          const label = cleanLabel(rawLabel);
+          // Skip navigation-noise labels
+          if (/^(бонус|bonus|прод|next|back|назад|напред|close|затвор|cancel|отказ|search|търс|bg\b|en\b)/i.test(label)) continue;
+          if (!label && !(el as any).placeholder) continue;
+          const type = ((el as any).type || el.tagName.toLowerCase()).toLowerCase();
+          const sel = getSelector(el);
+          if (seenSels.has(sel)) continue;
+          seenSels.add(sel);
+          const current_value = String((el as any).value || "").trim();
+          const req = isRequired(el, rawLabel);
+          const entry = { label: label || cleanLabel((el as any).placeholder || ""), type, selector: sel, current_value };
+          if (req) required.push(entry);
+          else optional.push(entry);
+        }
+
+        // ── native <select> ───────────────────────────────────────
+        const selects = Array.from(document.querySelectorAll("select"));
+        for (const el of selects) {
+          if (!isVisible(el)) continue;
+          if ((el as any).disabled) continue;
+          const rawLabel = getLabel(el);
+          const label = cleanLabel(rawLabel);
+          const sel = getSelector(el);
+          if (seenSels.has(sel)) continue;
+          seenSels.add(sel);
+          const opts = Array.from((el as HTMLSelectElement).options).map((o: any) => (o.label || o.text || "").trim()).filter(Boolean);
+          const current_value = (el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex]?.label?.trim() || "";
+          dropdowns.push({ label, selector: sel, options: opts.slice(0, 30), current_value, required: isRequired(el, rawLabel) });
+        }
+
+        // ── Quasar q-select / styled dropdowns ───────────────────
+        // Detect by: has q-field__label AND has q-select or role=listbox ancestor
+        const qSelects = Array.from(document.querySelectorAll('[class*="q-select"], [class*="q-field"][class*="select"]'));
+        for (const qSel of qSelects) {
+          if (!isVisible(qSel)) continue;
+          const rawLabel = getLabel(qSel.querySelector("[class*='q-field__native'], input") || qSel);
+          const label = cleanLabel(rawLabel || (qSel.querySelector("[class*='q-field__label']") as HTMLElement | null)?.textContent?.trim() || "");
+          if (!label) continue;
+          const nativeInput = qSel.querySelector("input") as HTMLInputElement | null;
+          const sel = nativeInput ? getSelector(nativeInput) : getSelector(qSel);
+          if (seenSels.has(sel)) continue;
+          seenSels.add(sel);
+          const current_value = (nativeInput?.value || (qSel as any).innerText || "").trim();
+          dropdowns.push({ label, selector: sel, options: [], current_value, required: isRequired(qSel, rawLabel) });
+        }
+
+        // ── checkboxes ────────────────────────────────────────────
+        const cbs = Array.from(document.querySelectorAll("input[type=checkbox]"));
+        for (const cb of cbs) {
+          if (!isVisible(cb) && !(cb as any).closest?.("[class*='terms'], [class*='agree'], [class*='policy']")) continue;
+          const rawLabel = getLabel(cb);
+          const label = cleanLabel(rawLabel);
+          const sel = getSelector(cb);
+          if (seenSels.has(sel)) continue;
+          seenSels.add(sel);
+          checkboxes.push({ label, selector: sel, checked: !!(cb as any).checked, required: isRequired(cb, rawLabel) });
+        }
+
+        return { required, optional, dropdowns, checkboxes, step_title, is_checkout_step, is_payment_step };
+      });
+    } catch (e) {
+      console.log(`[UNIVERSAL_SCAN] Error: ${e instanceof Error ? e.message : String(e)}`);
+      return { required: [], optional: [], dropdowns: [], checkboxes: [], step_title: "", is_checkout_step: false, is_payment_step: false };
+    }
+  }
+
+  /**
+   * universalFillKnownFields — fill ANY widget field by semantic label matching.
+   * Handles: standard inputs, Quasar selects, native selects, date fields, checkboxes.
+   * Returns list of filled field labels.
+   */
+  private async universalFillKnownFields(
+    ctx: any,
+    page: Page,
+    guestData: {
+      first_name?: string; last_name?: string; full_name?: string;
+      email?: string; phone?: string; message?: string;
+      egn?: string; birthdate?: string; gender?: string;
+      country?: string; doc_type?: string; doc_number?: string;
+    }
+  ): Promise<string[]> {
+    const filled: string[] = [];
+
+    // Build semantic mapping: label keyword → value
+    const NAME_PARTS = (guestData.full_name || "").trim().split(/\s+/);
+    const FIRST = guestData.first_name || NAME_PARTS[0] || "";
+    const LAST  = guestData.last_name  || NAME_PARTS.slice(1).join(" ") || NAME_PARTS[0] || "";
+
+    const FIELD_MAP: Array<{ patterns: RegExp; value: string; is_select?: boolean }> = [
+      { patterns: /собствено\s*им|first\s*name|given\s*name|ime\b/i,    value: FIRST },
+      { patterns: /фамил|last\s*name|family\s*name|surname/i,           value: LAST  },
+      { patterns: /три\s*им|full\s*name|пълно\s*им/i,                   value: guestData.full_name || `${FIRST} ${LAST}`.trim() },
+      { patterns: /e.?mail|имейл|поща/i,                                 value: guestData.email || "" },
+      { patterns: /телефон|phone|tel\b|gsm|mobile|мобил/i,              value: guestData.phone || "" },
+      { patterns: /егн|egn|лична\s*карта.*номер|personal\s*id/i,        value: guestData.egn || "" },
+      { patterns: /дата.*ражд|birth.*date|date.*birth/i,                 value: guestData.birthdate || "" },
+      { patterns: /пол\b|sex\b|gender/i,                                 value: guestData.gender || "", is_select: true },
+      { patterns: /държав|country/i,                                     value: guestData.country || "", is_select: true },
+      { patterns: /тип.*документ|document.*type|doc.*type/i,            value: guestData.doc_type || "", is_select: true },
+      { patterns: /номер.*документ|document.*number|passport.*number/i, value: guestData.doc_number || "" },
+      { patterns: /забел|бележк|note|message|коментар|comment/i,        value: guestData.message || "" },
+    ];
+
+    // Normalize gender value for common widget options
+    const normalizeGender = (g: string): string => {
+      const gl = g.toLowerCase().trim();
+      if (/^(м|m|male|мъж|мъжки|man)$/.test(gl)) return "М";
+      if (/^(ж|f|female|жена|женски|woman)$/.test(gl)) return "Ж";
+      return g;
+    };
+
+    // ── Fill a Quasar or styled dropdown by clicking and picking option ──
+    const fillStyledDropdown = async (ctxEl: any, selector: string, value: string, labelHint: string): Promise<boolean> => {
+      if (!value) return false;
+      try {
+        // Find the q-field wrapper that contains this input
+        const qWrapper = await ctxEl.locator(selector).first().evaluate((el: any) => {
+          let p: Element | null = el;
+          for (let i = 0; i < 6; i++) {
+            if (!p) break;
+            const cls = String((p as any).className || "");
+            if (cls.includes("q-field") || cls.includes("q-select")) {
+              return `[class*="q-field"]:has(${el.id ? "#" + el.id : el.tagName.toLowerCase()})`;
+            }
+            p = p.parentElement;
+          }
+          return null;
+        }).catch(() => null);
+
+        // Click the field or its input
+        const clickTarget = ctxEl.locator(selector).first();
+        if (await clickTarget.isVisible().catch(() => false)) {
+          await clickTarget.click({ timeout: 1500 }).catch(() => {});
+        } else if (qWrapper) {
+          await ctxEl.locator(qWrapper).first().click({ timeout: 1500 }).catch(() => {});
+        }
+        await page.waitForTimeout(500);
+
+        // Look for dropdown options on main page or in iframe
+        const normVal = value.toLowerCase().trim();
+        // Search contexts: main page DOM first (Quasar teleports menus), then iframe
+        const searchCtxs = [page, ctxEl];
+        for (const sc of searchCtxs) {
+          const optSels = [
+            `[role="option"]:has-text("${value}")`,
+            `.q-item:has-text("${value}")`,
+            `li[class*="option"]:has-text("${value}")`,
+            `li:has-text("${value}")`,
+          ];
+          for (const os of optSels) {
+            const opt = sc.locator(os).first();
+            if (await opt.isVisible().catch(() => false)) {
+              await opt.click({ timeout: 1500 }).catch(() => {});
+              console.log(`[UNIVERSAL_FILL][DROPDOWN] "${labelHint}" = "${value}"`);
+              await page.waitForTimeout(300);
+              return true;
+            }
+          }
+          // Partial / normalized match
+          const allOpts = await sc.locator('[role="option"], .q-item').all().catch(() => []);
+          for (const o of allOpts) {
+            const t = (await o.textContent().catch(() => "")).trim().toLowerCase();
+            if (!t) continue;
+            if (t.includes(normVal) || normVal.includes(t) || t === normVal) {
+              await o.click({ timeout: 1500 }).catch(() => {});
+              console.log(`[UNIVERSAL_FILL][DROPDOWN][PARTIAL] "${labelHint}" = "${t}" (wanted "${value}")`);
+              await page.waitForTimeout(300);
+              return true;
+            }
+          }
+        }
+        // Close dropdown if nothing matched
+        await page.keyboard.press("Escape").catch(() => {});
+        return false;
+      } catch { return false; }
+    };
+
+    // ── Fill a standard text/email/tel input ──
+    const fillTextInput = async (ctxEl: any, selector: string, value: string, labelHint: string): Promise<boolean> => {
+      if (!value) return false;
+      try {
+        const loc = ctxEl.locator(selector).first();
+        if (await loc.count().catch(() => 0) === 0) return false;
+        if (!(await loc.isVisible().catch(() => false))) return false;
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.click({ clickCount: 3, timeout: 1500 }).catch(() => {});
+        await loc.fill(value, { timeout: 1500 }).catch(() => {});
+        // Trigger React/Vue reactivity
+        await ctxEl.evaluate(({ sel, val }: { sel: string; val: string }) => {
+          const el = document.querySelector(sel) as HTMLInputElement | null;
+          if (!el) return;
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(el, val);
+          el.dispatchEvent(new Event("input",  { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+        }, { sel: selector, val: value }).catch(() => {});
+        await page.waitForTimeout(80);
+        console.log(`[UNIVERSAL_FILL][TEXT] "${labelHint}" = "${value.slice(0, 30)}"`);
+        return true;
+      } catch { return false; }
+    };
+
+    // ── Scan and fill ──
+    const scan = await this.universalScanWidgetDOM(ctx);
+
+    // Fill text/date/email/tel inputs
+    for (const field of [...scan.required, ...scan.optional]) {
+      for (const mapping of FIELD_MAP) {
+        if (mapping.is_select) continue; // handled separately
+        if (!mapping.patterns.test(field.label)) continue;
+        if (!mapping.value) continue;
+        if (field.current_value) continue; // already filled
+        const ok = await fillTextInput(ctx, field.selector, mapping.value, field.label);
+        if (ok) { filled.push(field.label); break; }
+      }
+    }
+
+    // Fill dropdowns (native + Quasar)
+    for (const dd of scan.dropdowns) {
+      for (const mapping of FIELD_MAP) {
+        if (!mapping.patterns.test(dd.label)) continue;
+        if (!mapping.value) continue;
+        if (dd.current_value && dd.current_value !== "-") continue; // already selected
+        const val = /пол|gender|sex/i.test(dd.label) ? normalizeGender(mapping.value) : mapping.value;
+        // Try native select first
+        try {
+          const natSel = ctx.locator(`select`).filter({ has: ctx.locator(`option`) }).first();
+          const natCount = await ctx.locator(`select[name]`).count().catch(() => 0);
+          if (natCount > 0) {
+            const selOk = await ctx.locator(`select`).evaluateAll(
+              (selects: HTMLSelectElement[], { label, val }: { label: string; val: string }) => {
+                for (const s of selects) {
+                  if (!s.offsetParent) continue;
+                  // Find closest label text
+                  const lbl = s.previousElementSibling?.textContent?.trim() || s.getAttribute("aria-label") || "";
+                  if (!label || lbl.toLowerCase().includes(label.toLowerCase().replace(/\*/g, "").trim())) {
+                    for (const o of Array.from(s.options)) {
+                      if (o.label.toLowerCase().includes(val.toLowerCase()) || val.toLowerCase().includes(o.label.toLowerCase())) {
+                        s.value = o.value;
+                        s.dispatchEvent(new Event("change", { bubbles: true }));
+                        return true;
+                      }
+                    }
+                  }
+                }
+                return false;
+              },
+              { label: dd.label, val }
+            ).catch(() => false);
+            if (selOk) { filled.push(dd.label); continue; }
+          }
+        } catch {}
+        // Styled/Quasar dropdown
+        const ok = await fillStyledDropdown(ctx, dd.selector, val, dd.label);
+        if (ok) { filled.push(dd.label); break; }
+      }
+    }
+
+    // Accept unchecked required checkboxes (terms/policy)
+    for (const cb of scan.checkboxes) {
+      if (!cb.checked && /умови|terms|policy|политик|съглас|agree/i.test(cb.label || "")) {
+        try {
+          await ctx.locator(cb.selector).first().check({ timeout: 1500, force: true }).catch(() => {});
+          console.log(`[UNIVERSAL_FILL][CHECKBOX] Checked: "${cb.label}"`);
+          filled.push(cb.label || "terms");
+        } catch {}
+      }
+    }
+
+    if (filled.length > 0) {
+      console.log(`[UNIVERSAL_FILL] Filled ${filled.length} fields: ${filled.join(" | ")}`);
+    } else {
+      console.log(`[UNIVERSAL_FILL] No fields matched — scan found req=${scan.required.length} opt=${scan.optional.length} dd=${scan.dropdowns.length}`);
+    }
+    return filled;
+  }
+
+  /**
+   * universalGetMissingRequired — returns human-readable list of unfilled required fields
+   * from ANY widget, using DOM scan. Replaces inferCurrentBookingStepNeeds for the
+   * missing_required array returned to NEO.
+   */
+  private async universalGetMissingRequired(page: Page): Promise<{
+    missing_required: string[];
+    current_step: string;
+    payment_required: boolean;
+    can_continue: boolean;
+    is_checkout_step: boolean;
+  }> {
+    try {
+      const bf = await this.findBookingFrameWithContent(page, 2000).catch(() => this.findBookingFrame(page));
+      const ctx = (bf as any) || page;
+
+      const scan = await this.universalScanWidgetDOM(ctx);
+
+      // Filter out already filled fields
+      const missing = scan.required
+        .filter(f => !f.current_value || f.current_value.trim() === "")
+        .map(f => cleanFieldLabel(f.label))
+        .filter(Boolean);
+
+      // Also include required dropdowns that haven't been selected
+      const missingDropdowns = scan.dropdowns
+        .filter(dd => dd.required && (!dd.current_value || dd.current_value === "-"))
+        .map(dd => cleanFieldLabel(dd.label))
+        .filter(Boolean);
+
+      // Required unchecked checkboxes (terms)
+      const missingCbs = scan.checkboxes
+        .filter(cb => cb.required && !cb.checked && /умови|terms|policy|политик|съглас/i.test(cb.label))
+        .map(cb => cleanFieldLabel(cb.label))
+        .filter(Boolean);
+
+      const allMissing = [...new Set([...missing, ...missingDropdowns, ...missingCbs])]
+        .map(s => cleanFieldLabel(s))
+        .filter(s => s.length > 1)
+        .filter(s => !/^(бонус|bonus|прод|next|back|назад|напред|close|bg\b|en\b|arrow|grid|event\b|sell\b)/i.test(s))
+        .slice(0, 15);
+
+      console.log(`[UNIVERSAL_SCAN] step="${scan.step_title}" checkout=${scan.is_checkout_step} payment=${scan.is_payment_step} missing=${allMissing.join(" | ") || "none"}`);
+
+      return {
+        missing_required: allMissing,
+        current_step: scan.is_payment_step ? "payment" : scan.is_checkout_step ? "checkout" : "reserve",
+        payment_required: scan.is_payment_step,
+        can_continue: allMissing.length === 0,
+        is_checkout_step: scan.is_checkout_step,
+      };
+    } catch (e) {
+      console.log(`[UNIVERSAL_SCAN][ERROR] ${e instanceof Error ? e.message : String(e)}`);
+      // Fallback to existing method
+      const fb = await this.inferCurrentBookingStepNeeds(page);
+      return { ...fb, is_checkout_step: false };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // END UNIVERSAL WIDGET ENGINE
+  // ═══════════════════════════════════════════════════════════════════
+
   // ─────────────────────────────────────────────────────────
   // makeReservation — full hotel booking workflow
   // Phase "check": fills dates, gets screenshot with prices
   // Phase "reserve": fills guest details, stops before payment, returns URL
   // ─────────────────────────────────────────────────────────
 
-  private async clockPmsNavigateToCheckout(page: Page, guests: string): Promise<boolean> {
-    const bf = page.frames().find(f => {
-      const n = String(f.name?.() || "");
-      return n.includes("clock") || n.includes("wbe") || f.url().includes("clock-pms");
-    });
-    if (!bf) { console.log("[CLOCK_PMS] No booking iframe found"); return false; }
-    const guestNum = parseInt(guests || "2") || 2;
-    console.log(`[CLOCK_PMS] Starting tariff/checkout navigator guests=${guestNum}`);
-    for (let step = 0; step < 8; step++) {
-      await page.waitForTimeout(600);
-      const frameText = (await bf.locator("body").innerText().catch(() => "")).toLowerCase();
-      // Reached checkout/contact form
-      if (/данни\s*за\s*контакт|contact|собствено\s*име|first.?name|e-?mail|завършване/i.test(frameText)) {
-        console.log("[CLOCK_PMS] Reached checkout step ✓"); return true;
-      }
-      // Tariff step: set adults, click ИЗБЕРИ
-      if (/тариф|standard.?rate|bb|rate|план|нощувка\s*с/i.test(frameText)) {
-        console.log("[CLOCK_PMS] On tariff step — setting adults and clicking ИЗБЕРИ");
+  // ─────────────────────────────────────────────────────────
+  // Universal booking frame finder — works for ANY iframe-based widget
+  // ─────────────────────────────────────────────────────────
+  private findBookingFrame(page: Page) {
+    // Priority: known booking widget patterns in name or URL
+    const knownPatterns = [
+      "clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier",
+      "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "hotel",
+      "checkout", "availability", "widget",
+    ];
+    const analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick|trustpilot/i;
+    const frames = page.frames().filter(f => f !== page.mainFrame());
+    // First pass: known booking patterns
+    for (const f of frames) {
+      const n = String(f.name?.() || "").toLowerCase();
+      const u = f.url().toLowerCase();
+      if (analyticsPattern.test(u)) continue; // skip analytics/maps
+      const hay = n + " " + u;
+      if (knownPatterns.some(p => hay.includes(p))) return f;
+    }
+    // Second pass: any non-analytics/non-maps iframe
+    for (const f of frames) {
+      const u = f.url().toLowerCase();
+      if (analyticsPattern.test(u)) continue;
+      if (u === "" || u === "about:blank") continue;
+      return f;
+    }
+    return undefined;
+  }
+
+  // findBookingFrame with retry — waits up to maxWaitMs for a frame with actual content
+  private async findBookingFrameWithContent(page: Page, maxWaitMs = 6000): Promise<any> {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      const frames = page.frames().filter(f => f !== page.mainFrame());
+      const analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick|trustpilot/i;
+      const knownPatterns = ["clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier", "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "hotel", "checkout", "availability", "widget"];
+      // Look for a frame that: matches known patterns AND has text content
+      for (const f of frames) {
+        const n = String(f.name?.() || "").toLowerCase();
+        const u = f.url().toLowerCase();
+        if (analyticsPattern.test(u)) continue;
+        const hay = n + " " + u;
+        if (!knownPatterns.some(p => hay.includes(p))) continue;
         try {
-          const selLoc = bf.locator("select").first();
-          if (await selLoc.count().catch(() => 0) > 0) {
-            await selLoc.selectOption(String(guestNum)).catch(() => {});
-            await page.waitForTimeout(300);
-          } else {
-            const dropdownLoc = bf.locator('[class*="select"], [class*="dropdown"]').first();
-            if (await dropdownLoc.isVisible().catch(() => false)) {
-              await dropdownLoc.click().catch(() => {});
-              await page.waitForTimeout(200);
-              await bf.locator(`li:has-text("${guestNum}"), [role="option"]:has-text("${guestNum}")`).first().click().catch(() => {});
-            }
+          const text = await f.locator("body").innerText({ timeout: 1000 }).catch(() => "");
+          if (text.trim().length > 30) {
+            console.log(`[BOOKING_NAV] Found loaded booking frame: name="${n || u.slice(0,40)}" len=${text.length}`);
+            return f;
           }
         } catch {}
-        const chooseBtns = await bf.locator("button").all().catch(() => []);
-        for (const btn of chooseBtns) {
-          const t = (await btn.innerText().catch(() => "")).trim().toLowerCase();
-          if (/избери|select|book|резерв|добав|add/i.test(t) && t.length <= 30) {
-            if (await btn.isVisible().catch(() => false)) {
+      }
+      await page.waitForTimeout(300);
+    }
+    // Fallback: return any non-analytics frame even if empty
+    const fb = this.findBookingFrame(page);
+    if (fb) console.log("[BOOKING_NAV] Returning frame without content (timeout)");
+    return fb;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Universal checkout step detector
+  // ─────────────────────────────────────────────────────────
+  private async isAtCheckoutStep(frameOrPage: any): Promise<boolean> {
+    try {
+      const text = (await frameOrPage.locator("body").innerText().catch(() => "")).toLowerCase();
+
+      // IMPORTANT: Clock PMS shows "Завършване" tab on EVERY step — do NOT match it alone.
+      // We require STRONG signals: actual input fields for guest data present.
+
+      // 1. Strong text signal: guest data section heading (NOT just nav tab)
+      const hasStrongText = (
+        /данни\s*за\s*контакт/i.test(text) ||          // БГ section heading
+        /guest\s*details|your\s*details|personal\s*details|contact\s*details/i.test(text) ||
+        /собствено\s*име.*фамил/i.test(text) ||         // both first+last name labels together
+        /first.?name.*last.?name/i.test(text)
+      );
+      if (hasStrongText) return true;
+
+      // 2. Actual input fields present for guest data (most reliable)
+      const hasEmailInput = await frameOrPage.locator(
+        "input[type='email'], input[placeholder*='mail'], input[placeholder*='Mail'], input[name*='email'], input[id*='email']"
+      ).count().catch(() => 0) > 0;
+
+      const hasNameInput = await frameOrPage.locator(
+        "input[placeholder*='Собствено'], input[placeholder*='Фамил'], input[placeholder*='First'], input[placeholder*='Last'], input[name*='first'], input[name*='last'], input[id*='first'], input[id*='last']"
+      ).count().catch(() => 0) > 0;
+
+      if (hasEmailInput && hasNameInput) return true;
+      if (hasEmailInput) {
+        // email input alone is a strong signal IF we also have the step indicator active
+        const isOnLastStep = /завършване.*active|active.*завършване/i.test(text) ||
+          await frameOrPage.locator('[class*="active"]:has-text("Завършване"), [class*="current"]:has-text("Завършване")').count().catch(() => 0) > 0;
+        if (isOnLastStep) return true;
+      }
+
+      return false;
+    } catch { return false; }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Universal booking widget navigator (replaces clockPmsNavigateToCheckout)
+  // Works for: Clock PMS, Beds24, Cloudbeds, Mews, SabeeApp, LittleHotelier,
+  //            HotelRunner, Bookero, Amelia, Quendoo, and generic multi-step widgets
+  // ─────────────────────────────────────────────────────────
+  private async navigateBookingWidgetToCheckout(page: Page, guests: string): Promise<boolean> {
+    // Use async frame finder — waits up to 8s for a frame with actual content
+    const bf = await this.findBookingFrameWithContent(page, 4000);
+    if (!bf) {
+      if (await this.isAtCheckoutStep(page)) return true;
+      console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
+    }
+    let ctx: any = bf || page;
+    const guestNum = parseInt(guests || "2") || 2;
+    console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
+
+    let _prevFrameText = "";
+    let _sameTextCount = 0;
+
+    for (let step = 0; step < 14; step++) {
+      await page.waitForTimeout(500);
+      // Re-find frame each step in case it changed (e.g. new iframe opened)
+      if (bf) {
+        const freshFrame = await this.findBookingFrameWithContent(page, 800);
+        if (freshFrame) ctx = freshFrame;
+      }
+      const frameText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
+      console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 120).replace(/\s+/g, " ")}"`);
+      if (frameText.trim().length < 20) {
+        console.log("[BOOKING_NAV] iframe content empty — waiting");
+        await page.waitForTimeout(800); continue;
+      }
+
+      // ── Infinite loop detection ──────────────────────────
+      if (frameText === _prevFrameText) {
+        _sameTextCount++;
+        if (_sameTextCount >= 2) {
+          console.log(`[BOOKING_NAV] Frame text unchanged for ${_sameTextCount} steps — trying modal/overlay detection`);
+
+          // Check MAIN PAGE for Clock PMS checkout overlay
+          const _mainPageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainPageText);
+
+          if (_hasOverlay) {
+            console.log("[BOOKING_NAV] Clock PMS login overlay detected — clicking Резервирам за някой друг toggle");
+
+            // Try ALL possible toggle selectors — Quasar toggle needs inner element clicked
+            const _toggleSelectors = [
+              '.q-toggle__thumb',                              // Quasar thumb (most reliable)
+              '.q-toggle__inner',                              // Quasar inner track
+              '[class*="q-toggle__track"]',
+              '[class*="toggle__thumb"]',
+              '[class*="toggle__inner"]',
+              'label:has-text("Резервирам за някой друг")',   // Label text
+              'label:has-text("Резервирам")',
+              '[class*="q-toggle"]',                           // The whole toggle component
+            ];
+
+            let _didToggle = false;
+            for (const _ts of _toggleSelectors) {
+              try {
+                const _tel = page.locator(_ts).first();
+                if (await _tel.count().catch(() => 0) === 0) continue;
+                if (!(await _tel.isVisible({ timeout: 500 }).catch(() => false))) continue;
+                await _tel.scrollIntoViewIfNeeded().catch(() => {});
+                await _tel.click({ timeout: 1500, force: true }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked toggle: "${_ts}"`);
+                _didToggle = true;
+                break;
+              } catch {}
+            }
+
+            if (_didToggle) {
+              // Wait for checkout form to appear on main page
+              for (let _cw = 0; _cw < 6; _cw++) {
+                await page.waitForTimeout(600);
+                if (await this.isAtCheckoutStep(page)) {
+                  console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
+                  return true;
+                }
+                if (await this.isAtCheckoutStep(ctx)) {
+                  console.log("[BOOKING_NAV] Checkout appeared in iframe after toggle ✓");
+                  return true;
+                }
+                // Check if iframe content changed (sometimes checkout loads in iframe)
+                const _newFt = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
+                if (_newFt !== frameText && _newFt.length > 100) {
+                  console.log("[BOOKING_NAV] iframe changed after toggle — continuing");
+                  _sameTextCount = 0; _prevFrameText = "";
+                  break;
+                }
+              }
+              _sameTextCount = 0; _prevFrameText = "";
+              continue;
+            }
+          }
+
+          // Check for Quasar dialog/overlay even without specific text
+          const modalVisible = await page.locator(
+            '.q-dialog__backdrop, .q-overlay, [class*="q-dialog"]'
+          ).first().isVisible().catch(() => false);
+          if (modalVisible) {
+            console.log("[BOOKING_NAV] Quasar dialog detected — checking for any action buttons");
+            const _dlgBtns = await page.locator('.q-dialog button, [class*="q-dialog"] button').all().catch(() => []);
+            for (const _db of _dlgBtns) {
+              const _dt = (await _db.innerText().catch(() => "")).trim();
+              if (!_dt || isBadClickableLabel(_dt)) continue;
+              if (await _db.isVisible().catch(() => false)) {
+                await _db.click({ timeout: 1500 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked dialog button: "${_dt}"`);
+                _sameTextCount = 0; await page.waitForTimeout(800);
+                break;
+              }
+            }
+          }
+
+          // Re-check checkout
+          if (await this.isAtCheckoutStep(page) || await this.isAtCheckoutStep(ctx)) {
+            console.log("[BOOKING_NAV] Checkout reached after modal handling ✓"); return true;
+          }
+
+          if (_sameTextCount >= 4) {
+            console.log("[BOOKING_NAV] Stuck — same frame text 4+ times, stopping");
+            break;
+          }
+          continue;
+        }
+      } else {
+        _sameTextCount = 0;
+      }
+      _prevFrameText = frameText;
+
+      // ── Already at checkout ──────────────────────────────
+      if (await this.isAtCheckoutStep(ctx)) {
+        console.log("[BOOKING_NAV] Reached checkout step ✓"); return true;
+      }
+
+      // ── Room/accommodation selection step ────────────────
+      // NOTE: room card buttons may contain "тариф" (e.g. "ПОКАЖИ ТАРИФИТЕ")
+      // so we detect ACTUAL tariff content by price-per-night patterns or rate plan names
+      const hasTariffContent = (
+        /standard.?rate|нощувка\s*с|meal\s*plan|breakfast\s*included|закуска\s*включ/i.test(frameText) ||
+        /\d+[\.,]\d+\s*(лв|bgn|eur|€|\$)\s*[\/на]\s*нощ/i.test(frameText)
+      );
+      const isRoomStep = (
+        /апартамент|единична|двойна|студио|suite|room|стая|accommodation|камер/i.test(frameText) &&
+        !hasTariffContent
+      );
+      if (isRoomStep) {
+        console.log("[BOOKING_NAV] On room selection step — finding available room action button");
+        // Try cards first (Clock PMS, Beds24, Cloudbeds style)
+        const cardSelectors = [
+          '[class*="card"]:not([class*="disabled"])',
+          '[class*="room-item"]', '[class*="room_item"]',
+          '[class*="rate-item"]', '[class*="accommodation"]',
+          'article', 'li[class*="room"]',
+        ];
+        let roomClicked = false;
+        for (const cardSel of cardSelectors) {
+          const cards = await ctx.locator(cardSel).all().catch(() => []);
+          for (const card of cards) {
+            const cardText = (await card.innerText().catch(() => "")).toLowerCase();
+            if (!cardText || cardText.trim().length < 5) continue;
+            if (/не\s*е\s*налично|not\s*available|unavailable|sold.?out|no\s*rooms/i.test(cardText)) continue;
+            const cardBtns = await card.locator("button, [role='button'], a[class*='btn'], a[class*='button']").all().catch(() => []);
+            for (const btn of cardBtns) {
+              const btnText = (await btn.innerText().catch(() => "")).trim();
+              if (!btnText || isBadClickableLabel(btnText)) continue;
+              if (!(await btn.isVisible().catch(() => false))) continue;
               await btn.scrollIntoViewIfNeeded().catch(() => {});
               await btn.click({ timeout: 2000 }).catch(() => {});
-              console.log(`[CLOCK_PMS] Clicked tariff CTA: "${t}"`);
+              console.log(`[BOOKING_NAV] Clicked room action: "${btnText}"`);
+              roomClicked = true; break;
+            }
+            if (roomClicked) break;
+          }
+          if (roomClicked) break;
+        }
+        if (!roomClicked) {
+          // Fallback: any visible non-icon button in the context
+          const allBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+          for (const btn of allBtns) {
+            const t = (await btn.innerText().catch(() => "")).trim();
+            if (!t || isBadClickableLabel(t)) continue;
+            if (!(await btn.isVisible().catch(() => false))) continue;
+            await btn.scrollIntoViewIfNeeded().catch(() => {});
+            await btn.click({ timeout: 2000 }).catch(() => {});
+            console.log(`[BOOKING_NAV] Clicked fallback room button: "${t}"`);
+            roomClicked = true; break;
+          }
+        }
+        await page.waitForTimeout(900); continue;
+      }
+
+      // ── Tariff/rate selection step ───────────────────────
+      // Clock PMS specific flow (works for other widgets too):
+      //   1st ИЗБЕРИ click → opens guests/rooms dropdown IN iframe
+      //   Select guests value
+      //   2nd ИЗБЕРИ click → triggers main page overlay (login/guest toggle)
+      //   Click "Резервирам за някой друг" → checkout form appears on main page
+      const hasIzberiBtn = await ctx.locator(
+        'button:has-text("ИЗБЕРИ"), button:has-text("Избери"), [role="button"]:has-text("ИЗБЕРИ")'
+      ).count().catch(() => 0) > 0;
+      const isTariffStep = hasTariffContent || hasIzberiBtn ||
+        /standard.?rate|нощувка\s*с\s*закуска|meal\s*plan|rate\s*name|bb\s*plan|закуска\s*включ/i.test(frameText);
+      if (isTariffStep) {
+        console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent}`);
+
+        // ── Step A: Set guest count via select/dropdown/stepper ──
+        let _guestsSet = false;
+        // 1. Native <select>
+        const _selEl = ctx.locator("select").first();
+        if (await _selEl.count().catch(() => 0) > 0) {
+          await _selEl.selectOption(String(guestNum)).catch(async () => {
+            await _selEl.selectOption({ index: Math.min(guestNum - 1, 2) }).catch(() => {});
+          });
+          await page.waitForTimeout(300);
+          _guestsSet = true;
+          console.log(`[BOOKING_NAV] Set guests via <select> to ${guestNum}`);
+        }
+
+        // 2. Clock PMS Quasar dropdown — click to open, then pick value
+        if (!_guestsSet) {
+          const _qDropLabel = ctx.locator('[class*="q-field"], [class*="q-select"]').filter({ hasText: /Възрастни|Adults|Гости|Guests/i }).first();
+          const _qDropAny = ctx.locator('[class*="q-field"], [class*="q-select"]').first();
+          const _dropTarget = (await _qDropLabel.count().catch(() => 0) > 0) ? _qDropLabel : _qDropAny;
+          if (await _dropTarget.isVisible().catch(() => false)) {
+            await _dropTarget.click({ timeout: 1500 }).catch(() => {});
+            await page.waitForTimeout(400);
+            // Pick the right option from the opened list
+            const _optSel = `[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`;
+            const _opt = page.locator(_optSel).first(); // options appear on main page DOM
+            const _optInCtx = ctx.locator(_optSel).first();
+            if (await _opt.isVisible().catch(() => false)) {
+              await _opt.click({ timeout: 1500 }).catch(() => {});
+              _guestsSet = true;
+              console.log(`[BOOKING_NAV] Set guests via Quasar dropdown (main page) to ${guestNum}`);
+            } else if (await _optInCtx.isVisible().catch(() => false)) {
+              await _optInCtx.click({ timeout: 1500 }).catch(() => {});
+              _guestsSet = true;
+              console.log(`[BOOKING_NAV] Set guests via Quasar dropdown (iframe) to ${guestNum}`);
+            }
+            await page.waitForTimeout(300);
+          }
+        }
+
+        // 3. Stepper +/- (Mews, Beds24 style)
+        if (!_guestsSet) {
+          const _plusBtn = ctx.locator('[class*="plus"], [class*="increment"], button:has-text("+"), [aria-label*="add"], [aria-label*="increase"]').first();
+          if (await _plusBtn.isVisible().catch(() => false)) {
+            const _curVal = parseInt(await ctx.locator('input[type="number"]').first().inputValue().catch(() => "1")) || 1;
+            for (let _p = _curVal; _p < guestNum; _p++) {
+              await _plusBtn.click({ timeout: 1000 }).catch(() => {});
+              await page.waitForTimeout(150);
+            }
+            _guestsSet = true;
+          }
+        }
+
+        // ── Step B: Click ИЗБЕРИ / rate CTA ──
+        await page.waitForTimeout(200);
+        let _izberiClicked = false;
+        const _ctaBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+        for (const _btn of _ctaBtns) {
+          const _t = (await _btn.innerText().catch(() => "")).trim();
+          if (!_t) continue;
+          if (/избери|select|book|резерв|добав|add|choose|reserve/i.test(_t) && _t.length <= 50) {
+            if (await _btn.isVisible().catch(() => false)) {
+              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+              await _btn.click({ timeout: 2000 }).catch(() => {});
+              console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
+              _izberiClicked = true;
               break;
             }
           }
         }
+
+        // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
+        await page.waitForTimeout(1200);
+
+        // Check main page for Clock PMS checkout overlay
+        for (let _od = 0; _od < 5; _od++) {
+          await page.waitForTimeout(400);
+
+          // Did checkout form appear? (on main page)
+          if (await this.isAtCheckoutStep(page)) {
+            console.log("[BOOKING_NAV] Checkout form appeared on main page ✓");
+            return true;
+          }
+          if (await this.isAtCheckoutStep(ctx)) {
+            console.log("[BOOKING_NAV] Checkout form appeared in iframe ✓");
+            return true;
+          }
+
+          // Check for Clock PMS overlay with login + guest toggle
+          const _mainText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainText);
+
+          if (_hasOverlay) {
+            console.log(`[BOOKING_NAV] Clock PMS overlay detected on main page (attempt ${_od + 1})`);
+
+            // Toggle "Резервирам за някой друг. Няма да отсядам в хотела."
+            // Quasar q-toggle: MUST click .q-toggle__thumb or .q-toggle__inner for the toggle to work
+            const _toggleSelectors = [
+              '.q-toggle__thumb',                            // Most reliable for Quasar
+              '.q-toggle__inner',
+              '[class*="q-toggle__track"]',
+              '[class*="toggle__thumb"]',
+              '[class*="toggle__inner"]',
+              'label:has-text("Резервирам за някой друг")',
+              '[class*="q-toggle"]:has-text("Резервирам")',
+              '[class*="toggle"]:has-text("Резервирам")',
+              'label:has-text("Резервирам")',
+            ];
+            let _toggled = false;
+            for (const _tSel of _toggleSelectors) {
+              try {
+                const _tEl = page.locator(_tSel).first();
+                if (await _tEl.count().catch(() => 0) === 0) continue;
+                if (!(await _tEl.isVisible({ timeout: 600 }).catch(() => false))) continue;
+                await _tEl.scrollIntoViewIfNeeded().catch(() => {});
+                await _tEl.click({ timeout: 1500, force: true }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
+                _toggled = true;
+                break;
+              } catch {}
+            }
+
+            if (_toggled) {
+              _sameTextCount = 0; _prevFrameText = "";
+              // Wait up to 4s for checkout to appear
+              for (let _cw2 = 0; _cw2 < 5; _cw2++) {
+                await page.waitForTimeout(500);
+                if (await this.isAtCheckoutStep(page)) {
+                  console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
+                  return true;
+                }
+                if (await this.isAtCheckoutStep(ctx)) {
+                  console.log("[BOOKING_NAV] Checkout appeared in iframe after toggle ✓");
+                  return true;
+                }
+              }
+              // Toggle was clicked but checkout not detected yet — continue loop
+              break;
+            }
+            break; // no toggle found, continue loop
+          }
+
+          // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
+          // This happens when: first ИЗБЕРИ opens a select/dropdown for Възрастни
+          const _openDropdown = await ctx.locator(
+            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
+          ).first().isVisible().catch(() => false);
+          const _openDropdownPage = await page.locator(
+            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
+          ).first().isVisible().catch(() => false);
+
+          if (_openDropdown || _openDropdownPage) {
+            console.log("[BOOKING_NAV] Dropdown/listbox is open — selecting guest count");
+            const _listCtx = _openDropdownPage ? page : ctx;
+            const _optEl = _listCtx.locator(`[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`).first();
+            if (await _optEl.isVisible().catch(() => false)) {
+              await _optEl.click({ timeout: 1500 }).catch(() => {});
+              console.log(`[BOOKING_NAV] Selected ${guestNum} from open dropdown`);
+              await page.waitForTimeout(400);
+              _sameTextCount = 0; _prevFrameText = "";
+            }
+            break;
+          }
+        }
         continue;
       }
-      // Login prompt — toggle guest booking
-      if (/вход\s*с|login|sign.?in|google|имейл.*влез/i.test(frameText)) {
-        const lbl = bf.locator("label").filter({ hasText: /резервирам\s*за\s*някой\s*друг|book\s*for/i }).first();
-        if (await lbl.isVisible().catch(() => false)) { await lbl.click().catch(() => {}); await page.waitForTimeout(400); continue; }
+
+      // ── Login/auth prompt — check BOTH iframe AND main page ────
+      const _mainPageForLogin = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const _loginInFrame = /вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account/i.test(frameText);
+      const _loginOnPage = /вход\s*с|login|sign.?in|google|имейл.*влез|резервирам за някой/i.test(_mainPageForLogin);
+      if (_loginInFrame || _loginOnPage) {
+        console.log(`[BOOKING_NAV] Login/auth prompt detected inFrame=${_loginInFrame} onPage=${_loginOnPage}`);
+        // Try "Резервирам за някой друг" on MAIN page (Clock PMS)
+        const _guestToggleSelectors = [
+          'label:has-text("Резервирам за някой друг")',
+          '[class*="q-toggle"]:has-text("Резервирам")',
+          'label:has-text("Резервирам")',
+        ];
+        let _handled = false;
+        for (const _s of _guestToggleSelectors) {
+          const _el = page.locator(_s).first();
+          if (await _el.isVisible().catch(() => false)) {
+            await _el.click().catch(() => {});
+            console.log(`[BOOKING_NAV] Clicked guest toggle on main page: "${_s}"`);
+            _handled = true;
+            _sameTextCount = 0; _prevFrameText = "";
+            await page.waitForTimeout(800);
+            if (await this.isAtCheckoutStep(page)) {
+              console.log("[BOOKING_NAV] Checkout appeared after login bypass ✓"); return true;
+            }
+            break;
+          }
+        }
+        if (!_handled) {
+          // Try in iframe
+          const _ctxLbl = ctx.locator("label, button").filter({ hasText: /резервирам|guest|без регистрация/i }).first();
+          if (await _ctxLbl.isVisible().catch(() => false)) {
+            await _ctxLbl.click().catch(() => {});
+            _sameTextCount = 0; _prevFrameText = "";
+            await page.waitForTimeout(600);
+          }
+        }
+        continue;
       }
-      // Generic forward
-      const fwdBtns = await bf.locator("button").all().catch(() => []);
-      let clicked = false;
-      for (const btn of fwdBtns) {
-        const t = (await btn.innerText().catch(() => "")).trim();
-        if (/продълж|напред|next|continue/i.test(t) && t.length <= 30 && await btn.isVisible().catch(() => false)) {
+
+      // ── Generic forward navigation ───────────────────────
+      const fwdSelectors = [
+        'button:has-text("Продължи")', 'button:has-text("Напред")',
+        'button:has-text("Next")', 'button:has-text("Continue")',
+        'button:has-text("Proceed")', '[class*="next-step"]',
+        'button[class*="next"]', 'a[class*="next"]',
+      ];
+      let fwdClicked = false;
+      for (const sel of fwdSelectors) {
+        try {
+          const btn = ctx.locator(sel).first();
+          if (await btn.count().catch(() => 0) === 0) continue;
+          if (!(await btn.isVisible().catch(() => false))) continue;
           await btn.click({ timeout: 1500 }).catch(() => {});
-          console.log(`[CLOCK_PMS] Forwarded with: "${t}"`); clicked = true; break;
+          console.log(`[BOOKING_NAV] Forwarded with: "${sel}"`);
+          fwdClicked = true; break;
+        } catch {}
+      }
+      if (!fwdClicked) {
+        // Catch-all: try any visible non-icon button in the iframe
+        console.log(`[BOOKING_NAV] No named forward button at step=${step} — trying any action button`);
+        const anyBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+        for (const btn of anyBtns) {
+          const t = (await btn.innerText().catch(() => "")).trim();
+          if (!t || isBadClickableLabel(t)) continue;
+          if (!(await btn.isVisible().catch(() => false))) continue;
+          await btn.scrollIntoViewIfNeeded().catch(() => {});
+          await btn.click({ timeout: 1500 }).catch(() => {});
+          console.log(`[BOOKING_NAV] Catch-all clicked: "${t}"`);
+          fwdClicked = true; break;
+        }
+        if (!fwdClicked) {
+          console.log(`[BOOKING_NAV] No clickable button at step=${step} — stopping`);
+          break;
         }
       }
-      if (!clicked) break;
     }
-    return false;
+    // Final check
+    return await this.isAtCheckoutStep(ctx);
   }
 
   async makeReservation(req: MakeReservationRequest): Promise<{
@@ -4026,11 +5101,110 @@ rooms: rooms,
           adults: guests,
           rooms: rooms,
           room_type: req.room_type || "",
+          // Bulgarian Clock PMS specific
+          egn: req.guest_egn || "",
+          birthdate: req.guest_birthdate || "",
+          gender: req.guest_gender || "",
+          country: req.guest_country || "",
+          doc_type: req.guest_doc_type || "",
+          doc_number: req.guest_doc_number || "",
         };
 
         const beforeUrl = page.url();
         console.log(`[RESERVATION][RESERVE] staying on current booking step url=${beforeUrl}`);
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(400);
+
+        // Early exit: if Clock PMS iframe is already at checkout, skip ALL room selection
+        // Wait briefly for iframe content before checking checkout state
+        const _earlyBookingFrame = await this.findBookingFrameWithContent(page, 2000);
+        let _alreadyAtCheckoutEarly = false;
+        if (_earlyBookingFrame) {
+          if (await this.isAtCheckoutStep(_earlyBookingFrame)) {
+            _alreadyAtCheckoutEarly = true;
+            console.log("[RESERVATION][RESERVE] iframe already at checkout — skipping room selection");
+          }
+        }
+        if (_alreadyAtCheckoutEarly) {
+          // Fill checkout form directly if we have guest data
+          const _hasGuestEarly = !!String(req.guest_name || "").trim() && !!String(req.guest_email || "").trim();
+          if (_hasGuestEarly && _earlyBookingFrame) {
+            console.log("[RESERVATION][STEP3-EARLY] Filling checkout form in booking widget iframe");
+            const _checkoutFieldsEarly: Array<{ sel: string[]; val: string; label: string }> = [
+              { label: "Собствено име", sel: ["input[placeholder*='Собствено']","input[name*='first']","input[id*='first']","input[placeholder*='First']"], val: String(req.guest_name || "").split(" ")[0] },
+              { label: "Фамилия",       sel: ["input[placeholder*='Фамил']","input[name*='last']","input[id*='last']","input[placeholder*='Last']"], val: String(req.guest_name || "").split(" ").slice(1).join(" ") || String(req.guest_name || "") },
+              { label: "ЕГН",           sel: ["input[placeholder*='ЕГН']","input[placeholder*='EGN']","input[name*='egn']","input[id*='egn']","input[name*='pid']","input[id*='pid']"], val: req.guest_egn || "" },
+              { label: "Дата на раждане", sel: ["input[placeholder*='Дата']","input[placeholder*='Date']","input[name*='birth']","input[id*='birth']","input[name*='dob']"], val: req.guest_birthdate || "" },
+              { label: "Номер на документ", sel: ["input[placeholder*='Номер на документ']","input[placeholder*='Document']","input[name*='doc']","input[id*='doc']","input[name*='passport']"], val: req.guest_doc_number || "" },
+              { label: "E-mail",        sel: ["input[type='email']","input[placeholder*='mail']","input[name*='email']","input[id*='email']"], val: req.guest_email || "" },
+              { label: "Телефон",       sel: ["input[type='tel']","input[placeholder*='елефон']","input[placeholder*='Phone']","input[name*='phone']","input[name*='tel']"], val: req.guest_phone || "" },
+            ];
+            for (const fld of _checkoutFieldsEarly) {
+              if (!fld.val) continue;
+              for (const sel of fld.sel) {
+                try {
+                  const loc = _earlyBookingFrame.locator(sel).first();
+                  if (await loc.count().catch(() => 0) === 0) continue;
+                  if (!(await loc.isVisible().catch(() => false))) continue;
+                  await loc.scrollIntoViewIfNeeded().catch(() => {});
+                  await loc.click({ timeout: 1500 }).catch(() => {});
+                  await loc.fill(fld.val, { timeout: 1500 }).catch(() => {});
+                  console.log(`[RESERVATION][STEP3-EARLY] Filled ${fld.label}`);
+                  break;
+                } catch {}
+              }
+            }
+            // Check terms checkbox
+            try {
+              const chk = _earlyBookingFrame.locator("input[type='checkbox']").first();
+              if (await chk.count().catch(() => 0) > 0 && !(await chk.isChecked().catch(() => false))) {
+                await chk.check({ timeout: 1500 }).catch(() => {});
+                console.log("[RESERVATION][STEP3-EARLY] Checked terms checkbox");
+              }
+            } catch {}
+            const _ssEarly = await this.takeAvailabilityScreenshot(page);
+            return {
+              ok: true,
+              phase: "reserve",
+              message: "reserve_checkout_filled",
+              booking_url: page.url(),
+              screenshot_base64: _ssEarly,
+              observation: {
+                url: page.url(),
+                before_url: beforeUrl,
+                room_type: req.room_type || "",
+                room_selection_succeeded: true,
+                current_step: "checkout_filled",
+                missing_required: [],
+                can_continue: true,
+                payment_required: false,
+                finalized: false,
+              },
+            };
+          }
+          // No guest data yet — ask for it
+          const _ssE = await this.takeAvailabilityScreenshot(page);
+          const _snE = await this.inferCurrentBookingStepNeeds(page);
+          return {
+            ok: true,
+            phase: "reserve",
+            message: "reserve_current_step_needs_input",
+            booking_url: null as any,
+            screenshot_base64: _ssE,
+            observation: {
+              url: beforeUrl,
+              before_url: beforeUrl,
+              room_type: req.room_type || "",
+              room_selection_attempted: false,
+              room_selection_succeeded: true,
+              current_step: _snE.current_step,
+              missing_required: _snE.missing_required,
+              can_continue: _snE.can_continue,
+              payment_required: _snE.payment_required,
+              finalized: false,
+            },
+          };
+        }
+
 
         // STEP 1: first select the chosen room on the CURRENT booking page / iframe context
         let roomSelectionAttempted = false;
@@ -4060,11 +5234,7 @@ rooms: rooms,
           };
 
           // Capture Clock PMS iframe body BEFORE any clicks for change detection
-          const _findBookingFrame = () => page.frames().find(f => {
-            const n = String(f.name?.() || "");
-            const u = f.url();
-            return n.includes("clock") || n.includes("wbe") || u.includes("clock-pms") || u.includes("wbe");
-          });
+          const _findBookingFrame = () => this.findBookingFrame(page);
           const _iframeSnapBefore = await (async () => {
             try {
               const bf = _findBookingFrame();
@@ -4094,6 +5264,17 @@ rooms: rooms,
                   console.log("[RESERVATION][ROOM] iframe content changed — booking progressed");
                   return true;
                 }
+                // Even if snapshot text didn't change in length, check for tariff/checkout keywords appearing
+                const newSnapLower = newSnap.toLowerCase();
+                if (/тариф|standard.?rate|bb\b|нощувка\s*с|plan|покажи тарифите/i.test(newSnapLower) &&
+                    !/апартамент.*апартамент.*апартамент/i.test(newSnapLower)) {
+                  console.log("[RESERVATION][ROOM] tariff step detected in iframe — booking progressed");
+                  return true;
+                }
+                if (/данни\s*за\s*контакт|guest\s*details|your\s*details/i.test(newSnapLower)) {
+                  console.log("[RESERVATION][ROOM] checkout step detected in iframe — booking progressed");
+                  return true;
+                }
               }
             } catch {}
 
@@ -4106,11 +5287,19 @@ rooms: rooms,
 
           const clickRoomInContext = async (ctx: any, label: string) => {
             const ctaSelectors = [
+              `button:has-text("ПОКАЖИ ТАРИФИТЕ")`,
+              `button:has-text("Покажи тарифите")`,
+              `button:has-text("Покажи")`,
+              `button:has-text("Тарифи")`,
               `button:has-text("Резервирай")`,
               `button:has-text("Избери")`,
               `button:has-text("Book")`,
               `button:has-text("Reserve")`,
               `button:has-text("Select")`,
+              `button:has-text("Check rates")`,
+              `button:has-text("Show rates")`,
+              `[role="button"]:has-text("ПОКАЖИ ТАРИФИТЕ")`,
+              `[role="button"]:has-text("Покажи тарифите")`,
               `[role="button"]:has-text("Резервирай")`,
               `[role="button"]:has-text("Избери")`,
               `[role="button"]:has-text("Book")`,
@@ -4192,9 +5381,24 @@ rooms: rooms,
                       );
                       await cta.dispatchEvent("click").catch(() => {});
                     });
-                    await page.waitForTimeout(1200);
-
-                    const progressed = await indicatesBookingProgress();
+                    // Wait longer for Clock PMS async view transition, then retry up to 4x
+                    let progressed = false;
+                    for (let _w = 0; _w < 3; _w++) {
+                      await page.waitForTimeout(1000);
+                      progressed = await indicatesBookingProgress();
+                      if (progressed) break;
+                      // Extra: check if iframe text changed since _iframeSnapBefore
+                      try {
+                        const _bf = _findBookingFrame();
+                        if (_bf) {
+                          const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 2000);
+                          if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                          // Clock PMS specific: after ПОКАЖИ ТАРИФИТЕ, ИЗБЕРИ button appears in the card
+                          const _hasIzberi = await _bf.locator('button:has-text("ИЗБЕРИ"), button:has-text("Избери"), button:has-text("Choose"), button:has-text("Select rate")').count().catch(() => 0);
+                          if (_hasIzberi > 0) { console.log("[RESERVATION][ROOM] ИЗБЕРИ button appeared — tariff loaded, progressed"); progressed = true; break; }
+                        }
+                      } catch {}
+                    }
                     console.log(
                       `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                     );
@@ -4244,9 +5448,19 @@ rooms: rooms,
                     console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j} ${debugLabel}`);
                     await btn.dispatchEvent("click").catch(() => {});
                   });
-                  await page.waitForTimeout(1200);
-
-                  const progressed = await indicatesBookingProgress();
+                  let progressed = false;
+                  for (let _w = 0; _w < 3; _w++) {
+                    await page.waitForTimeout(900);
+                    progressed = await indicatesBookingProgress();
+                    if (progressed) break;
+                    try {
+                      const _bf = _findBookingFrame();
+                      if (_bf) {
+                        const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                        if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                      }
+                    } catch {}
+                  }
                   console.log(
                     `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                   );
@@ -4287,9 +5501,19 @@ rooms: rooms,
                 console.log(`[RESERVATION][ROOM][DIRECT][DISPATCH] label=${label} sel=${sel}`);
                 await loc.dispatchEvent("click").catch(() => {});
               });
-              await page.waitForTimeout(1200);
-
-              const progressed = await indicatesBookingProgress();
+              let progressed = false;
+              for (let _w = 0; _w < 3; _w++) {
+                await page.waitForTimeout(1200);
+                progressed = await indicatesBookingProgress();
+                if (progressed) break;
+                try {
+                  const _bf = _findBookingFrame();
+                  if (_bf) {
+                    const _snap = (await _bf.locator("body").innerText().catch(() => "")).slice(0, 1200);
+                    if (_snap && _snap !== _iframeSnapBefore && _snap.length > 100) { progressed = true; break; }
+                  }
+                } catch {}
+              }
               console.log(`[RESERVATION][ROOM][DIRECT][RESULT] label=${label} sel=${sel} progressed=${progressed} url="${page.url()}"`);
 
               if (progressed) {
@@ -4304,25 +5528,23 @@ rooms: rooms,
 
           const frames = page.frames().filter((f) => f !== page.mainFrame());
 
-          const bookingFrames = frames.filter((frame) => {
-            const frameUrl = String(frame.url() || "").toLowerCase();
-            const frameName = String((frame as any).name?.() || "").toLowerCase();
-            const hay = `${frameUrl} ${frameName}`;
-            return (
-              hay.includes("book") ||
-              hay.includes("reserv") ||
-              hay.includes("clock-pms") ||
-              hay.includes("wbe") ||
-              hay.includes("hotel") ||
-              hay.includes("checkout") ||
-              hay.includes("availability")
-            );
-          });
+          // Try ALL non-analytics frames, prioritizing known booking patterns
+          const _analyticsPattern = /google\.com\/maps|google\.com\/recaptcha|facebook\.com|youtube\.com|analytics|gtm\.|pixel\.|adsbygoogle|doubleclick/i;
+          const _knownPatterns = ["clock", "wbe", "beds24", "cloudbeds", "mews", "sabee", "littlehotelier", "hotelrunner", "bookero", "amelia", "quendoo", "booking", "reserv", "checkout", "availability", "widget"];
+          const bookingFrames = frames
+            .filter(f => !_analyticsPattern.test(f.url()))
+            .sort((a, b) => {
+              const aHay = (String(a.name?.() || "") + " " + a.url()).toLowerCase();
+              const bHay = (String(b.name?.() || "") + " " + b.url()).toLowerCase();
+              const aScore = _knownPatterns.some(p => aHay.includes(p)) ? 1 : 0;
+              const bScore = _knownPatterns.some(p => bHay.includes(p)) ? 1 : 0;
+              return bScore - aScore; // known patterns first
+            });
 
           for (const frame of bookingFrames) {
             const frameUrl = String(frame.url() || "");
             const frameName = String((frame as any).name?.() || "");
-            const label = `frame(${frameName || frameUrl || "unknown"})`;
+            const label = `frame(${frameName || frameUrl.slice(0, 60) || "unknown"})`;
             if (await clickRoomInContext(frame as any, label)) {
               roomSelectionSucceeded = true;
               break;
@@ -4370,37 +5592,65 @@ rooms: rooms,
           .slice(0, 1200);
         console.log(`[RESERVATION][AFTER_ROOM] url=${currentUrlAfterRoom} body="${bodySnippetAfterRoom}"`);
 
-        const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
-        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
-
+        // NOTE: Do NOT call inferCurrentBookingStepNeeds here — checkout form is not yet loaded.
+        // We take screenshot early for error paths only.
 
         if (roomSelectionAttempted && !roomSelectionSucceeded) {
-          return {
-            ok: false,
-            phase: "reserve",
-            message: "room_selection_not_confirmed",
-            booking_url: "",
-            screenshot_base64: screenshotAfterRoom,
-            observation: {
-              url: currentUrlAfterRoom,
-              before_url: beforeUrl,
-              room_type: req.room_type || "",
-              current_step: stepNeedsAfterRoom.current_step,
-              missing_required: stepNeedsAfterRoom.missing_required,
-              can_continue: stepNeedsAfterRoom.can_continue,
-              payment_required: stepNeedsAfterRoom.payment_required,
-              finalized: false,
-            },
-          };
+          // For Clock PMS iframes: attempt full navigation regardless —
+          // the room click may have changed the iframe state without triggering indicatesBookingProgress
+          const hasBookingFrame = !!this.findBookingFrame(page);
+          if (hasBookingFrame) {
+            console.log("[RESERVATION][ROOM] room click unconfirmed but booking iframe present — attempting navigateBookingWidgetToCheckout");
+            const reachedCheckout = await this.navigateBookingWidgetToCheckout(page, guests);
+            console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
+            if (reachedCheckout) roomSelectionSucceeded = true;
+            await page.waitForTimeout(500);
+          }
+
+          if (!roomSelectionSucceeded) {
+            const screenshotRoomFail = await this.takeAvailabilityScreenshot(page);
+            const stepNeedsRoomFail = await this.inferCurrentBookingStepNeeds(page);
+            return {
+              ok: false,
+              phase: "reserve",
+              message: "room_selection_not_confirmed",
+              booking_url: "",
+              screenshot_base64: screenshotRoomFail,
+              observation: {
+                url: page.url(),
+                before_url: beforeUrl,
+                room_type: req.room_type || "",
+                current_step: stepNeedsRoomFail.current_step,
+                missing_required: stepNeedsRoomFail.missing_required,
+                can_continue: stepNeedsRoomFail.can_continue,
+                payment_required: stepNeedsRoomFail.payment_required,
+                finalized: false,
+              },
+            };
+          }
         }
 
-
-        // Navigate Clock PMS through Tariff step to Checkout step
+        // Navigate Clock PMS through Tariff step to Checkout step (only if not already navigated via fallback gate)
         if (roomSelectionSucceeded) {
-          const reachedCheckout = await this.clockPmsNavigateToCheckout(page, guests);
-          console.log(`[RESERVATION] Clock PMS navigator result: reachedCheckout=${reachedCheckout}`);
-          await page.waitForTimeout(500);
+          const _alreadyAtCheckout = await (async () => {
+            const _bf2 = this.findBookingFrame(page);
+            if (!_bf2) return false;
+            return await this.isAtCheckoutStep(_bf2);
+          })();
+          if (!_alreadyAtCheckout) {
+            const reachedCheckout = await this.navigateBookingWidgetToCheckout(page, guests);
+            console.log(`[RESERVATION] Clock PMS navigator (2nd call guard): reachedCheckout=${reachedCheckout}`);
+            await page.waitForTimeout(500);
+          } else {
+            console.log('[RESERVATION] Already at checkout — skipping duplicate navigateBookingWidgetToCheckout');
+          }
         }
+
+        // ✅ FIX: Scan AFTER checkout navigation — now the form fields are actually visible
+        await page.waitForTimeout(800); // allow checkout form to fully render
+        const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
+        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
+        console.log(`[RESERVATION][STEP-NEEDS-POST-NAV] missing=${stepNeedsAfterRoom.missing_required.join(" | ") || "none"}`);
 
         // STEP 2: after room selection, return the REAL missing fields from the current booking step
         const hasGuestIdentity =
@@ -4430,12 +5680,167 @@ rooms: rooms,
           };
         }
 
-        // STEP 3: only now try to fill personal data on the CURRENT page/state
+        // STEP 3: fill personal data — UNIVERSAL ENGINE FIRST, then Clock PMS iframe fallback
+        const _clockFrame = this.findBookingFrame(page);
+        let _iframeCheckoutFilled = false;
+
+        // ✅ PRIMARY: Universal fill engine — works with ANY widget
+        if (_clockFrame || req.guest_name || req.guest_email) {
+          const _fillCtx = _clockFrame || page;
+          console.log("[RESERVATION][STEP3] Using universal fill engine");
+
+          const guestPayload = {
+            full_name:  req.guest_name || "",
+            email:      req.guest_email || "",
+            phone:      req.guest_phone || "",
+            egn:        req.guest_egn || "",
+            birthdate:  req.guest_birthdate || "",
+            gender:     req.guest_gender || "",
+            country:    req.guest_country || "",
+            doc_type:   req.guest_doc_type || "",
+            doc_number: req.guest_doc_number || "",
+            message:    req.guest_message || "",
+          };
+
+          const filledFields = await this.universalFillKnownFields(_fillCtx, page, guestPayload);
+
+          if (filledFields.length > 0) {
+            _iframeCheckoutFilled = true;
+            console.log(`[RESERVATION][STEP3][UNIVERSAL] Filled ${filledFields.length} fields: ${filledFields.join(" | ")}`);
+          }
+
+          // Check for terms checkbox if not filled
+          if (_clockFrame) {
+            try {
+              const chk = _clockFrame.locator("input[type='checkbox']").first();
+              if (await chk.count().catch(() => 0) > 0 && !(await chk.isChecked().catch(() => false))) {
+                await chk.check({ timeout: 1500 }).catch(() => {});
+                console.log("[RESERVATION][STEP3][UNIVERSAL] Checked terms checkbox");
+              }
+            } catch {}
+          }
+
+          // After universal fill — check what's still missing
+          if (filledFields.length > 0 || req.guest_name) {
+            await page.waitForTimeout(500);
+            const _stepAfterFill = await this.inferCurrentBookingStepNeeds(page);
+            console.log(`[RESERVATION][STEP3][AFTER_FILL] missing=${_stepAfterFill.missing_required.join(" | ") || "none"}`);
+
+            if (_stepAfterFill.missing_required.length > 0) {
+              return {
+                ok: true,
+                success: true,
+                phase: "reserve",
+                stage: "reservation_reserve_needs_input",
+                message: "reserve_current_step_needs_input",
+                needs_input: true,
+                missing_required: _stepAfterFill.missing_required,
+                booking_url: "",
+                screenshot_base64: screenshotAfterRoom,
+                current_step: _stepAfterFill.current_step,
+                can_continue: false,
+              };
+            }
+
+            const _finalUrl = page.url();
+            return {
+              ok: true,
+              success: true,
+              phase: "reserve",
+              stage: "reservation_reserve_checkout_filled",
+              message: "reserve_checkout_filled",
+              needs_input: false,
+              missing_required: [],
+              booking_url: _finalUrl,
+              current_step: "checkout_filled",
+              can_continue: true,
+            };
+          }
+        }
+          // ── FALLBACK: Clock PMS specific selector-based fill (if universal engine filled nothing) ──
+          if (!_iframeCheckoutFilled && _clockFrame && req.guest_name) {
+          console.log("[RESERVATION][STEP3][FALLBACK] Using Clock PMS selector-based fill");
+          const _checkoutFields: Array<{ sel: string[]; val: string; label: string }> = [
+            { label: "Собствено име",  sel: ["input[placeholder*='Собствено']", "input[name*='first']", "input[name*='given']", "input[id*='first']", "input[placeholder*='First']"], val: String(req.guest_name || "").split(" ")[0] },
+            { label: "Фамилия",        sel: ["input[placeholder*='Фамил']", "input[name*='last']", "input[name*='family']", "input[id*='last']", "input[placeholder*='Last']"], val: String(req.guest_name || "").split(" ").slice(1).join(" ") || String(req.guest_name || "") },
+            { label: "ЕГН",            sel: ["input[placeholder*='ЕГН']", "input[placeholder*='EGN']", "input[name*='egn']", "input[id*='egn']", "input[name*='pid']", "input[id*='pid']"], val: req.guest_egn || "" },
+            { label: "Дата на раждане", sel: ["input[placeholder*='Дата']", "input[placeholder*='Date of birth']", "input[name*='birth']", "input[id*='birth']", "input[name*='dob']"], val: req.guest_birthdate || "" },
+            { label: "Номер на документ", sel: ["input[placeholder*='Номер на документ']", "input[placeholder*='Document']", "input[name*='doc']", "input[id*='doc']", "input[name*='passport']", "input[placeholder*='Passport']"], val: req.guest_doc_number || "" },
+            { label: "E-mail",         sel: ["input[type='email']", "input[placeholder*='mail']", "input[placeholder*='Mail']", "input[name*='email']", "input[id*='email']"], val: req.guest_email || "" },
+            { label: "Телефон",        sel: ["input[type='tel']", "input[placeholder*='елефон']", "input[placeholder*='Phone']", "input[name*='phone']", "input[name*='tel']", "input[id*='phone']"], val: req.guest_phone || "" },
+          ];
+          let _filledCount = 0;
+          for (const fld of _checkoutFields) {
+            if (!fld.val) continue;
+            for (const sel of fld.sel) {
+              try {
+                const loc = _clockFrame.locator(sel).first();
+                if (await loc.count().catch(() => 0) === 0) continue;
+                if (!(await loc.isVisible().catch(() => false))) continue;
+                await loc.scrollIntoViewIfNeeded().catch(() => {});
+                await loc.click({ clickCount: 3, timeout: 1500 }).catch(() => {});
+                await loc.fill(fld.val, { timeout: 1500 }).catch(() => {});
+                await _clockFrame.evaluate(({ sel, val }: { sel: string; val: string }) => {
+                  const el = document.querySelector(sel) as HTMLInputElement | null;
+                  if (!el) return;
+                  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+                  if (nativeInputValueSetter) nativeInputValueSetter.call(el, val);
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+                }, { sel, val: fld.val }).catch(() => {});
+                await page.waitForTimeout(100);
+                console.log(`[RESERVATION][STEP3][FALLBACK] Filled ${fld.label}: ${fld.val.slice(0,20)}`);
+                _filledCount++;
+                break;
+              } catch {}
+            }
+          }
+          // Accept terms checkbox if present
+          try {
+            const chk = _clockFrame.locator("input[type='checkbox']").first();
+            if (await chk.count().catch(() => 0) > 0 && !(await chk.isChecked().catch(() => false))) {
+              await chk.check({ timeout: 1500 }).catch(() => {});
+              console.log("[RESERVATION][STEP3][FALLBACK] Checked terms checkbox");
+            }
+          } catch {}
+          if (_filledCount > 0) {
+            _iframeCheckoutFilled = true;
+            console.log(`[RESERVATION][STEP3][FALLBACK] Filled ${_filledCount} fields`);
+          }
+
+          if (_iframeCheckoutFilled) {
+            await page.waitForTimeout(400);
+            const _stepAfterFill = await this.inferCurrentBookingStepNeeds(page);
+            console.log(`[RESERVATION][STEP3][FALLBACK] After fill: missing=${_stepAfterFill.missing_required.join(" | ") || "none"}`);
+            if (_stepAfterFill.missing_required.length > 0) {
+              return {
+                ok: true, success: true, phase: "reserve",
+                stage: "reservation_reserve_needs_input",
+                message: "reserve_current_step_needs_input",
+                needs_input: true,
+                missing_required: _stepAfterFill.missing_required,
+                booking_url: "", screenshot_base64: screenshotAfterRoom,
+                current_step: "reserve", can_continue: false,
+              };
+            }
+            const _finalUrl = page.url();
+            return {
+              ok: true, success: true, phase: "reserve",
+              stage: "reservation_reserve_checkout_filled",
+              message: "reserve_checkout_filled",
+              needs_input: false, missing_required: [],
+              booking_url: _finalUrl, current_step: "checkout_filled", can_continue: true,
+            };
+          }
+          }
+
         const formSchema = session.formSchemas.find(
           (s) => s.kind === "form" || s.kind === "wizard"
         );
 
-               if (formSchema) {
+        // Only use schema-based fill if all above fill methods did not work
+        if (!_iframeCheckoutFilled && formSchema) {
           if (formSchema.schema.choices?.length) {
             const choiceActions = await this.fillStyledChoiceGroups(
               page,
@@ -4607,19 +6012,21 @@ async function main() {
   app.get("/", (_, res) => {
     res.json({
       name: "NEO Worker",
-      version: "7.0.0-booking",
-      build: "neo-worker_v7_make_reservation",
-      mode: "schema-first",
-      has_make_reservation: true
+      version: "8.0.0",
+      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
+      mode: "universal-dom-first",
+      has_make_reservation: true,
+      has_universal_widget_engine: true,
     });
   });
 
    app.get("/health", (_, res) => {
     res.json({
       status: "ok",
-      version: "7.0.0-booking",
-      build: "neo-worker_v7_make_reservation",
+      version: "8.0.0",
+      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
       has_make_reservation: true,
+      has_universal_widget_engine: true,
       ...manager.getStatus()
     });
   });
@@ -4627,8 +6034,8 @@ async function main() {
   app.get("/__routes", (_, res) => {
     res.json({
       success: true,
-      version: "7.0.0-booking",
-      build: "neo-worker_v7_make_reservation",
+      version: "8.0.0",
+      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
       routes: [
         "GET /",
         "GET /health",
@@ -4742,8 +6149,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v7.0.0-booking listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v7_make_reservation port=${PORT}`);
+    console.log(`🚀 NEO Worker v8.0.0 Universal Widget Engine listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v8_universal_widget_engine_2026-03-14 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
