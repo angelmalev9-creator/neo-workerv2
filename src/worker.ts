@@ -298,6 +298,63 @@ function labelSoftIncludes(a: string, b: string): boolean {
   return A.includes(B) || B.includes(A);
 }
 
+async function getClickableDebugLabel(loc: any): Promise<string> {
+  try {
+    const meta = await loc.evaluate((el: any) => {
+      const text = String(el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+      const value = String(el?.value || "").replace(/\s+/g, " ").trim();
+      const aria = String(el?.getAttribute?.("aria-label") || "").replace(/\s+/g, " ").trim();
+      const title = String(el?.getAttribute?.("title") || "").replace(/\s+/g, " ").trim();
+      const placeholder = String(el?.getAttribute?.("placeholder") || "").replace(/\s+/g, " ").trim();
+      const cls = String(el?.className || "").replace(/\s+/g, " ").trim();
+      const tag = String(el?.tagName || "").toLowerCase();
+      const type = String(el?.type || "").toLowerCase();
+      return { text, value, aria, title, placeholder, cls, tag, type };
+    });
+
+    const parts = [
+      meta?.text ? `text="${meta.text}"` : "",
+      meta?.value ? `value="${meta.value}"` : "",
+      meta?.aria ? `aria="${meta.aria}"` : "",
+      meta?.title ? `title="${meta.title}"` : "",
+      meta?.placeholder ? `placeholder="${meta.placeholder}"` : "",
+      meta?.tag ? `tag=${meta.tag}` : "",
+      meta?.type ? `type=${meta.type}` : "",
+      meta?.cls ? `class="${String(meta.cls).slice(0, 120)}"` : "",
+    ].filter(Boolean);
+
+    return parts.join(" ");
+  } catch {
+    return "";
+  }
+}
+
+function isBadClickableLabel(raw: string): boolean {
+  const s = normLabel(raw || "");
+  if (!s) return true;
+
+  return [
+    "lens",
+    "chevron left",
+    "chevron right",
+    "fullscreen",
+    "expand more",
+    "expand less",
+    "close",
+    "menu",
+    "search",
+    "favorite",
+    "share",
+    "prev",
+    "next",
+    "zoom",
+    "галерия",
+    "снимка",
+    "картина",
+  ].some((x) => s === x || s.startsWith(x) || s.includes(x));
+}
+
+
 // ───────────────────────────────────────────────────────────────
 // Select normalization + matching
 // ───────────────────────────────────────────────────────────────
@@ -2145,24 +2202,22 @@ class HotSessionManager {
         out.push(label);
       };
 
-      for (const lbl of unfilled.labels || []) push(lbl);
+      const requiredFieldLabels = (scanned.fields || [])
+        .filter((f: any) => !!f?.required)
+        .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
+        .filter(Boolean);
 
-      for (const f of scanned.fields || []) {
-        if (!f?.required) continue;
-        const label =
-          String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim();
-        if (!label) continue;
-        push(label);
-      }
+      const requiredChoiceLabels = (scanned.choiceGroups || [])
+        .filter((g: any) => !!g?.required)
+        .map((g: any) =>
+          String(g.label || g.name || "").trim() ||
+          (Array.isArray(g.options) ? g.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "")
+        )
+        .filter(Boolean);
 
-      for (const group of scanned.choiceGroups || []) {
-        if (!group?.required) continue;
-        const groupLabel =
-          String(group.label || group.name || "").trim() ||
-          (Array.isArray(group.options) ? group.options.map((o: any) => o.text).filter(Boolean).join(" / ") : "");
-        if (!groupLabel) continue;
-        push(groupLabel);
-      }
+      for (const lbl of requiredFieldLabels) push(lbl);
+      for (const lbl of requiredChoiceLabels) push(lbl);
+
 
       console.log(
         `[RESERVATION][STEP-NEEDS] url=${page.url()} payment=${paymentRequired} current_step=${paymentRequired ? "payment" : "reserve"} missing=${out.join(" | ") || "none"}`
@@ -2174,25 +2229,14 @@ class HotSessionManager {
         );
       }
 
-      if ((scanned.fields || []).length) {
-        const requiredFieldLabels = (scanned.fields || [])
-          .filter((f: any) => !!f?.required)
-          .map((f: any) => String(f.label || f.aria_label || f.placeholder || f.name || f.id || "").trim())
-          .filter(Boolean);
-        console.log(
-          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_FIELDS] ${requiredFieldLabels.join(" | ") || "none"}`
-        );
-      }
+      console.log(
+        `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_FIELDS] ${requiredFieldLabels.join(" | ") || "none"}`
+      );
 
-      if ((scanned.choiceGroups || []).length) {
-        const requiredChoiceLabels = (scanned.choiceGroups || [])
-          .filter((g: any) => !!g?.required)
-          .map((g: any) => String(g.label || g.name || "").trim() || (Array.isArray(g.options) ? g.options.map((o: any) => o.text).filter(Boolean).join(" / ") : ""))
-          .filter(Boolean);
-        console.log(
-          `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_CHOICES] ${requiredChoiceLabels.join(" | ") || "none"}`
-        );
-      }
+      console.log(
+        `[RESERVATION][STEP-NEEDS][SCANNED_REQUIRED_CHOICES] ${requiredChoiceLabels.join(" | ") || "none"}`
+      );
+
 
 
       return {
@@ -3976,32 +4020,41 @@ rooms: rooms,
 
                 for (const ctaSel of ctaSelectors) {
                   const ctas = container.locator(ctaSel);
-                  const ctaCount = Math.min(await ctas.count().catch(() => 0), 3);
+                  const ctaCount = Math.min(await ctas.count().catch(() => 0), 4);
                   for (let j = 0; j < ctaCount; j++) {
                     const cta = ctas.nth(j);
                     const tag = await cta.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
-                    const ctaText = String(await cta.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+                    const debugLabel = await getClickableDebugLabel(cta);
+
                     if (tag === "a") {
                       console.log(
-                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=anchor text="${ctaText}"`
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=anchor ${debugLabel}`
                       );
                       continue;
                     }
+
                     if (!(await cta.isVisible().catch(() => false))) {
                       console.log(
-                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=hidden text="${ctaText}"`
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=hidden ${debugLabel}`
+                      );
+                      continue;
+                    }
+
+                    if (isBadClickableLabel(debugLabel)) {
+                      console.log(
+                        `[RESERVATION][ROOM][CTA][SKIP] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} reason=bad_label ${debugLabel}`
                       );
                       continue;
                     }
 
                     console.log(
-                      `[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} tag=${tag} text="${ctaText}"`
+                      `[RESERVATION][ROOM][CTA][TRY] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} ${debugLabel}`
                     );
 
                     await cta.scrollIntoViewIfNeeded().catch(() => {});
                     await cta.click({ timeout: 1800 }).catch(async () => {
                       console.log(
-                        `[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j}`
+                        `[RESERVATION][ROOM][CTA][FALLBACK_DISPATCH] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} ${debugLabel}`
                       );
                       await cta.dispatchEvent("click").catch(() => {});
                     });
@@ -4009,52 +4062,67 @@ rooms: rooms,
 
                     const progressed = await indicatesBookingProgress();
                     console.log(
-                      `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}"`
+                      `[RESERVATION][ROOM][CTA][RESULT] label=${label} containerSel=${containerSel} ctaSel=${ctaSel} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                     );
 
                     if (progressed) {
-                      console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel}`);
+                      console.log(`[RESERVATION][ROOM] selected via ${label} -> ${containerSel} :: ${ctaSel} ${debugLabel}`);
                       return true;
                     }
-
                   }
                 }
 
                 const fallbackButtons = container.locator(`button, [role="button"], a, input[type="button"], input[type="submit"]`);
-                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 4);
+                const fallbackCount = Math.min(await fallbackButtons.count().catch(() => 0), 5);
 
                 for (let j = 0; j < fallbackCount; j++) {
                   const btn = fallbackButtons.nth(j);
-                  const btnText = String(await btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
                   const btnTag = await btn.evaluate((el: any) => el.tagName?.toLowerCase?.() || "").catch(() => "");
+                  const debugLabel = await getClickableDebugLabel(btn);
+
                   if (!(await btn.isVisible().catch(() => false))) {
                     console.log(
-                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=hidden tag=${btnTag} text="${btnText}"`
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=hidden ${debugLabel}`
+                    );
+                    continue;
+                  }
+
+                  if (btnTag === "a") {
+                    console.log(
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=anchor ${debugLabel}`
+                    );
+                    continue;
+                  }
+
+                  if (isBadClickableLabel(debugLabel)) {
+                    console.log(
+                      `[RESERVATION][ROOM][FALLBACK][SKIP] label=${label} idx=${j} reason=bad_label ${debugLabel}`
                     );
                     continue;
                   }
 
                   console.log(
-                    `[RESERVATION][ROOM][FALLBACK][TRY] label=${label} idx=${j} tag=${btnTag} text="${btnText}"`
+                    `[RESERVATION][ROOM][FALLBACK][TRY] label=${label} idx=${j} ${debugLabel}`
                   );
 
                   await btn.scrollIntoViewIfNeeded().catch(() => {});
                   await btn.click({ timeout: 1800 }).catch(async () => {
-                    console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j}`);
+                    console.log(`[RESERVATION][ROOM][FALLBACK][DISPATCH] label=${label} idx=${j} ${debugLabel}`);
                     await btn.dispatchEvent("click").catch(() => {});
                   });
                   await page.waitForTimeout(1200);
 
                   const progressed = await indicatesBookingProgress();
                   console.log(
-                    `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}"`
+                    `[RESERVATION][ROOM][FALLBACK][RESULT] label=${label} idx=${j} progressed=${progressed} url="${page.url()}" ${debugLabel}`
                   );
 
                   if (progressed) {
-                    console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container`);
+                    console.log(`[RESERVATION][ROOM] selected via ${label} -> fallback button in container ${debugLabel}`);
                     return true;
                   }
                 }
+
 
               }
             }
