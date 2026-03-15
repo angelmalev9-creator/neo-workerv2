@@ -256,6 +256,14 @@ function normalizePhone(input: unknown): string {
   return s;
 }
 
+function normalizeReservationGuests(raw: unknown, fallback = "2"): string {
+  const n = Number(String(raw || "").trim());
+  if (!Number.isFinite(n)) return fallback;
+  if (n < 1) return "1";
+  if (n > 8) return "8";
+  return String(Math.trunc(n));
+}
+
 function mergeConfirmedData(
   data: Record<string, unknown>,
   confirmed?: Record<string, unknown>
@@ -394,6 +402,8 @@ function isBadClickableLabel(raw: string): boolean {
     "български", "english", "profile or sign in",
     // ✅ Clock PMS availability calendar — NOT a booking button
     "календар на заетостта", "calendar на заетостта", "availability calendar",
+    "януари", "февруари", "март", "април", "май", "юни", "юли", "август", "септември", "октомври", "ноември", "декември",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
   ]);
   if (exactBad.has(s)) return true;
 
@@ -4494,7 +4504,7 @@ class HotSessionManager {
       console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
     }
     let ctx: any = bf || page;
-    const guestNum = parseInt(guests || "2") || 2;
+    const guestNum = parseInt(normalizeReservationGuests(guests, "2"), 10) || 2;
     console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
 
     let _prevFrameText = "";
@@ -4993,6 +5003,7 @@ class HotSessionManager {
         for (const btn of anyBtns) {
           const t = (await btn.innerText().catch(() => "")).trim();
           if (!t || isBadClickableLabel(t)) continue;
+          if (/^(януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември|january|february|march|april|may|june|july|august|september|october|november|december)$/i.test(t)) continue;
           if (!(await btn.isVisible().catch(() => false))) continue;
           await btn.scrollIntoViewIfNeeded().catch(() => {});
           await btn.click({ timeout: 1500 }).catch(() => {});
@@ -5025,7 +5036,7 @@ class HotSessionManager {
 
     const checkin  = String(req.check_in || "").trim();
     const checkout = String(req.check_out || "").trim();
-    const guests   = String(req.guests || "2");
+    const guests   = normalizeReservationGuests(req.guests || "2", "2");
     const rooms    = String(req.rooms || "1");
     const page     = session.page;
 
@@ -5655,6 +5666,8 @@ rooms: rooms,
               const _ft = (await _fb.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
               if (!_ft || isBadClickableLabel(_ft)) continue;
               if (/календар|заетост|calendar/i.test(_ft)) continue;
+              if (/^(януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември|january|february|march|april|may|june|july|august|september|october|november|december)$/i.test(_ft)) continue;
+              if (/^покажи\s*повече/i.test(_ft)) continue;
               if (!(await _fb.isVisible().catch(() => false))) continue;
               const _unavail = await _fb.evaluate((el: any): boolean => {
                 let p: Element | null = el;
