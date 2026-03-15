@@ -3578,11 +3578,9 @@ class HotSessionManager {
       const selMap = vendorDateSelectors[normalizedVendor] || vendorDateSelectors[vendor] || genericSelectors;
 
       const bookingFrame = await this.findBookingFrameWithContent(page, normalizedVendor === 'clock_pms' ? 3500 : 2200).catch(() => this.findBookingFrame(page));
-      const clockCtx: any = bookingFrame || null;
 
       // Helper: try to fill an element inside the iframe
       const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
-        const allSels = [...selectors, ...genericSelectors.checkin.slice(0, 3)];
         for (const sel of selectors) {
           try {
             const loc = frameLocator.locator(sel).first();
@@ -3591,20 +3589,17 @@ class HotSessionManager {
             const visible = await loc.isVisible().catch(() => false);
             if (!visible) continue;
 
-            // Try fill first
             await loc.click({ timeout: 2000 }).catch(() => {});
             await loc.fill(value, { timeout: 2000 }).catch(() => {});
-            await page.keyboard.press("Tab");
+            await page.keyboard.press("Tab").catch(() => {});
             await page.waitForTimeout(200);
 
-            // Verify
             const filled = await loc.inputValue().catch(() => "");
             if (filled && filled !== "") {
               console.log(`[IFRAME][FILL] ${sel} = ${filled}`);
               return true;
             }
 
-            // Try custom datepicker approach
             const filledDP = await this.fillCustomDatepickerInFrame(frameLocator, sel, value);
             if (filledDP) {
               console.log(`[IFRAME][DATEPICKER] ${sel} = ${value}`);
@@ -3615,40 +3610,107 @@ class HotSessionManager {
         return false;
       };
 
+      // Clock PMS special rule:
+      // availability must NOT use checkout navigation. We only set dates/guests,
+      // click the real search button, and wait for room/tariff results.
+      if (normalizedVendor === 'clock_pms') {
+        const pageFill = await this.fillAvailabilityDates(
+          page,
+          {
+            id: '',
+            session_id: '',
+            url: page.url(),
+            domain: '',
+            kind: 'availability',
+            fingerprint: '',
+            schema: {
+              fields: [],
+              date_inputs: [
+                { name: 'arrival', label: 'Пристигане', selector_candidates: selMap.checkin },
+                { name: 'departure', label: 'Заминаване', selector_candidates: selMap.checkout },
+              ],
+              guest_fields: selMap.guests.map((s: string) => ({ name: 'guests', label: 'Гости', selector_candidates: [s] })),
+            } as any,
+            dom_snapshot: null,
+          } as FormSchemaRow,
+          checkin,
+          checkout,
+          guests,
+          rooms,
+        );
+
+        let searchClicked = await this.clickAvailabilitySearch(page).catch(() => false);
+        console.log(`[IFRAME][CLOCK] page-level fill=${JSON.stringify(pageFill)} searchClicked=${searchClicked}`);
+
+        if (!searchClicked) {
+          // fallback: try iframe-local search buttons only, but NEVER navigate checkout here
+          for (const sel of selMap.search) {
+            try {
+              const loc = frameLocator.locator(sel).first();
+              const count = await loc.count().catch(() => 0);
+              if (count === 0) continue;
+              const visible = await loc.isVisible().catch(() => false);
+              if (!visible) continue;
+              await loc.click({ timeout: 3000, force: true });
+              searchClicked = true;
+              console.log(`[IFRAME][CLOCK] iframe search fallback clicked ${sel}`);
+              break;
+            } catch {}
+          }
+        }
+
+        await this.waitForAvailabilityResults(page);
+        const resultDetected = await (async () => {
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline) {
+            const freshFrame = await this.findBookingFrameWithContent(page, 1200).catch(() => this.findBookingFrame(page));
+            const ctx = freshFrame || bookingFrame;
+            if (!ctx) {
+              await page.waitForTimeout(400);
+              continue;
+            }
+            const txt = String(await ctx.locator('body').innerText().catch(() => '')).toLowerCase();
+            const hasResults = /престой|стаи|тарифи|избери|покажи\s*тарифите|standard.?rate|нощувка\s*с\s*закуска|bb\b/i.test(txt);
+            if (hasResults && txt.length > 360) {
+              console.log(`[IFRAME][CLOCK] availability results detected len=${txt.length}`);
+              return true;
+            }
+            await page.waitForTimeout(400);
+          }
+          return false;
+        })();
+
+        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+        return {
+          ok: searchClicked,
+          message: resultDetected ? 'clock_pms_availability_ready' : 'clock_pms_availability_not_confirmed',
+          screenshot_base64,
+        };
+      }
+
       const checkinOk = await iframeFill(selMap.checkin, checkin);
       await page.waitForTimeout(300);
       const checkoutOk = await iframeFill(selMap.checkout, checkout);
       await page.waitForTimeout(300);
 
-      // Guests (optional / required for many widgets)
       try {
-        let guestFilled = false;
         for (const sel of selMap.guests) {
           const loc = frameLocator.locator(sel).first();
           const count = await loc.count().catch(() => 0);
           if (count === 0) continue;
           const visible = await loc.isVisible().catch(() => false);
           if (!visible) continue;
-          const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
-          if (tag === "select") {
-            await loc.selectOption(guests).catch(() => {});
-            guestFilled = true;
-          } else {
+          const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => '');
+          if (tag === 'select') await loc.selectOption(guests).catch(() => {});
+          else {
             await loc.click({ timeout: 1200 }).catch(() => {});
             await loc.fill(guests).catch(() => {});
-            guestFilled = true;
           }
           await page.waitForTimeout(250);
-          if (guestFilled) break;
-        }
-
-        if (!guestFilled && normalizedVendor === 'clock_pms' && clockCtx) {
-          const reached = await this.navigateBookingWidgetToCheckout(page, guests).catch(() => false);
-          console.log(`[IFRAME][CLOCK] navigateBookingWidgetToCheckout during availability reached=${reached}`);
+          break;
         }
       } catch {}
 
-      // Click search inside iframe
       let searchClicked = false;
       for (const sel of selMap.search) {
         try {
@@ -3664,17 +3726,12 @@ class HotSessionManager {
         } catch {}
       }
 
-      if (!searchClicked && normalizedVendor === 'clock_pms') {
-        searchClicked = await this.clickAvailabilitySearch(page).catch(() => false);
-        console.log(`[IFRAME][CLOCK] main-page search fallback clicked=${searchClicked}`);
-      }
-
       await this.waitForAvailabilityResults(page);
       const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
 
       return {
-        ok: true,
-        message: searchClicked ? "iframe_availability_ready" : "iframe_availability_partial",
+        ok: searchClicked,
+        message: searchClicked ? 'iframe_availability_ready' : 'iframe_availability_partial',
         screenshot_base64,
       };
     
