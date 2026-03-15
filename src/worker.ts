@@ -5134,6 +5134,27 @@ class HotSessionManager {
   private async navigateBookingWidgetToCheckout(page: Page, guests: string): Promise<boolean> {
     // Use async frame finder — waits up to 8s for a frame with actual content
     const bf = await this.findBookingFrameWithContent(page, 4000);
+
+    // Apply a zoom-out on the main page to improve visibility of the booking widget.
+    // Many hotel sites display the Clock PMS or other widgets in a small area,
+    // requiring excessive scrolling.  By zooming out we can see both the
+    // tariffs and the checkout button without scrolling, which reduces the
+    // chance of the navigator getting "stuck".  The zoom factor is set to
+    // 80% (i.e. scale down by 20%), but this can be tuned as needed.  We only
+    // apply the zoom once per page using a marker on the window object.
+    try {
+      await page.evaluate(() => {
+        const w: any = window;
+        if (!w.__neoZoomApplied) {
+          const zoomFactor = 0.8;
+          document.body.style.zoom = String(zoomFactor);
+          (document.documentElement as HTMLElement).style.zoom = String(zoomFactor);
+          w.__neoZoomApplied = true;
+        }
+      });
+    } catch {
+      // ignore zoom errors
+    }
     if (!bf) {
       if (await this.isAtCheckoutStep(page)) return true;
       console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
