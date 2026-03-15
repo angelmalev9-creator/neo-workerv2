@@ -5362,10 +5362,26 @@ class HotSessionManager {
     ok: boolean;
     phase: string;
     message: string;
-    screenshot_base64?: string;
-    booking_url?: string;
+    screenshot_base64?: string | null;
+    booking_url?: string | null;
     prices_found?: string;
     observation?: JsonObj;
+    // v9: top-level fields for easier frontend consumption
+    stage?: string;
+    needs_input?: boolean;
+    missing_required?: string[];
+    selected_room_type?: string;
+    current_step?: string;
+    payment_required?: boolean;
+    can_continue?: boolean;
+    check_in?: string;
+    check_out?: string;
+    guests?: string;
+    room_type?: string;
+    worker_message?: string;
+    worker_result?: JsonObj;
+    timing_ms?: number;
+    build_id?: string;
   }> {
     const session = this.sessions.get(req.site_id);
     if (!session) return { ok: false, phase: req.phase, message: "Няма активна сесия" };
@@ -6084,7 +6100,7 @@ rooms: rooms,
 
               const scopedCtx = {
                 locator: (sel: string) => root.locator(sel),
-              } as any;
+              };
 
               if (await clickRoomInContext(scopedCtx, `page-root(${rootSel})`)) {
                 roomSelectionSucceeded = true;
@@ -6215,7 +6231,7 @@ rooms: rooms,
               payment_required: stepNeedsAfterRoom.payment_required,
               finalized: false,
             },
-          } as any;
+          };
         }
 
         // STEP 3: fill personal data — UNIVERSAL ENGINE FIRST, then Clock PMS iframe fallback
@@ -6281,7 +6297,7 @@ rooms: rooms,
                   current_step: _stepAfterFill.current_step,
                   can_continue: false,
                 },
-              } as any;
+              };
             }
 
             const _finalUrl = page.url();
@@ -6301,7 +6317,7 @@ rooms: rooms,
                 current_step: "checkout_filled",
                 can_continue: true,
               },
-            } as any;
+            };
           }
         }
           // ── FALLBACK: Clock PMS specific selector-based fill (if universal engine filled nothing) ──
@@ -6518,7 +6534,7 @@ rooms: rooms,
             payment_required: stepNeeds.payment_required,
             finalized: false,
           },
-        } as any;
+        };
 
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
