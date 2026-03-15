@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v12.0.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
+ * NEO WORKER v12.1.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
  *
  * v8.0.0 — НОВА АРХИТЕКТУРА:
  * ─────────────────────────────────────────────────────────────────
@@ -3721,7 +3721,7 @@ class HotSessionManager {
                 { name: 'arrival', label: 'Пристигане', selector_candidates: selMap.checkin },
                 { name: 'departure', label: 'Заминаване', selector_candidates: selMap.checkout },
               ],
-              guest_fields: selMap.guests.map((s: string) => ({ name: 'guests', label: 'Гости', selector_candidates: [s] })),
+              guest_fields: selMap.guests.map((s) => ({ name: 'guests', label: 'Гости', selector_candidates: [s] })),
             } as any,
             dom_snapshot: null,
           } as FormSchemaRow,
@@ -3864,7 +3864,7 @@ class HotSessionManager {
 
         let _ciOpened = false;
         for (const selGroup of _ciTriggerSels) {
-          for (const sel of selGroup.split(',').map((s: string) => s.trim())) {
+          for (const sel of selGroup.split(',').map((s) => s.trim())) {
             try {
               const el = _qCtx.locator(sel).first();
               if (!(await el.isVisible({ timeout: 600 }).catch(() => false))) continue;
@@ -3881,7 +3881,7 @@ class HotSessionManager {
         if (_ciOpened) await page.waitForTimeout(1200);
 
         // Helper: click a calendar day by matching text content
-        const clickCalDay = async (dayNum: number, label: string): Promise<boolean> => {
+        const clickCalDay = async (dayNum: number, label: string) => {
           const _calSels = [
             `.flatpickr-day:not(.disabled):not(.prevMonthDay):not(.nextMonthDay)`,
             `[class*="DayCell"]:not([class*="disabled"])`,
@@ -3933,7 +3933,7 @@ class HotSessionManager {
                 'input[placeholder*="Заминаване"], input[placeholder*="Check-out"], input[placeholder*="Departure"]',
               ];
               for (const selGroup of _coTriggerSels) {
-                for (const sel of selGroup.split(',').map((s: string) => s.trim())) {
+                for (const sel of selGroup.split(',').map((s) => s.trim())) {
                   try {
                     const el = _qCtx.locator(sel).first();
                     if (!(await el.isVisible({ timeout: 500 }).catch(() => false))) continue;
@@ -3957,7 +3957,7 @@ class HotSessionManager {
             'select[class*="guests"], select[class*="adult"]',
           ];
           for (const sg of _guestSels) {
-            for (const sel of sg.split(',').map((s: string) => s.trim())) {
+            for (const sel of sg.split(',').map((s) => s.trim())) {
               try {
                 const el = _qCtx.locator(sel).first();
                 if (!(await el.isVisible({ timeout: 400 }).catch(() => false))) continue;
@@ -4002,7 +4002,6 @@ class HotSessionManager {
           message: _qHasRooms ? 'quendoo_availability_ready' : 'quendoo_availability_attempted',
           screenshot_base64: _qScreenshot,
         };
-      };
       }
 
       const checkinOk = await iframeFill(selMap.checkin, checkin);
@@ -6994,7 +6993,7 @@ async function main() {
     res.json({
       name: "NEO Worker",
       version: "10.0.0",
-      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
+      build: "neo-worker_v12-1_ts_fixes_2026-03-15",
       mode: "universal-dom-first",
       has_make_reservation: true,
       has_universal_widget_engine: true,
@@ -7005,7 +7004,7 @@ async function main() {
     res.json({
       status: "ok",
       version: "10.0.0",
-      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
+      build: "neo-worker_v12-1_ts_fixes_2026-03-15",
       has_make_reservation: true,
       has_universal_widget_engine: true,
       ...manager.getStatus()
@@ -7016,7 +7015,7 @@ async function main() {
     res.json({
       success: true,
       version: "10.0.0",
-      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
+      build: "neo-worker_v12-1_ts_fixes_2026-03-15",
       routes: [
         "GET /",
         "GET /health",
@@ -7130,8 +7129,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v12.0.0 listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v12_stepbar_routing_quendoo_2026-03-15 port=${PORT}`);
+    console.log(`🚀 NEO Worker v12.1.0 listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v12-1_ts_fixes_2026-03-15 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
