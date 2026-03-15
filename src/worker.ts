@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v8.0.0 — Universal Widget Engine
+ * NEO WORKER v9.0.0 — Universal Widget Engine + Step Indicator
  *
  * v8.0.0 — НОВА АРХИТЕКТУРА:
  * ─────────────────────────────────────────────────────────────────
@@ -4529,7 +4529,31 @@ class HotSessionManager {
       };
     } catch (e) {
       console.log(`[UNIVERSAL_SCAN][ERROR] ${e instanceof Error ? e.message : String(e)}`);
-      // Fallback to existing method
+      // ✅ Fallback 1: опитай директно в iframe (Clock PMS)
+      try {
+        const _bf = this.findBookingFrame(page);
+        if (_bf) {
+          const _scan = await this.universalScanWidgetDOM(_bf);
+          const _missingInputs = _scan.required
+            .filter(f => !f.current_value || f.current_value.trim() === "")
+            .map(f => cleanFieldLabel(f.label)).filter(s => s.length > 1);
+          const _missingDDs = _scan.dropdowns
+            .filter(d => d.required && (!d.current_value || d.current_value === "-"))
+            .map(d => cleanFieldLabel(d.label)).filter(s => s.length > 1);
+          const _allMissing = [...new Set([..._missingInputs, ..._missingDDs])].slice(0, 15);
+          console.log(`[UNIVERSAL_SCAN][IFRAME_FALLBACK] found=${_allMissing.join(" | ") || "none"}`);
+          return {
+            missing_required: _allMissing,
+            current_step: _scan.is_payment_step ? "payment" : _scan.is_checkout_step ? "checkout" : "reserve",
+            payment_required: _scan.is_payment_step,
+            can_continue: _allMissing.length === 0,
+            is_checkout_step: _scan.is_checkout_step,
+          };
+        }
+      } catch (_innerE) {
+        console.log(`[UNIVERSAL_SCAN][IFRAME_FALLBACK_ERROR] ${_innerE instanceof Error ? _innerE.message : String(_innerE)}`);
+      }
+      // Fallback 2: legacy method
       const fb = await this.inferCurrentBookingStepNeeds(page);
       return { ...fb, is_checkout_step: false };
     }
@@ -4645,6 +4669,155 @@ class HotSessionManager {
     } catch { return false; }
   }
 
+
+  // ═══════════════════════════════════════════════════════════════════
+  // readWidgetStepIndicator — чете хронологичната стъпкова лента
+  // на ВСЯКАКЪВ booking widget (Clock PMS, Beds24, Mews, Cloudbeds...)
+  // Пример Clock PMS: "СТАИ → ТАРИФИ → ЗАВЪРШВАНЕ"
+  // Пример Beds24:    "1. Search 2. Select 3. Details 4. Payment"
+  // Пример Mews:      стъпки с числа и активен клас
+  // ═══════════════════════════════════════════════════════════════════
+  private async readWidgetStepIndicator(ctx: any): Promise<{
+    steps: string[];           // всички стъпки в ред
+    current_step: string;      // текуща активна стъпка (lowercased)
+    current_index: number;     // индекс на текущата стъпка (0-based)
+    next_step: string;         // следваща стъпка
+    total_steps: number;
+    is_last_step: boolean;     // checkout/завършване/payment = последна
+    is_checkout: boolean;      // дали сме на checkout стъпка
+    raw_text: string;
+  }> {
+    const EMPTY = { steps: [], current_step: "", current_index: -1, next_step: "", total_steps: 0, is_last_step: false, is_checkout: false, raw_text: "" };
+    try {
+      return await ctx.evaluate(() => {
+        // ── Детектори за step bar ──────────────────────────────────────
+        // Стратегия: намери хоризонтален списък от стъпки, 2-8 на брой,
+        // кратък текст (≤40 chars), поне 1 е активен/current.
+        
+        const CHECKOUT_KEYWORDS = /завършв|checkout|payment|плащ|details|данни\s*за\s*к|your\s*details|guest\s*details|contact|контакт/i;
+        const TARIFF_KEYWORDS   = /тариф|rates?|price|цена|стаи\s*и|room\s*sel|select\s*room/i;
+        const ROOMS_KEYWORDS    = /стаи|rooms?|accommodation|настанявне|нощувки/i;
+
+        const isVisible = (el: Element): boolean => {
+          const s = window.getComputedStyle(el as any);
+          if (s.display === "none" || s.visibility === "hidden") return false;
+          const r = (el as any).getBoundingClientRect?.();
+          return !!r && r.width > 1 && r.height > 1;
+        };
+
+        const getActiveClass = (el: Element): boolean => {
+          const cls = String((el as any).className || "").toLowerCase();
+          const aria = (el as any).getAttribute?.("aria-current") || (el as any).getAttribute?.("aria-selected") || "";
+          const dataState = (el as any).getAttribute?.("data-state") || "";
+          return /active|current|selected|on|step--active|q-tab--active|is-active/.test(cls) ||
+                 aria === "step" || aria === "true" || dataState === "active" || dataState === "current";
+        };
+
+        const extractStepText = (el: Element): string => {
+          // Игнорирай Material icon текст в Clock PMS (q-tab)
+          let text = "";
+          const children = Array.from(el.childNodes);
+          for (const ch of children) {
+            if (ch.nodeType === 3) { // TextNode
+              const t = ch.textContent?.trim() || "";
+              if (t && t.length > 1 && t.length < 40) text += t + " ";
+            } else if ((ch as Element).tagName) {
+              const tag = (ch as Element).tagName.toLowerCase();
+              // Skip icon-only elements (Material Icons, Font Awesome)
+              const cls = String((ch as any).className || "").toLowerCase();
+              if (tag === "i" || cls.includes("icon") || cls.includes("material")) continue;
+              // For q-tab__label — this is the real text
+              if (cls.includes("label") || cls.includes("tab__label")) {
+                const t = ((ch as HTMLElement).textContent || "").trim();
+                if (t) return t;
+              }
+              const t = ((ch as HTMLElement).innerText || (ch as HTMLElement).textContent || "").trim();
+              if (t && t.length > 1 && t.length < 40) text += t + " ";
+            }
+          }
+          return text.trim() || ((el as HTMLElement).innerText || (el as HTMLElement).textContent || "").replace(/\s+/g, " ").trim().slice(0, 40);
+        };
+
+        // Стратегия 1: Quasar q-tabs (Clock PMS)
+        const qTabs = Array.from(document.querySelectorAll(".q-tab, [class*='q-tab']")).filter(isVisible);
+        if (qTabs.length >= 2 && qTabs.length <= 8) {
+          const steps = qTabs.map(t => extractStepText(t)).filter(s => s.length > 1);
+          const currentIdx = qTabs.findIndex(t => getActiveClass(t));
+          if (steps.length >= 2) {
+            const cur = currentIdx >= 0 ? steps[currentIdx] : steps[0];
+            const nxt = currentIdx >= 0 && currentIdx < steps.length - 1 ? steps[currentIdx + 1] : "";
+            const isLast = currentIdx === steps.length - 1;
+            const isCheckout = CHECKOUT_KEYWORDS.test(cur) || isLast;
+            return { steps, current_step: cur.toLowerCase(), current_index: currentIdx, next_step: nxt, total_steps: steps.length, is_last_step: isLast, is_checkout: isCheckout, raw_text: steps.join(" → ") };
+          }
+        }
+
+        // Стратегия 2: ol/ul.steps или [class*=step] или [role=tablist]
+        const stepContainers = [
+          ...Array.from(document.querySelectorAll("ol.steps, ul.steps, .wizard-steps, .step-indicator, .booking-steps, .checkout-steps, [class*='step-bar'], [class*='stepbar'], [class*='booking-wizard']")),
+          ...Array.from(document.querySelectorAll("[role='tablist'], [role='progressbar']")),
+          ...Array.from(document.querySelectorAll("nav[class*='step'], div[class*='steps']")),
+        ];
+        for (const container of stepContainers) {
+          if (!isVisible(container)) continue;
+          const items = Array.from(container.querySelectorAll("li, .step, [class*='-step'], [role='tab'], a, span[class*='step']")).filter(isVisible);
+          if (items.length < 2 || items.length > 8) continue;
+          const steps = items.map(it => extractStepText(it)).filter(s => s.length > 1 && s.length < 40);
+          if (steps.length < 2) continue;
+          const currentIdx = items.findIndex(it => getActiveClass(it));
+          const cur = currentIdx >= 0 ? steps[currentIdx] : steps[0];
+          const nxt = currentIdx >= 0 && currentIdx < steps.length - 1 ? steps[currentIdx + 1] : "";
+          const isLast = currentIdx === steps.length - 1;
+          const isCheckout = CHECKOUT_KEYWORDS.test(cur) || isLast;
+          return { steps, current_step: cur.toLowerCase(), current_index: currentIdx, next_step: nxt, total_steps: steps.length, is_last_step: isLast, is_checkout: isCheckout, raw_text: steps.join(" → ") };
+        }
+
+        // Стратегия 3: Numbered steps (1. Стаи 2. Тарифи 3. Завършване)
+        const numberedRe = /^[1-9][.)]\s*\S/;
+        const allDivs = Array.from(document.querySelectorAll("div, span, a")).filter(el => {
+          if (!isVisible(el)) return false;
+          const t = (el as HTMLElement).innerText?.trim() || "";
+          return numberedRe.test(t) && t.length < 40;
+        });
+        if (allDivs.length >= 2 && allDivs.length <= 8) {
+          const steps = allDivs.map(el => extractStepText(el)).filter(s => s.length > 1);
+          const currentIdx = allDivs.findIndex(el => getActiveClass(el));
+          const cur = currentIdx >= 0 ? steps[currentIdx] : "";
+          const nxt = currentIdx >= 0 && currentIdx < steps.length - 1 ? steps[currentIdx + 1] : "";
+          const isLast = currentIdx === steps.length - 1;
+          const isCheckout = CHECKOUT_KEYWORDS.test(cur) || isLast;
+          if (steps.length >= 2) {
+            return { steps, current_step: cur.toLowerCase(), current_index: currentIdx, next_step: nxt, total_steps: steps.length, is_last_step: isLast, is_checkout: isCheckout, raw_text: steps.join(" → ") };
+          }
+        }
+
+        // Стратегия 4: Намери активен елемент и съседи (по-общ подход)
+        const activeEls = Array.from(document.querySelectorAll("[aria-current='step'], [class*='step'][class*='active'], [class*='active'][class*='step']")).filter(isVisible);
+        if (activeEls.length > 0) {
+          const active = activeEls[0];
+          const parent = active.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children).filter(isVisible);
+            if (siblings.length >= 2 && siblings.length <= 8) {
+              const steps = siblings.map(s => extractStepText(s)).filter(s => s.length > 1);
+              const currentIdx = siblings.indexOf(active);
+              const cur = currentIdx >= 0 ? steps[currentIdx] : "";
+              const nxt = currentIdx >= 0 && currentIdx < steps.length - 1 ? steps[currentIdx + 1] : "";
+              const isLast = currentIdx === steps.length - 1;
+              const isCheckout = CHECKOUT_KEYWORDS.test(cur) || isLast;
+              return { steps, current_step: cur.toLowerCase(), current_index: currentIdx, next_step: nxt, total_steps: steps.length, is_last_step: isLast, is_checkout: isCheckout, raw_text: steps.join(" → ") };
+            }
+          }
+        }
+
+        return { steps: [], current_step: "", current_index: -1, next_step: "", total_steps: 0, is_last_step: false, is_checkout: false, raw_text: "" };
+      });
+    } catch (e) {
+      console.log(`[STEP_INDICATOR] Error: ${e instanceof Error ? e.message : String(e)}`);
+      return EMPTY;
+    }
+  }
+
   // ─────────────────────────────────────────────────────────
   // Universal booking widget navigator (replaces clockPmsNavigateToCheckout)
   // Works for: Clock PMS, Beds24, Cloudbeds, Mews, SabeeApp, LittleHotelier,
@@ -4673,6 +4846,18 @@ class HotSessionManager {
       }
       const frameText = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
       console.log(`[BOOKING_NAV] step=${step} len=${frameText.length} preview="${frameText.slice(0, 120).replace(/\s+/g, " ")}"`);
+
+      // ── Четем step indicator на widget-а (Clock PMS q-tabs, Beds24, Mews и т.н.) ──
+      // Това е най-надеждният начин да разберем на коя стъпка сме и накъде да вървим
+      const stepInfo = await this.readWidgetStepIndicator(ctx).catch(() => null);
+      if (stepInfo && stepInfo.steps.length >= 2) {
+        console.log(`[BOOKING_NAV] StepBar: [${stepInfo.steps.join(" → ")}] current="${stepInfo.current_step}" idx=${stepInfo.current_index}/${stepInfo.total_steps-1}`);
+        
+        // Ако сме на checkout → сме готови
+        if (stepInfo.is_checkout || stepInfo.is_last_step) {
+          console.log("[BOOKING_NAV] StepBar indicates CHECKOUT step ✓"); return true;
+        }
+      }
       if (frameText.trim().length < 20) {
         console.log("[BOOKING_NAV] iframe content empty — waiting");
         await page.waitForTimeout(800); continue;
@@ -5415,6 +5600,9 @@ rooms: rooms,
             const _ssEarly = await this.takeAvailabilityScreenshot(page);
             return {
               ok: true,
+              stage: "reservation_reserve_checkout_filled",
+              needs_input: false,
+              missing_required: [],
               phase: "reserve",
               message: "reserve_checkout_filled",
               booking_url: page.url(),
@@ -5506,6 +5694,17 @@ rooms: rooms,
             // URL changed to a valid booking step → progress
             if (afterUrl !== beforeUrl && !isBadRoomNavigation(beforeUrl, afterUrl)) return true;
 
+            // ✅ NEW: Check step indicator — if current step changed, we progressed
+            try {
+              const _bf2 = _findBookingFrame();
+              const _ctx2 = (_bf2 as any) || page;
+              const _newStepInfo = await this.readWidgetStepIndicator(_ctx2).catch(() => null);
+              if (_newStepInfo && _newStepInfo.steps.length >= 2 && _newStepInfo.current_index > 0) {
+                console.log(`[RESERVATION][ROOM] step indicator shows step ${_newStepInfo.current_index}/${_newStepInfo.total_steps-1}: "${_newStepInfo.current_step}" — booking progressed`);
+                return true;
+              }
+            } catch {}
+
             // Primary: did the Clock PMS iframe content change?
             try {
               const bf = _findBookingFrame();
@@ -5515,9 +5714,8 @@ rooms: rooms,
                   console.log("[RESERVATION][ROOM] iframe content changed — booking progressed");
                   return true;
                 }
-                // Even if snapshot text didn't change in length, check for tariff/checkout keywords appearing
                 const newSnapLower = newSnap.toLowerCase();
-                if (/тариф|standard.?rate|bb\b|нощувка\s*с\s*закуска|plan|покажи тарифите/i.test(newSnapLower) &&
+                if (/тариф|standard.?rate|bb|нощувка\s*с\s*закуска|plan|покажи тарифите/i.test(newSnapLower) &&
                     !/апартамент.*апартамент.*апартамент/i.test(newSnapLower)) {
                   console.log("[RESERVATION][ROOM] tariff step detected in iframe — booking progressed");
                   return true;
@@ -5962,11 +6160,28 @@ rooms: rooms,
           }
         }
 
-        // ✅ FIX: Scan AFTER checkout navigation — now the form fields are actually visible
+        // ✅ FIX v9: Scan AFTER checkout navigation using universalGetMissingRequired (scans iframe!)
         await page.waitForTimeout(800); // allow checkout form to fully render
         const screenshotAfterRoom = await this.takeAvailabilityScreenshot(page);
-        const stepNeedsAfterRoom = await this.inferCurrentBookingStepNeeds(page);
-        console.log(`[RESERVATION][STEP-NEEDS-POST-NAV] missing=${stepNeedsAfterRoom.missing_required.join(" | ") || "none"}`);
+
+        // ✅ universalGetMissingRequired сканира Clock PMS iframe правилно
+        const stepNeedsAfterRoom = await this.universalGetMissingRequired(page);
+        console.log(`[RESERVATION][STEP-NEEDS-POST-NAV] missing=${stepNeedsAfterRoom.missing_required.join(" | ") || "none"} step=${stepNeedsAfterRoom.current_step} checkout=${stepNeedsAfterRoom.is_checkout_step}`);
+
+        // Ако scan-ът не намери нищо (e.g. iframe още не е зареден), използвай fallback от step indicator
+        const _stepBar = await this.readWidgetStepIndicator(this.findBookingFrame(page) || page).catch(() => null);
+        if (_stepBar) console.log(`[RESERVATION][STEP-BAR] ${_stepBar.raw_text} current="${_stepBar.current_step}"`);
+
+        // Ако missing_required е празен НО checkout формата още не е там — значи сме на стъпка ПРЕДИ checkout
+        // В Clock PMS: ако stepBar показва "СТАИ" или "ТАРИФИ" → still navigating
+        const _stillNavigating = _stepBar && _stepBar.steps.length >= 2 && !_stepBar.is_checkout && !_stepBar.is_last_step;
+        const _missingToReport = stepNeedsAfterRoom.missing_required.length > 0
+          ? stepNeedsAfterRoom.missing_required
+          : (_stillNavigating
+            // Не сме стигнали до checkout — ще опитаме пак при следващо reserve повикване
+            ? []
+            // Стигнали сме до checkout но scan е върнал [] — правим explicit списък с ЗАДЪЛЖИТЕЛНИ гост полета
+            : ["Собствено иme", "Фамилия", "Имейл", "Телефон"]);
 
         // STEP 2: after room selection, return the REAL missing fields from the current booking step
         const hasGuestIdentity =
@@ -5977,23 +6192,30 @@ rooms: rooms,
         if (req.room_type && !hasGuestIdentity) {
           return {
             ok: true,
+            // ✅ top-level fields — frontend ги чете директно (не само от observation)
+            stage: "reservation_reserve_needs_input",
+            needs_input: true,
+            missing_required: _missingToReport,
+            selected_room_type: req.room_type || "",
             phase: "reserve",
             message: "reserve_current_step_needs_input",
-            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : "",
+            booking_url: stepNeedsAfterRoom.payment_required ? currentUrlAfterRoom : null,
             screenshot_base64: screenshotAfterRoom,
             observation: {
+              stage: "reservation_reserve_needs_input",
+              needs_input: true,
               url: currentUrlAfterRoom,
               before_url: beforeUrl,
               room_type: req.room_type || "",
               room_selection_attempted: roomSelectionAttempted,
               room_selection_succeeded: roomSelectionSucceeded,
               current_step: stepNeedsAfterRoom.current_step,
-              missing_required: stepNeedsAfterRoom.missing_required,
-              can_continue: stepNeedsAfterRoom.can_continue,
+              missing_required: _missingToReport,
+              can_continue: false,
               payment_required: stepNeedsAfterRoom.payment_required,
               finalized: false,
             },
-          };
+          } as any;
         }
 
         // STEP 3: fill personal data — UNIVERSAL ENGINE FIRST, then Clock PMS iframe fallback
@@ -6036,18 +6258,21 @@ rooms: rooms,
             } catch {}
           }
 
-          // After universal fill — check what's still missing
+          // After universal fill — check what's still missing using universalGetMissingRequired
           if (filledFields.length > 0 || req.guest_name) {
             await page.waitForTimeout(500);
-            const _stepAfterFill = await this.inferCurrentBookingStepNeeds(page);
+            const _stepAfterFill = await this.universalGetMissingRequired(page);
             console.log(`[RESERVATION][STEP3][AFTER_FILL] missing=${_stepAfterFill.missing_required.join(" | ") || "none"}`);
 
             if (_stepAfterFill.missing_required.length > 0) {
               return {
                 ok: true,
+                stage: "reservation_reserve_needs_input",
+                needs_input: true,
+                missing_required: _stepAfterFill.missing_required,
                 phase: "reserve",
                 message: "reserve_current_step_needs_input",
-                booking_url: "",
+                booking_url: null,
                 screenshot_base64: screenshotAfterRoom,
                 observation: {
                   stage: "reservation_reserve_needs_input",
@@ -6056,12 +6281,16 @@ rooms: rooms,
                   current_step: _stepAfterFill.current_step,
                   can_continue: false,
                 },
-              };
+              } as any;
             }
 
             const _finalUrl = page.url();
             return {
               ok: true,
+              stage: "reservation_reserve_checkout_filled",
+              needs_input: false,
+              missing_required: [],
+              selected_room_type: req.room_type || "",
               phase: "reserve",
               message: "reserve_checkout_filled",
               booking_url: _finalUrl,
@@ -6072,7 +6301,7 @@ rooms: rooms,
                 current_step: "checkout_filled",
                 can_continue: true,
               },
-            };
+            } as any;
           }
         }
           // ── FALLBACK: Clock PMS specific selector-based fill (if universal engine filled nothing) ──
@@ -6266,13 +6495,17 @@ rooms: rooms,
         const obs = await this.quickObserve(page);
         const currentUrl = page.url();
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-        const stepNeeds = await this.inferCurrentBookingStepNeeds(page);
+        // ✅ v9: use universalGetMissingRequired (scans iframe)
+        const stepNeeds = await this.universalGetMissingRequired(page);
 
         return {
           ok: true,
+          stage: stepNeeds.missing_required.length > 0 ? "reservation_reserve_needs_input" : "reservation_reserve_result",
+          needs_input: stepNeeds.missing_required.length > 0,
+          missing_required: stepNeeds.missing_required,
           phase: "reserve",
           message: "no_form_schema_found_current_step_preserved",
-          booking_url: stepNeeds.payment_required ? currentUrl : "",
+          booking_url: stepNeeds.payment_required ? currentUrl : null,
           screenshot_base64,
           observation: {
             ...(obs || {}),
@@ -6285,7 +6518,7 @@ rooms: rooms,
             payment_required: stepNeeds.payment_required,
             finalized: false,
           },
-        };
+        } as any;
 
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -6335,8 +6568,8 @@ async function main() {
   app.get("/", (_, res) => {
     res.json({
       name: "NEO Worker",
-      version: "8.0.0",
-      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
+      version: "9.0.0",
+      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
       mode: "universal-dom-first",
       has_make_reservation: true,
       has_universal_widget_engine: true,
@@ -6346,8 +6579,8 @@ async function main() {
    app.get("/health", (_, res) => {
     res.json({
       status: "ok",
-      version: "8.0.0",
-      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
+      version: "9.0.0",
+      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
       has_make_reservation: true,
       has_universal_widget_engine: true,
       ...manager.getStatus()
@@ -6357,8 +6590,8 @@ async function main() {
   app.get("/__routes", (_, res) => {
     res.json({
       success: true,
-      version: "8.0.0",
-      build: "neo-worker_v8_universal_widget_engine_2026-03-14",
+      version: "9.0.0",
+      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
       routes: [
         "GET /",
         "GET /health",
@@ -6472,8 +6705,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v8.0.0 Universal Widget Engine listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v8_universal_widget_engine_2026-03-14 port=${PORT}`);
+    console.log(`🚀 NEO Worker v9.0.0 Universal Widget Engine + Step Indicator listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v9_step_indicator_dom_scan_2026-03-15 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
