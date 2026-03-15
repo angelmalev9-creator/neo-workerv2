@@ -4520,23 +4520,25 @@ class HotSessionManager {
         if (_sameTextCount >= 2) {
           console.log(`[BOOKING_NAV] Frame text unchanged for ${_sameTextCount} steps — trying modal/overlay detection`);
 
-          // Check MAIN PAGE for Clock PMS checkout overlay
-          const _mainPageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainPageText);
+          // ✅ Use direct element visibility — Quasar dialogs are in portals, invisible to innerText
+          const _toggleVisible = await page.locator('.q-toggle__thumb, .q-toggle__inner').first().isVisible().catch(() => false);
+          const _loginVisible = await page.locator('button:has-text("Вход с Google"), button:has-text("Вход с имейл")').first().isVisible().catch(() => false);
+          const _reserveVisible = await page.locator('label:has-text("Резервирам за някой друг")').first().isVisible().catch(() => false);
+          const _hasOverlay = _toggleVisible || _loginVisible || _reserveVisible;
+          console.log(`[BOOKING_NAV] stuck overlay check: toggle=${_toggleVisible} login=${_loginVisible} reserve=${_reserveVisible}`);
 
           if (_hasOverlay) {
-            console.log("[BOOKING_NAV] Clock PMS login overlay detected — clicking Резервирам за някой друг toggle");
+            console.log("[BOOKING_NAV] Clock PMS overlay detected — clicking Резервирам за някой друг toggle");
 
-            // Try ALL possible toggle selectors — Quasar toggle needs inner element clicked
             const _toggleSelectors = [
-              '.q-toggle__thumb',                              // Quasar thumb (most reliable)
-              '.q-toggle__inner',                              // Quasar inner track
+              '.q-toggle__thumb',
+              '.q-toggle__inner',
               '[class*="q-toggle__track"]',
               '[class*="toggle__thumb"]',
               '[class*="toggle__inner"]',
-              'label:has-text("Резервирам за някой друг")',   // Label text
+              'label:has-text("Резервирам за някой друг")',
               'label:has-text("Резервирам")',
-              '[class*="q-toggle"]',                           // The whole toggle component
+              '[class*="q-toggle"]',
             ];
 
             let _didToggle = false;
@@ -4554,8 +4556,7 @@ class HotSessionManager {
             }
 
             if (_didToggle) {
-              // Wait for checkout form to appear on main page
-              for (let _cw = 0; _cw < 6; _cw++) {
+              for (let _cw = 0; _cw < 8; _cw++) {
                 await page.waitForTimeout(600);
                 if (await this.isAtCheckoutStep(page)) {
                   console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
@@ -4565,7 +4566,6 @@ class HotSessionManager {
                   console.log("[BOOKING_NAV] Checkout appeared in iframe after toggle ✓");
                   return true;
                 }
-                // Check if iframe content changed (sometimes checkout loads in iframe)
                 const _newFt = (await ctx.locator("body").innerText().catch(() => "")).toLowerCase();
                 if (_newFt !== frameText && _newFt.length > 100) {
                   console.log("[BOOKING_NAV] iframe changed after toggle — continuing");
@@ -4782,23 +4782,47 @@ class HotSessionManager {
         }
 
         // ── Step B: Click ИЗБЕРИ / rate CTA — strictly inside ctx (booking iframe) ──
-        await page.waitForTimeout(200);
+        // ✅ IMPORTANT: Clock PMS has TWO versions of ИЗБЕРИ:
+        //   1st click: "arrow_downward ИЗБЕРИ" (↓) → opens guests/rooms popup
+        //   2nd click: "arrow_forward ИЗБЕРИ" (→) → submits and triggers main overlay
+        // After setting guests, PREFER arrow_forward over arrow_downward.
+        await page.waitForTimeout(300);
         let _izberiClicked = false;
 
         const _ctaBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
-        for (const _btn of _ctaBtns) {
-          const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-          if (!_t) continue;
-          if (/избери|select|book|резерв|choose|reserve/i.test(_t) && _t.length <= 60) {
-            // scrollIntoViewIfNeeded to handle buttons below fold
-            await _btn.scrollIntoViewIfNeeded().catch(() => {});
-            await page.waitForTimeout(100);
-            const _vis = await _btn.isVisible().catch(() => false);
-            if (_vis) {
-              await _btn.click({ timeout: 2000 }).catch(() => {});
-              console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
-              _izberiClicked = true;
-              break;
+
+        // Pass 1: prefer arrow_forward / arrow_right ИЗБЕРИ (submits after guests set)
+        if (_guestsSet) {
+          for (const _btn of _ctaBtns) {
+            const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+            if (!_t) continue;
+            if (/избери|select|reserve/i.test(_t) && /arrow_forward|arrow_right|→/i.test(_t) && _t.length <= 60) {
+              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+              await page.waitForTimeout(100);
+              if (await _btn.isVisible().catch(() => false)) {
+                await _btn.click({ timeout: 2000 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked SUBMIT rate CTA (→): "${_t.replace(/\s+/g, " ")}"`);
+                _izberiClicked = true;
+                break;
+              }
+            }
+          }
+        }
+
+        // Pass 2: any ИЗБЕРИ (including arrow_downward on first step)
+        if (!_izberiClicked) {
+          for (const _btn of _ctaBtns) {
+            const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+            if (!_t) continue;
+            if (/избери|select|book|резерв|choose|reserve/i.test(_t) && _t.length <= 60) {
+              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+              await page.waitForTimeout(100);
+              if (await _btn.isVisible().catch(() => false)) {
+                await _btn.click({ timeout: 2000 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
+                _izberiClicked = true;
+                break;
+              }
             }
           }
         }
@@ -4807,11 +4831,13 @@ class HotSessionManager {
         }
 
         // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
-        await page.waitForTimeout(1200);
+        // ✅ CRITICAL FIX: DO NOT use body.innerText() — Quasar dialogs are in aria-hidden
+        // portals and are invisible to innerText(). Use direct element visibility instead.
+        await page.waitForTimeout(1400);
 
         // Check main page for Clock PMS checkout overlay
-        for (let _od = 0; _od < 5; _od++) {
-          await page.waitForTimeout(400);
+        for (let _od = 0; _od < 8; _od++) {
+          await page.waitForTimeout(500);
 
           // Did checkout form appear? (on main page)
           if (await this.isAtCheckoutStep(page)) {
@@ -4823,16 +4849,21 @@ class HotSessionManager {
             return true;
           }
 
-          // Check for Clock PMS overlay with login + guest toggle
-          const _mainText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-          const _hasOverlay = /резервирам за някой|вход с google|вход с имейл|sign.?in|login with google/i.test(_mainText);
+          // ✅ Use direct element visibility — not innerText — to detect Clock PMS overlay
+          const _toggleEl = page.locator('.q-toggle__thumb, .q-toggle__inner').first();
+          const _loginBtn = page.locator('button:has-text("Вход с Google"), button:has-text("Вход с имейл")').first();
+          const _reserveLabel = page.locator('label:has-text("Резервирам за някой друг"), [class*="q-toggle"]:has-text("Резервирам")').first();
+
+          const _hasOverlay =
+            await _toggleEl.isVisible().catch(() => false) ||
+            await _loginBtn.isVisible().catch(() => false) ||
+            await _reserveLabel.isVisible().catch(() => false);
+
+          console.log(`[BOOKING_NAV] overlay check _od=${_od} hasOverlay=${_hasOverlay}`);
 
           if (_hasOverlay) {
-            console.log(`[BOOKING_NAV] Clock PMS overlay detected on main page (attempt ${_od + 1})`);
+            console.log(`[BOOKING_NAV] Clock PMS overlay detected (attempt ${_od + 1})`);
 
-            // The "Резервирам за някой друг" toggle is a Quasar q-toggle on the MAIN PAGE
-            // (Clock PMS renders the checkout overlay outside the iframe)
-            // We must click it on the main page — this is unavoidable for Clock PMS
             const _toggleSelectors = [
               '.q-toggle__thumb',
               '.q-toggle__inner',
@@ -4846,10 +4877,10 @@ class HotSessionManager {
               try {
                 const _tEl = page.locator(_tSel).first();
                 if (await _tEl.count().catch(() => 0) === 0) continue;
-                if (!(await _tEl.isVisible({ timeout: 600 }).catch(() => false))) continue;
+                if (!(await _tEl.isVisible({ timeout: 800 }).catch(() => false))) continue;
                 await _tEl.scrollIntoViewIfNeeded().catch(() => {});
                 await _tEl.click({ timeout: 1500, force: true }).catch(() => {});
-                console.log(`[BOOKING_NAV] Clicked guest toggle: "${_tSel}"`);
+                console.log(`[BOOKING_NAV] ✓ Clicked guest toggle: "${_tSel}"`);
                 _toggled = true;
                 break;
               } catch {}
@@ -4857,7 +4888,7 @@ class HotSessionManager {
 
             if (_toggled) {
               _sameTextCount = 0; _prevFrameText = "";
-              for (let _cw2 = 0; _cw2 < 6; _cw2++) {
+              for (let _cw2 = 0; _cw2 < 8; _cw2++) {
                 await page.waitForTimeout(600);
                 if (await this.isAtCheckoutStep(page)) {
                   console.log("[BOOKING_NAV] Checkout appeared on main page after toggle ✓");
@@ -4874,7 +4905,6 @@ class HotSessionManager {
           }
 
           // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
-          // This happens when: first ИЗБЕРИ opens a select/dropdown for Възрастни
           const _openDropdown = await ctx.locator(
             '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
           ).first().isVisible().catch(() => false);
@@ -4898,10 +4928,11 @@ class HotSessionManager {
         continue;
       }
 
-      // ── Login/auth prompt — check BOTH iframe AND main page ────
-      const _mainPageForLogin = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      // ── Login/auth prompt — use direct visibility (not innerText) ────
       const _loginInFrame = /вход\s*с|login|sign.?in|google|имейл.*влез|create\s*account/i.test(frameText);
-      const _loginOnPage = /вход\s*с|login|sign.?in|google|имейл.*влез|резервирам за някой/i.test(_mainPageForLogin);
+      const _loginOnPage =
+        await page.locator('button:has-text("Вход с Google"), button:has-text("Вход с имейл")').first().isVisible().catch(() => false) ||
+        await page.locator('label:has-text("Резервирам за някой друг"), .q-toggle__thumb').first().isVisible().catch(() => false);
       if (_loginInFrame || _loginOnPage) {
         console.log(`[BOOKING_NAV] Login/auth prompt detected inFrame=${_loginInFrame} onPage=${_loginOnPage}`);
         // Try "Резервирам за някой друг" on MAIN page (Clock PMS)
