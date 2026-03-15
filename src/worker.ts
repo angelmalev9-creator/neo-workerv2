@@ -3577,7 +3577,7 @@ class HotSessionManager {
       const normalizedVendor = this.normalizeBookingEngine(vendor);
       const selMap = vendorDateSelectors[normalizedVendor] || vendorDateSelectors[vendor] || genericSelectors;
 
-      const bookingFrame = await this.findBookingFrameWithContent(page, normalizedVendor === 'clock_pms' ? 3500 : 2200).catch(() => this.findBookingFrame(page));
+      let bookingFrame = await this.findBookingFrameWithContent(page, normalizedVendor === 'clock_pms' ? 12000 : 2200).catch(() => this.findBookingFrame(page));
 
       // Helper: try to fill an element inside the iframe
       const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
@@ -3614,6 +3614,17 @@ class HotSessionManager {
       // availability must NOT use checkout navigation. We only set dates/guests,
       // click the real search button, and wait for room/tariff results.
       if (normalizedVendor === 'clock_pms') {
+        const getFrameTextLen = async (ctx: any): Promise<number> => {
+          try {
+            return String(await ctx.locator('body').innerText().catch(() => '')).trim().length;
+          } catch {
+            return 0;
+          }
+        };
+
+        let initialFrameLen = bookingFrame ? await getFrameTextLen(bookingFrame) : 0;
+        console.log(`[IFRAME][CLOCK] initial frame len=${initialFrameLen}`);
+
         const pageFill = await this.fillAvailabilityDates(
           page,
           {
@@ -3642,7 +3653,7 @@ class HotSessionManager {
         let searchClicked = await this.clickAvailabilitySearch(page).catch(() => false);
         console.log(`[IFRAME][CLOCK] page-level fill=${JSON.stringify(pageFill)} searchClicked=${searchClicked}`);
 
-        if (!searchClicked) {
+        if (!searchClicked && bookingFrame) {
           // fallback: try iframe-local search buttons only, but NEVER navigate checkout here
           for (const sel of selMap.search) {
             try {
@@ -3659,30 +3670,39 @@ class HotSessionManager {
           }
         }
 
+        if (!bookingFrame || initialFrameLen < 120) {
+          console.log('[IFRAME][CLOCK] frame not ready yet — waiting longer after page trigger');
+          await page.waitForTimeout(1200);
+          bookingFrame = await this.findBookingFrameWithContent(page, 12000).catch(() => this.findBookingFrame(page));
+          initialFrameLen = bookingFrame ? await getFrameTextLen(bookingFrame) : 0;
+          console.log(`[IFRAME][CLOCK] frame len after extended wait=${initialFrameLen}`);
+        }
+
         await this.waitForAvailabilityResults(page);
         const resultDetected = await (async () => {
-          const deadline = Date.now() + 8000;
+          const deadline = Date.now() + 12000;
           while (Date.now() < deadline) {
-            const freshFrame = await this.findBookingFrameWithContent(page, 1200).catch(() => this.findBookingFrame(page));
+            const freshFrame = await this.findBookingFrameWithContent(page, 1800).catch(() => this.findBookingFrame(page));
             const ctx = freshFrame || bookingFrame;
             if (!ctx) {
-              await page.waitForTimeout(400);
+              await page.waitForTimeout(500);
               continue;
             }
             const txt = String(await ctx.locator('body').innerText().catch(() => '')).toLowerCase();
-            const hasResults = /престой|стаи|тарифи|избери|покажи\s*тарифите|standard.?rate|нощувка\s*с\s*закуска|bb\b/i.test(txt);
-            if (hasResults && txt.length > 360) {
-              console.log(`[IFRAME][CLOCK] availability results detected len=${txt.length}`);
+            const hasResults = /престой|стаи|тарифи|избери|покажи\s*тарифите|standard.?rate|нощувка\s*с\s*закуска|bb/i.test(txt);
+            const strongLen = txt.trim().length;
+            if (hasResults && strongLen > 360) {
+              console.log(`[IFRAME][CLOCK] availability results detected len=${strongLen}`);
               return true;
             }
-            await page.waitForTimeout(400);
+            await page.waitForTimeout(500);
           }
           return false;
         })();
 
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
         return {
-          ok: searchClicked,
+          ok: searchClicked && (resultDetected || initialFrameLen > 360),
           message: resultDetected ? 'clock_pms_availability_ready' : 'clock_pms_availability_not_confirmed',
           screenshot_base64,
         };
@@ -4556,7 +4576,7 @@ class HotSessionManager {
   }
 
   // findBookingFrame with retry — waits up to maxWaitMs for a frame with actual content
-  private async findBookingFrameWithContent(page: Page, maxWaitMs = 6000): Promise<any> {
+  private async findBookingFrameWithContent(page: Page, maxWaitMs = 12000): Promise<any> {
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       const frames = page.frames().filter(f => f !== page.mainFrame());
@@ -4577,11 +4597,11 @@ class HotSessionManager {
           }
         } catch {}
       }
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(400);
     }
     // Fallback: return any non-analytics frame even if empty
     const fb = this.findBookingFrame(page);
-    if (fb) console.log("[BOOKING_NAV] Returning frame without content (timeout)");
+    if (fb) console.log("[BOOKING_NAV] Returning frame without content (timeout) — keeping frame for retry");
     return fb;
   }
 
