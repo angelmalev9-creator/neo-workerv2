@@ -256,14 +256,6 @@ function normalizePhone(input: unknown): string {
   return s;
 }
 
-function normalizeReservationGuests(raw: unknown, fallback = "2"): string {
-  const n = Number(String(raw || "").trim());
-  if (!Number.isFinite(n)) return fallback;
-  if (n < 1) return "1";
-  if (n > 8) return "8";
-  return String(Math.trunc(n));
-}
-
 function mergeConfirmedData(
   data: Record<string, unknown>,
   confirmed?: Record<string, unknown>
@@ -402,8 +394,6 @@ function isBadClickableLabel(raw: string): boolean {
     "български", "english", "profile or sign in",
     // ✅ Clock PMS availability calendar — NOT a booking button
     "календар на заетостта", "calendar на заетостта", "availability calendar",
-    "януари", "февруари", "март", "април", "май", "юни", "юли", "август", "септември", "октомври", "ноември", "декември",
-    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
   ]);
   if (exactBad.has(s)) return true;
 
@@ -2828,6 +2818,47 @@ class HotSessionManager {
     return candidates[0]?.s;
   }
 
+  private normalizeBookingEngine(raw: unknown): string {
+    const v = String(raw || "").toLowerCase();
+    if (!v) return "generic";
+    if (/(clock|wbe|clock\s*pms|clock_pms)/i.test(v)) return "clock_pms";
+    if (/beds24/i.test(v)) return "beds24";
+    if (/cloudbeds/i.test(v)) return "cloudbeds";
+    if (/mews/i.test(v)) return "mews";
+    if (/(sabee|sabeeapp)/i.test(v)) return "sabeeapp";
+    if (/littlehotelier/i.test(v)) return "littlehotelier";
+    if (/hotelrunner/i.test(v)) return "hotelrunner";
+    if (/bookero/i.test(v)) return "bookero";
+    if (/amelia/i.test(v)) return "amelia";
+    return "generic";
+  }
+
+  private async detectBookingEngine(page: Page, schema?: any): Promise<{ engine: string; iframeSrc: string; reason: string }> {
+    const schemaAny: any = schema?.schema || {};
+    const rawVendor = String(schemaAny?.booking_vendor || schemaAny?.vendor || schemaAny?.engine || "");
+    const rawUiType = String(schemaAny?.ui_type || "");
+    const rawIframeSrc = String(schemaAny?.iframe_src || schemaAny?.src || "");
+    const schemaHints = `${rawVendor} ${rawUiType} ${rawIframeSrc}`.toLowerCase();
+    const schemaEngine = this.normalizeBookingEngine(schemaHints);
+    if (schemaEngine !== 'generic') {
+      return { engine: schemaEngine, iframeSrc: rawIframeSrc, reason: `schema:${schemaHints.slice(0,80)}` };
+    }
+
+    const bookingFrame = await this.findBookingFrameWithContent(page, 1800).catch(() => this.findBookingFrame(page));
+    const frameHay = bookingFrame ? `${String(bookingFrame.name?.() || '')} ${String(bookingFrame.url() || '')}`.toLowerCase() : '';
+    const frameEngine = this.normalizeBookingEngine(frameHay);
+    if (frameEngine !== 'generic') {
+      return { engine: frameEngine, iframeSrc: String(bookingFrame?.url?.() || rawIframeSrc || ''), reason: `frame:${frameHay.slice(0,120)}` };
+    }
+
+    const bodyText = String(await page.locator('body').innerText().catch(() => '')).toLowerCase();
+    if (/clock\s*pms|завършване|тарифи|престой/.test(bodyText) && /(?:стаи|резерв)/.test(bodyText)) {
+      return { engine: 'clock_pms', iframeSrc: rawIframeSrc, reason: 'body:clock-signals' };
+    }
+
+    return { engine: 'generic', iframeSrc: rawIframeSrc, reason: 'fallback' };
+  }
+
   // ─────────────────────────────────────────────────────────
   // checkAvailability — universal hotel availability check
   // Fills date fields, clicks search, waits, returns screenshot
@@ -2856,20 +2887,24 @@ class HotSessionManager {
 
       const schemaAny: any = schema?.schema || {};
       const uiType = String(schemaAny?.ui_type || "").toLowerCase();
-      const iframeSrc = String(schemaAny?.iframe_src || schemaAny?.src || "");
-      const vendor = String(schemaAny?.booking_vendor || schemaAny?.vendor || "unknown");
+      const schemaIframeSrc = String(schemaAny?.iframe_src || schemaAny?.src || "");
+      const detected = await this.detectBookingEngine(page, schema);
+      const engine = detected.engine;
+      const iframeSrc = detected.iframeSrc || schemaIframeSrc;
+      const vendor = engine !== 'generic' ? engine : String(schemaAny?.booking_vendor || schemaAny?.vendor || "unknown");
 
       const isIframeAvailability =
+        engine !== 'generic' ||
         uiType.includes("iframe_booking_widget") ||
         !!iframeSrc ||
         String(vendor).toLowerCase().includes("quendoo");
 
-      // ── 2. Schema-first iframe availability flow ───────────────
-      if (isIframeAvailability) {
-        console.log(`[AVAIL] iframe schema detected ui_type=${uiType} vendor=${vendor} url=${schema.url}`);
+      console.log(`[AVAIL][ENGINE] engine=${engine} vendor=${vendor} reason=${detected.reason} ui_type=${uiType} url=${schema.url}`);
 
+      // ── 2. Engine-first iframe availability flow ───────────────
+      if (isIframeAvailability) {
         await this.ensureOnSchemaUrl(page, schema.url);
-        await page.waitForTimeout(1200);
+        await page.waitForTimeout(engine === 'clock_pms' ? 1600 : 1200);
 
         const iframeResult = await this.fillIframeBookingWidget(
           page,
@@ -2894,6 +2929,7 @@ class HotSessionManager {
             url: page.url(),
             iframe_src: iframeSrc,
             vendor,
+            engine,
             fill_result: {
               checkin: true,
               checkout: true,
@@ -3442,6 +3478,27 @@ class HotSessionManager {
 
       // ── Vendor-specific date selectors ────────────────────
       const vendorDateSelectors: Record<string, { checkin: string[]; checkout: string[]; guests: string[]; search: string[] }> = {
+        clock_pms: {
+          checkin: [
+            'input[name="arrival"]', '#floatingArrival', 'input[placeholder*="Пристигане"]',
+            'input[aria-label*="Пристигане"]', '[data-testid*="arrival"] input',
+            '[class*="arrival"] input', '[class*="checkin"] input', 'input[type="date"]'
+          ],
+          checkout: [
+            'input[name="departure"]', '#floatingDeparture', 'input[placeholder*="Заминаване"]',
+            'input[aria-label*="Заминаване"]', '[data-testid*="departure"] input',
+            '[class*="departure"] input', '[class*="checkout"] input', 'input[type="date"]'
+          ],
+          guests: [
+            'select[name*="adult"]', 'select[name*="guest"]', '[class*="q-select"] input',
+            '[class*="guest"] input', '[class*="adult"] input', '[aria-label*="Гости"]', '[aria-label*="Adults"]'
+          ],
+          search: [
+            'button:has-text("Резервирай")', 'button:has-text("Провери и резервирай")',
+            'button:has-text("Провери")', 'button:has-text("Търси")',
+            'button:has-text("Search")', 'button[type="submit"]', 'input[type="submit"]'
+          ],
+        },
         cloudbeds: {
           checkin: ['input[name="checkin"]', '.cb-checkin input', '#checkin', 'input[placeholder*="Check-in"]'],
           checkout: ['input[name="checkout"]', '.cb-checkout input', '#checkout', 'input[placeholder*="Check-out"]'],
@@ -3517,7 +3574,11 @@ class HotSessionManager {
         ],
       };
 
-      const selMap = vendorDateSelectors[vendor] || genericSelectors;
+      const normalizedVendor = this.normalizeBookingEngine(vendor);
+      const selMap = vendorDateSelectors[normalizedVendor] || vendorDateSelectors[vendor] || genericSelectors;
+
+      const bookingFrame = await this.findBookingFrameWithContent(page, normalizedVendor === 'clock_pms' ? 3500 : 2200).catch(() => this.findBookingFrame(page));
+      const clockCtx: any = bookingFrame || null;
 
       // Helper: try to fill an element inside the iframe
       const iframeFill = async (selectors: string[], value: string): Promise<boolean> => {
@@ -3559,20 +3620,31 @@ class HotSessionManager {
       const checkoutOk = await iframeFill(selMap.checkout, checkout);
       await page.waitForTimeout(300);
 
-      // Guests (optional)
+      // Guests (optional / required for many widgets)
       try {
+        let guestFilled = false;
         for (const sel of selMap.guests) {
           const loc = frameLocator.locator(sel).first();
           const count = await loc.count().catch(() => 0);
           if (count === 0) continue;
+          const visible = await loc.isVisible().catch(() => false);
+          if (!visible) continue;
           const tag = await loc.evaluate((el: any) => el.tagName?.toLowerCase()).catch(() => "");
           if (tag === "select") {
             await loc.selectOption(guests).catch(() => {});
+            guestFilled = true;
           } else {
+            await loc.click({ timeout: 1200 }).catch(() => {});
             await loc.fill(guests).catch(() => {});
+            guestFilled = true;
           }
-          await page.waitForTimeout(200);
-          break;
+          await page.waitForTimeout(250);
+          if (guestFilled) break;
+        }
+
+        if (!guestFilled && normalizedVendor === 'clock_pms' && clockCtx) {
+          const reached = await this.navigateBookingWidgetToCheckout(page, guests).catch(() => false);
+          console.log(`[IFRAME][CLOCK] navigateBookingWidgetToCheckout during availability reached=${reached}`);
         }
       } catch {}
 
@@ -3585,11 +3657,16 @@ class HotSessionManager {
           if (count === 0) continue;
           const visible = await loc.isVisible().catch(() => false);
           if (!visible) continue;
-          await loc.click({ timeout: 3000 });
+          await loc.click({ timeout: 3000, force: true });
           searchClicked = true;
           console.log(`[IFRAME][SEARCH] clicked ${sel}`);
           break;
         } catch {}
+      }
+
+      if (!searchClicked && normalizedVendor === 'clock_pms') {
+        searchClicked = await this.clickAvailabilitySearch(page).catch(() => false);
+        console.log(`[IFRAME][CLOCK] main-page search fallback clicked=${searchClicked}`);
       }
 
       await this.waitForAvailabilityResults(page);
@@ -4504,7 +4581,7 @@ class HotSessionManager {
       console.log("[BOOKING_NAV] No booking iframe found — trying main page navigation");
     }
     let ctx: any = bf || page;
-    const guestNum = parseInt(normalizeReservationGuests(guests, "2"), 10) || 2;
+    const guestNum = parseInt(guests || "2") || 2;
     console.log(`[BOOKING_NAV] Starting universal checkout navigator guests=${guestNum} iframe=${!!bf}`);
 
     let _prevFrameText = "";
@@ -5003,7 +5080,6 @@ class HotSessionManager {
         for (const btn of anyBtns) {
           const t = (await btn.innerText().catch(() => "")).trim();
           if (!t || isBadClickableLabel(t)) continue;
-          if (/^(януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември|january|february|march|april|may|june|july|august|september|october|november|december)$/i.test(t)) continue;
           if (!(await btn.isVisible().catch(() => false))) continue;
           await btn.scrollIntoViewIfNeeded().catch(() => {});
           await btn.click({ timeout: 1500 }).catch(() => {});
@@ -5036,7 +5112,7 @@ class HotSessionManager {
 
     const checkin  = String(req.check_in || "").trim();
     const checkout = String(req.check_out || "").trim();
-    const guests   = normalizeReservationGuests(req.guests || "2", "2");
+    const guests   = String(req.guests || "2");
     const rooms    = String(req.rooms || "1");
     const page     = session.page;
 
@@ -5666,8 +5742,6 @@ rooms: rooms,
               const _ft = (await _fb.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
               if (!_ft || isBadClickableLabel(_ft)) continue;
               if (/календар|заетост|calendar/i.test(_ft)) continue;
-              if (/^(януари|февруари|март|април|май|юни|юли|август|септември|октомври|ноември|декември|january|february|march|april|may|june|july|august|september|october|november|december)$/i.test(_ft)) continue;
-              if (/^покажи\s*повече/i.test(_ft)) continue;
               if (!(await _fb.isVisible().catch(() => false))) continue;
               const _unavail = await _fb.evaluate((el: any): boolean => {
                 let p: Element | null = el;
