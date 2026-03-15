@@ -4604,7 +4604,8 @@ class HotSessionManager {
 
           // ✅ If stuck on tariff step with no ИЗБЕРИ found, try scrolling frame
           // and searching for ИЗБЕРИ with force approach
-          if (_sameTextCount >= 2 && hasTariffContent) {
+          const _stuckOnTariff = /standard.?rate|standard.?rate.?bb|meal\s*plan|rate\s*name|bb\s*plan|нощувка\s*с\s*закуска|закуска\s*включен/i.test(frameText);
+          if (_sameTextCount >= 2 && _stuckOnTariff) {
             console.log("[BOOKING_NAV] Stuck on tariff step — trying frame-wide ИЗБЕРИ search");
             const _stuckBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
             for (const _sb of _stuckBtns) {
