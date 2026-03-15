@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v11.1.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
+ * NEO WORKER v12.0.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
  *
  * v8.0.0 — НОВА АРХИТЕКТУРА:
  * ─────────────────────────────────────────────────────────────────
@@ -3837,60 +3837,80 @@ class HotSessionManager {
 
       // ── Quendoo calendar widget — click-based date picker ──────
       if (_isQuendoo) {
-        // Quendoo is a SPA calendar — must click on "Пристигане"/"Напускане" labels
-        // then click the correct day numbers in the calendar grid
-
         const _qFrame = await this.findBookingFrameWithContent(page, 5000).catch(() => null);
         const _qCtx: any = _qFrame || page;
-
         console.log(`[QUENDOO] Starting calendar interaction frame=${!!_qFrame}`);
 
-        // Parse dates
-        const _ciParts = checkin.split('-');  // ["2026","03","16"]
+        const _ciParts = checkin.split('-');
         const _coParts = checkout.split('-');
-        const _ciDay = parseInt(_ciParts[2] || '1');
-        const _coDay = parseInt(_coParts[2] || '1');
+        const _ciDay   = parseInt(_ciParts[2] || '1');
+        const _coDay   = parseInt(_coParts[2] || '1');
         const _ciMonth = parseInt(_ciParts[1] || '1');
-        const _coMonth = parseInt(_coParts[1] || '1');
 
-        // Helper: click a day in the Quendoo calendar
-        const clickQuendooDay = async (dayNum: number, monthNum: number, hint: string): Promise<boolean> => {
-          // Quendoo calendar day selectors (SPA React/Vue calendar)
-          const _daySels = [
-            `[class*="day"][data-date*="${checkin.slice(0,7)}-${String(dayNum).padStart(2,'0')}"]`,
-            `[class*="day"][data-date*="-${String(dayNum).padStart(2,'0')}"]`,
-            `[class*="DayCell"]:not([class*="disabled"]):not([class*="past"])`,
-            `[class*="calendar-day"]:not([class*="disabled"])`,
-            `[role="gridcell"]:not([aria-disabled="true"])`,
-            `td[class*="available"]:not([class*="disabled"])`,
-            `[class*="day"]:not([class*="disabled"]):not([class*="inactive"])`,
-          ];
+        // ✅ v12 FIX: Click the DATE INPUT (or button) inside the container, not the container itself
+        // Quendoo containers: div[class*="arrival"] > input or button
+        const _ciTriggerSels = [
+          // Input fields
+          '[class*="arrival"] input, [class*="Arrival"] input',
+          '[class*="checkin"] input, [class*="CheckIn"] input',
+          'input[placeholder*="Пристигане"], input[placeholder*="Check-in"], input[placeholder*="Arrival"]',
+          'input[placeholder*="From"], input[name*="checkin"], input[name*="arrival"]',
+          // Clickable elements that open the calendar
+          '[class*="arrival"] button, [class*="checkin"] button',
+          '[class*="date-from"], [class*="dateFrom"], [class*="date_from"]',
+          // Quendoo specific
+          '.booking-calendar-checkin, .checkin-date, .arrival-date',
+        ];
 
-          // First try: click by data-date attribute
-          for (const sel of _daySels.slice(0, 2)) {
+        let _ciOpened = false;
+        for (const selGroup of _ciTriggerSels) {
+          for (const sel of selGroup.split(',').map((s: string) => s.trim())) {
             try {
               const el = _qCtx.locator(sel).first();
-              if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-                await el.click({ timeout: 2000 });
-                console.log(`[QUENDOO] ${hint}: clicked via data-date selector`);
+              if (!(await el.isVisible({ timeout: 600 }).catch(() => false))) continue;
+              await el.click({ timeout: 1500 });
+              console.log(`[QUENDOO] Clicked checkin trigger: ${sel}`);
+              _ciOpened = true;
+              break;
+            } catch {}
+          }
+          if (_ciOpened) break;
+        }
+
+        // Wait for calendar grid to appear
+        if (_ciOpened) await page.waitForTimeout(1200);
+
+        // Helper: click a calendar day by matching text content
+        const clickCalDay = async (dayNum: number, label: string): Promise<boolean> => {
+          const _calSels = [
+            `.flatpickr-day:not(.disabled):not(.prevMonthDay):not(.nextMonthDay)`,
+            `[class*="DayCell"]:not([class*="disabled"])`,
+            `[class*="calendar-day"]:not([class*="disabled"])`,
+            `[role="gridcell"]:not([aria-disabled="true"])`,
+            `[class*="day"]:not([class*="disabled"]):not([class*="inactive"])`,
+            `td:not([class*="disabled"])`,
+          ];
+          for (const sel of _calSels) {
+            try {
+              const allEls = await _qCtx.locator(sel).all().catch(() => []);
+              for (const el of allEls) {
+                const txt = (await el.textContent().catch(() => "")).trim();
+                if (txt !== String(dayNum)) continue;
+                if (!(await el.isVisible().catch(() => false))) continue;
+                const cls = await el.getAttribute('class').catch(() => '') || '';
+                if (/disabled|inactive|past|prev-month|next-month/i.test(cls)) continue;
+                await el.click({ timeout: 1500 });
+                console.log(`[QUENDOO] Clicked ${label} day ${dayNum}`);
                 return true;
               }
             } catch {}
           }
-
-          // Second: find by text content matching day number
+          // Fallback: data-date attribute
           try {
-            const allDays = await _qCtx.locator(`[class*="day"], [class*="Day"], [role="gridcell"], td`).all().catch(() => []);
-            for (const dayEl of allDays) {
-              const txt = (await dayEl.textContent().catch(() => "")).trim();
-              if (txt !== String(dayNum)) continue;
-              const visible = await dayEl.isVisible().catch(() => false);
-              if (!visible) continue;
-              // Check not disabled
-              const cls = await dayEl.getAttribute('class').catch(() => '') || '';
-              if (/disabled|inactive|past|prev|next/i.test(cls)) continue;
-              await dayEl.click({ timeout: 2000 });
-              console.log(`[QUENDOO] ${hint}: clicked day ${dayNum} by text`);
+            const _byDate = _qCtx.locator(`[data-date*="${checkin.slice(0,7)}-${String(dayNum).padStart(2,'0')}"], [data-date*="${String(dayNum).padStart(2,'0')}"]`).first();
+            if (await _byDate.isVisible({ timeout: 400 }).catch(() => false)) {
+              await _byDate.click({ timeout: 1500 });
+              console.log(`[QUENDOO] Clicked ${label} day ${dayNum} via data-date`);
               return true;
             }
           } catch {}
@@ -3898,87 +3918,69 @@ class HotSessionManager {
         };
 
         let _calSuccess = false;
-
-        // Step 1: Click the "Пристигане" / checkin field to open calendar
-        const _ciFieldSels = [
-          '[class*="arrival"], [class*="Arrival"], [class*="checkin"], [class*="CheckIn"]',
-          'input[placeholder*="Пристигане"], input[placeholder*="Check-in"], input[placeholder*="Arrival"]',
-          '[class*="date-picker"]:first-child, [class*="datepicker"]:first-child',
-          'button[class*="date"]:first-child',
-          'div[class*="input"]:has-text("Пристигане"), div[class*="input"]:has-text("Arrival")',
-        ];
-
-        let _ciFieldClicked = false;
-        for (const sel of _ciFieldSels) {
-          try {
-            const el = _qCtx.locator(sel).first();
-            if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-              await el.click({ timeout: 2000 });
-              console.log(`[QUENDOO] Opened checkin picker via: ${sel}`);
-              _ciFieldClicked = true;
-              await page.waitForTimeout(800);
-              break;
-            }
-          } catch {}
-        }
-
-        // Step 2: If calendar opened, click the checkin day
-        if (_ciFieldClicked) {
-          _calSuccess = await clickQuendooDay(_ciDay, _ciMonth, 'checkin');
+        if (_ciOpened) {
+          _calSuccess = await clickCalDay(_ciDay, 'checkin');
           if (_calSuccess) {
-            await page.waitForTimeout(600);
-
-            // Step 3: Click checkout day (calendar may already be on checkout mode)
-            const _coSuccess = await clickQuendooDay(_coDay, _coMonth, 'checkout');
-            if (!_coSuccess) {
-              // Try clicking the checkout field first
-              const _coFieldSels = [
+            await page.waitForTimeout(700);
+            // After checkin clicked, checkout calendar may open automatically
+            // or we need to click the checkout trigger
+            let _coClicked = await clickCalDay(_coDay, 'checkout');
+            if (!_coClicked) {
+              // Try opening checkout picker explicitly
+              const _coTriggerSels = [
+                '[class*="departure"] input, [class*="Departure"] input',
+                '[class*="checkout"] input, [class*="CheckOut"] input',
                 'input[placeholder*="Заминаване"], input[placeholder*="Check-out"], input[placeholder*="Departure"]',
-                '[class*="departure"], [class*="Departure"], [class*="checkout"], [class*="CheckOut"]',
               ];
-              for (const sel of _coFieldSels) {
-                try {
-                  const el = _qCtx.locator(sel).first();
-                  if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
-                    await el.click({ timeout: 1500 });
-                    await page.waitForTimeout(500);
-                    await clickQuendooDay(_coDay, _coMonth, 'checkout-after-click');
-                    break;
-                  }
-                } catch {}
+              for (const selGroup of _coTriggerSels) {
+                for (const sel of selGroup.split(',').map((s: string) => s.trim())) {
+                  try {
+                    const el = _qCtx.locator(sel).first();
+                    if (!(await el.isVisible({ timeout: 500 }).catch(() => false))) continue;
+                    await el.click({ timeout: 1200 });
+                    await page.waitForTimeout(700);
+                    _coClicked = await clickCalDay(_coDay, 'checkout-after-trigger');
+                    if (_coClicked) break;
+                  } catch {}
+                }
+                if (_coClicked) break;
               }
             }
-            await page.waitForTimeout(500);
           }
         }
 
-        // Step 4: Set guests count
+        // Set guests
         try {
-          const _guestSelectors = [
-            'input[placeholder*="Гости"], input[placeholder*="Adults"], select[class*="guests"]',
-            '[class*="guests"] input, [class*="adult"] input, [class*="person"] input',
+          const _guestSels = [
+            'input[placeholder*="Гости"], input[placeholder*="Adults"], input[placeholder*="Guests"]',
+            '[class*="guests"] input, [class*="adult"] input',
+            'select[class*="guests"], select[class*="adult"]',
           ];
-          for (const gSel of _guestSelectors) {
-            const gEl = _qCtx.locator(gSel).first();
-            if (await gEl.isVisible({ timeout: 500 }).catch(() => false)) {
-              await gEl.fill(guests).catch(() => {});
-              break;
+          for (const sg of _guestSels) {
+            for (const sel of sg.split(',').map((s: string) => s.trim())) {
+              try {
+                const el = _qCtx.locator(sel).first();
+                if (!(await el.isVisible({ timeout: 400 }).catch(() => false))) continue;
+                const tag = await el.evaluate((e: any) => e.tagName?.toLowerCase()).catch(() => '');
+                if (tag === 'select') await el.selectOption(guests).catch(() => {});
+                else await el.fill(guests).catch(() => {});
+                break;
+              } catch {}
             }
           }
         } catch {}
 
-        // Step 5: Click search/reserve button
+        // Click search/reserve
         const _qSearchSels = [
           'button:has-text("РЕЗЕРВИРАЙ")', 'button:has-text("Резервирай")',
           'button:has-text("Reserve")', 'button:has-text("Book")',
-          'button:has-text("Search")', 'button:has-text("Търси")',
-          'button[type="submit"]', '[class*="submit"]', '[class*="search-btn"]',
+          'button:has-text("Search")', 'button[type="submit"]',
         ];
         let _qSearchClicked = false;
         for (const sel of _qSearchSels) {
           try {
             const btn = _qCtx.locator(sel).first();
-            if (await btn.isVisible({ timeout: 600 }).catch(() => false)) {
+            if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
               await btn.click({ timeout: 2000 });
               console.log(`[QUENDOO] Clicked search: ${sel}`);
               _qSearchClicked = true;
@@ -3990,19 +3992,17 @@ class HotSessionManager {
         await page.waitForTimeout(2500);
         await this.waitForAvailabilityResults(page);
         const _qScreenshot = await this.takeAvailabilityScreenshot(page);
-
         const _qFrameAfter = await this.findBookingFrameWithContent(page, 3000).catch(() => null);
-        const _qResultText = _qFrameAfter
-          ? (await _qFrameAfter.locator('body').innerText().catch(() => '')).slice(0, 200)
-          : '';
-        const _qHasRooms = _qResultText.length > 100 && !/^(Пристигане|Arrival|Check-in)/.test(_qResultText.trim());
-        console.log(`[QUENDOO] Result: calSuccess=${_calSuccess} searchClicked=${_qSearchClicked} hasRooms=${_qHasRooms} len=${_qResultText.length}`);
+        const _qTxt = _qFrameAfter ? (await _qFrameAfter.locator('body').innerText().catch(() => '')).slice(0, 200) : '';
+        const _qHasRooms = _qTxt.length > 100;
+        console.log(`[QUENDOO] Result: calSuccess=${_calSuccess} searchClicked=${_qSearchClicked} hasRooms=${_qHasRooms} len=${_qTxt.length}`);
 
         return {
           ok: _qSearchClicked || _calSuccess,
           message: _qHasRooms ? 'quendoo_availability_ready' : 'quendoo_availability_attempted',
           screenshot_base64: _qScreenshot,
         };
+      };
       }
 
       const checkinOk = await iframeFill(selMap.checkin, checkin);
@@ -5159,12 +5159,32 @@ class HotSessionManager {
       // ── Четем step indicator на widget-а (Clock PMS q-tabs, Beds24, Mews и т.н.) ──
       // Това е най-надеждният начин да разберем на коя стъпка сме и накъде да вървим
       const stepInfo = await this.readWidgetStepIndicator(ctx).catch(() => null);
+      // ✅ v12 FIX: StepBar now ROUTES to the correct handler — overrides text detection
+      let _stepBarForceTariff = false;
+      let _stepBarForceRoom   = false;
       if (stepInfo && stepInfo.steps.length >= 2) {
         console.log(`[BOOKING_NAV] StepBar: [${stepInfo.steps.join(" → ")}] current="${stepInfo.current_step}" idx=${stepInfo.current_index}/${stepInfo.total_steps-1}`);
-        
-        // Ако сме на checkout → сме готови
+
+        // Ако сме на checkout → готово
         if (stepInfo.is_checkout || stepInfo.is_last_step) {
           console.log("[BOOKING_NAV] StepBar indicates CHECKOUT step ✓"); return true;
+        }
+
+        const _curStep = stepInfo.current_step || "";
+        // StepBar "rates"/"тарифи"/"sell"/"price" → tariff handler
+        if (/rates?|тариф|sell|price|цен/i.test(_curStep)) {
+          _stepBarForceTariff = true;
+          console.log(`[BOOKING_NAV] StepBar ROUTES → TARIFF handler (current="${_curStep}")`);
+        }
+        // StepBar "rooms"/"стаи"/"accommodation" → room handler
+        else if (/rooms?|стаи|accommodation|grid_view/i.test(_curStep)) {
+          _stepBarForceRoom = true;
+          console.log(`[BOOKING_NAV] StepBar ROUTES → ROOM handler (current="${_curStep}")`);
+        }
+        // StepBar "stay"/"престой" → we're on dates step, need to click next room
+        else if (/stay|престой/i.test(_curStep)) {
+          _stepBarForceRoom = true;
+          console.log(`[BOOKING_NAV] StepBar ROUTES → ROOM handler via stay step (current="${_curStep}")`);
         }
       }
       if (frameText.trim().length < 20) {
@@ -5303,7 +5323,8 @@ class HotSessionManager {
         /breakfast\s*included|нощувка\s*с\s*закуска|закуска\s*включен/i.test(frameText) ||
         /\d+[\.,]\d+\s*(лв|bgn|eur|€|\$)\s*[\/на]\s*нощ/i.test(frameText)
       );
-      const isRoomStep = (
+      const isRoomStep = _stepBarForceRoom || (
+        !_stepBarForceTariff &&
         /апартамент|единична|двойна|студио|suite|room|стая|accommodation|камер/i.test(frameText) &&
         !hasTariffContent
       );
@@ -5381,7 +5402,7 @@ class HotSessionManager {
       const hasIzberiBtn = await ctx.locator(
         'button:has-text("ИЗБЕРИ"), button:has-text("Избери"), [role="button"]:has-text("ИЗБЕРИ")'
       ).count().catch(() => 0) > 0;
-      const isTariffStep = hasTariffContent || hasIzberiBtn ||
+      const isTariffStep = _stepBarForceTariff || hasTariffContent || hasIzberiBtn ||
         /standard.?rate|standard.?rate.?bb|meal\s*plan|rate\s*name|bb\s*plan|нощувка\s*с\s*закуска|закуска\s*включен/i.test(frameText);
       if (isTariffStep) {
         console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent}`);
@@ -5488,7 +5509,8 @@ class HotSessionManager {
           console.log(`[BOOKING_NAV] ИЗБЕРИ not found on tariff step — hasTariffContent=${hasTariffContent}`);
         }
 
-        // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
+        // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay OR proceed to arrow_forward ──
+        // ✅ v12 FIX: Also check if arrow_forward SELECT is now available (guest qty may have auto-set)
         // ✅ CRITICAL FIX: DO NOT use body.innerText() — Quasar dialogs are in aria-hidden
         // portals and are invisible to innerText(). Use direct element visibility instead.
         await page.waitForTimeout(1400);
@@ -5562,25 +5584,76 @@ class HotSessionManager {
             break;
           }
 
-          // Check if a dropdown opened in iframe (guests selector after first ИЗБЕРИ)
-          const _openDropdown = await ctx.locator(
-            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
-          ).first().isVisible().catch(() => false);
-          const _openDropdownPage = await page.locator(
-            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]'
-          ).first().isVisible().catch(() => false);
+          // Check if a guests/adults dropdown opened (after first arrow_downward click)
+          // Must check BOTH iframe and main page — Quasar teleports menus to document root
+          const _ddSelectors = [
+            '[class*="q-menu"], [class*="q-list"], .q-virtual-scroll, [role="listbox"]',
+            '[class*="dropdown"][class*="open"], [class*="select"][class*="open"]',
+            '.q-popup-container, [aria-haspopup="listbox"][aria-expanded="true"]',
+          ];
+          let _openDropdown = false;
+          let _listCtx: any = page;
+          for (const _dds of _ddSelectors) {
+            const _inPage = await page.locator(_dds).first().isVisible().catch(() => false);
+            const _inCtx  = await ctx.locator(_dds).first().isVisible().catch(() => false);
+            if (_inPage) { _openDropdown = true; _listCtx = page; break; }
+            if (_inCtx)  { _openDropdown = true; _listCtx = ctx;  break; }
+          }
 
-          if (_openDropdown || _openDropdownPage) {
-            console.log("[BOOKING_NAV] Dropdown/listbox is open — selecting guest count");
-            const _listCtx = _openDropdownPage ? page : ctx;
-            const _optEl = _listCtx.locator(`[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`).first();
-            if (await _optEl.isVisible().catch(() => false)) {
-              await _optEl.click({ timeout: 1500 }).catch(() => {});
-              console.log(`[BOOKING_NAV] Selected ${guestNum} from open dropdown`);
-              await page.waitForTimeout(400);
-              _sameTextCount = 0; _prevFrameText = "";
+          if (_openDropdown) {
+            console.log("[BOOKING_NAV] Dropdown is open — selecting guest count");
+            const _optSels = [
+              `[role="option"]:has-text("${guestNum}")`,
+              `.q-item:has-text("${guestNum}")`,
+              `li:has-text("${guestNum}")`,
+              `option:has-text("${guestNum}")`,
+            ];
+            let _optClicked = false;
+            for (const _os of _optSels) {
+              const _optEl = _listCtx.locator(_os).first();
+              if (await _optEl.isVisible().catch(() => false)) {
+                await _optEl.click({ timeout: 1500 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Selected ${guestNum} guests from dropdown`);
+                await page.waitForTimeout(400);
+                _sameTextCount = 0; _prevFrameText = "";
+                _optClicked = true;
+                break;
+              }
+            }
+            if (_optClicked) {
+              // Now try arrow_forward SELECT to proceed to checkout
+              await page.waitForTimeout(300);
+              const _fwdBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+              for (const _fb of _fwdBtns) {
+                const _ft = (await _fb.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+                if (/избери|select|reserve/i.test(_ft) && /arrow_forward|arrow_right|→/i.test(_ft) && _ft.length <= 60) {
+                  await _fb.scrollIntoViewIfNeeded().catch(() => {});
+                  await _fb.click({ timeout: 2000 }).catch(() => {});
+                  console.log(`[BOOKING_NAV] Clicked → SELECT after guest selection: "${_ft}"`);
+                  break;
+                }
+              }
             }
             break;
+          }
+        }
+        // ✅ v12: If no overlay found and dropdown didn't open — try arrow_forward SELECT as last resort
+        if (_izberiClicked) {
+          const _fwdBtns2 = await ctx.locator("button, [role='button']").all().catch(() => []);
+          for (const _fb2 of _fwdBtns2) {
+            const _ft2 = (await _fb2.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+            if (/избери|select|reserve/i.test(_ft2) && /arrow_forward|arrow_right|→/i.test(_ft2) && _ft2.length <= 60) {
+              if (await _fb2.isVisible().catch(() => false)) {
+                await _fb2.scrollIntoViewIfNeeded().catch(() => {});
+                await _fb2.click({ timeout: 2000 }).catch(() => {});
+                console.log(`[BOOKING_NAV] Last resort → SELECT: "${_ft2}"`);
+                await page.waitForTimeout(1200);
+                if (await this.isAtCheckoutStep(page) || await this.isAtCheckoutStep(ctx)) {
+                  console.log("[BOOKING_NAV] Checkout reached after → SELECT ✓"); return true;
+                }
+                break;
+              }
+            }
           }
         }
         continue;
@@ -6921,7 +6994,7 @@ async function main() {
     res.json({
       name: "NEO Worker",
       version: "10.0.0",
-      build: "neo-worker_v11-1_hybrid_screenshot_iframe_fill_2026-03-15",
+      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
       mode: "universal-dom-first",
       has_make_reservation: true,
       has_universal_widget_engine: true,
@@ -6932,7 +7005,7 @@ async function main() {
     res.json({
       status: "ok",
       version: "10.0.0",
-      build: "neo-worker_v11-1_hybrid_screenshot_iframe_fill_2026-03-15",
+      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
       has_make_reservation: true,
       has_universal_widget_engine: true,
       ...manager.getStatus()
@@ -6943,7 +7016,7 @@ async function main() {
     res.json({
       success: true,
       version: "10.0.0",
-      build: "neo-worker_v11-1_hybrid_screenshot_iframe_fill_2026-03-15",
+      build: "neo-worker_v12_stepbar_routing_quendoo_2026-03-15",
       routes: [
         "GET /",
         "GET /health",
@@ -7057,8 +7130,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v11.1.0 listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v11-1_hybrid_screenshot_iframe_fill_2026-03-15 port=${PORT}`);
+    console.log(`🚀 NEO Worker v12.0.0 listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v12_stepbar_routing_quendoo_2026-03-15 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
