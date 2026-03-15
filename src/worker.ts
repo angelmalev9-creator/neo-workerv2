@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v9.0.0 — Universal Widget Engine + Step Indicator
+ * NEO WORKER v10.0.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
  *
  * v8.0.0 — НОВА АРХИТЕКТУРА:
  * ─────────────────────────────────────────────────────────────────
@@ -2903,8 +2903,28 @@ class HotSessionManager {
 
       // ── 2. Engine-first iframe availability flow ───────────────
       if (isIframeAvailability) {
-        await this.ensureOnSchemaUrl(page, schema.url);
-        await page.waitForTimeout(engine === 'clock_pms' ? 1600 : 1200);
+        // ✅ v10 FIX: Smart URL — don't navigate away if booking iframe already present
+        const _hasFrameNow = !!this.findBookingFrame(page);
+        if (!_hasFrameNow) {
+          // No iframe on current page — try schema URL first
+          await this.ensureOnSchemaUrl(page, schema.url);
+          await page.waitForTimeout(engine === 'clock_pms' ? 1800 : 1200);
+          // If still no iframe, try site root
+          const _hasFrameAfterNav = !!this.findBookingFrame(page);
+          if (!_hasFrameAfterNav && schema.url) {
+            try {
+              const _siteRoot = new URL(schema.url).origin + "/";
+              if (_siteRoot !== schema.url) {
+                console.log(`[AVAIL] Iframe not found at schema URL → trying site root: ${_siteRoot}`);
+                await page.goto(_siteRoot, { waitUntil: "domcontentloaded", timeout: 12000 });
+                await page.waitForTimeout(1800);
+              }
+            } catch {}
+          }
+        } else {
+          console.log(`[AVAIL] Booking iframe already present on ${page.url()} — skipping navigation`);
+          await page.waitForTimeout(engine === 'clock_pms' ? 1000 : 600);
+        }
 
         const iframeResult = await this.fillIframeBookingWidget(
           page,
@@ -3451,7 +3471,31 @@ class HotSessionManager {
         } catch {}
       }
       if (!frameLocator) {
-        console.log("[IFRAME] Could not locate iframe, falling back to main page");
+        // ✅ v10 FIX: Before falling back, try site root URL
+        const _curUrl = page.url();
+        let _retriedRoot = false;
+        try {
+          const _siteRoot = new URL(_curUrl).origin + "/";
+          if (_siteRoot !== _curUrl && !_curUrl.endsWith("/")) {
+            console.log(`[IFRAME] Iframe not found — trying site root: ${_siteRoot}`);
+            await page.goto(_siteRoot, { waitUntil: "domcontentloaded", timeout: 12000 });
+            await page.waitForTimeout(1800);
+            // Re-try frame locator after navigation
+            for (const sel of iframeSelectors) {
+              try {
+                const el2 = await page.$(sel);
+                if (!el2) continue;
+                if (!(await el2.isVisible().catch(() => false))) continue;
+                frameLocator = page.frameLocator(sel);
+                console.log(`[IFRAME] Found iframe at site root via: ${sel}`);
+                _retriedRoot = true;
+                break;
+              } catch {}
+            }
+          }
+        } catch {}
+        if (!frameLocator) {
+        console.log("[IFRAME] Could not locate iframe even at site root — falling back to main page");
         // Fall back to main page availability check
         await this.fillAvailabilityDates(
           page,
@@ -3474,6 +3518,7 @@ class HotSessionManager {
         await this.waitForAvailabilityResults(page);
         const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
         return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
+        } // end if (!frameLocator after root retry)
       }
 
       // ── Vendor-specific date selectors ────────────────────
@@ -3705,6 +3750,125 @@ class HotSessionManager {
           ok: searchClicked && (resultDetected || initialFrameLen > 360),
           message: resultDetected ? 'clock_pms_availability_ready' : 'clock_pms_availability_not_confirmed',
           screenshot_base64,
+        };
+      }
+
+      // ── Quendoo calendar-based widget ─────────────────────────
+      if (normalizedVendor === 'quendoo' || vendor.toLowerCase().includes('quendoo')) {
+        // Strategy 1: Reload iframe with date params in URL
+        try {
+          const _quendooBase = iframeSrc.split('?')[0];
+          const _quendooParams = new URLSearchParams(iframeSrc.includes('?') ? iframeSrc.split('?')[1] : '');
+          // Parse dates: checkin="2026-03-16" → DD.MM.YYYY for quendoo
+          const _ciParts = checkin.split('-');
+          const _coParts = checkout.split('-');
+          if (_ciParts.length === 3) {
+            _quendooParams.set('arrival', checkin);
+            _quendooParams.set('departure', checkout);
+            _quendooParams.set('checkin', `${_ciParts[2]}.${_ciParts[1]}.${_ciParts[0]}`);
+            _quendooParams.set('checkout', `${_coParts[2]}.${_coParts[1]}.${_coParts[0]}`);
+            _quendooParams.set('adults', guests);
+            _quendooParams.set('guests', guests);
+          }
+          const _newSrc = `${_quendooBase}?${_quendooParams.toString()}`;
+          console.log(`[QUENDOO] Reloading iframe with dates: ${_newSrc.slice(0, 120)}`);
+          // Find and reload the quendoo iframe
+          const _qFrame = await page.$('iframe[src*="quendoo"], iframe[src*="booking.quendoo"]').catch(() => null);
+          if (_qFrame) {
+            await page.evaluate((src: string) => {
+              const iframes = Array.from(document.querySelectorAll('iframe'));
+              for (const f of iframes) {
+                if (f.src && f.src.includes('quendoo')) {
+                  f.src = src;
+                  break;
+                }
+              }
+            }, _newSrc).catch(() => {});
+            await page.waitForTimeout(3000);
+          }
+        } catch (qErr) {
+          console.log(`[QUENDOO] URL param strategy failed: ${qErr instanceof Error ? qErr.message : String(qErr)}`);
+        }
+
+        // Strategy 2: Try to interact with the calendar inside iframe
+        await page.waitForTimeout(2000);
+        const _qBookingFrame = await this.findBookingFrameWithContent(page, 5000).catch(() => null);
+        if (_qBookingFrame) {
+          const _qFrameText = (await _qBookingFrame.locator('body').innerText().catch(() => '')).slice(0, 200);
+          console.log(`[QUENDOO] iframe content after reload: len=${_qFrameText.length} preview="${_qFrameText.slice(0,80)}"`);
+          
+          // Try clicking calendar days in the iframe
+          const _ciDay = parseInt(checkin.split('-')[2] || '0');
+          const _coDay = parseInt(checkout.split('-')[2] || '0');
+          
+          // Click first available date matching checkin day
+          const _daySels = [
+            `[class*="day"]:has-text("${_ciDay}")`,
+            `td:has-text("${_ciDay}")`,
+            `[role="gridcell"]:has-text("${_ciDay}")`,
+            `[data-date*="${checkin}"]`,
+            `[aria-label*="${_ciDay}"]`,
+          ];
+          let _calClickOk = false;
+          for (const _ds of _daySels) {
+            try {
+              const _dayEl = _qBookingFrame.locator(_ds).first();
+              if (await _dayEl.isVisible({ timeout: 500 }).catch(() => false)) {
+                await _dayEl.click({ timeout: 1500 }).catch(() => {});
+                console.log(`[QUENDOO] Clicked checkin day via: ${_ds}`);
+                _calClickOk = true;
+                await page.waitForTimeout(600);
+                break;
+              }
+            } catch {}
+          }
+          
+          if (_calClickOk) {
+            // Click checkout day
+            const _coSels = [
+              `[class*="day"]:has-text("${_coDay}")`,
+              `td:has-text("${_coDay}")`,
+              `[role="gridcell"]:has-text("${_coDay}")`,
+              `[data-date*="${checkout}"]`,
+            ];
+            for (const _cs of _coSels) {
+              try {
+                const _coEl = _qBookingFrame.locator(_cs).first();
+                if (await _coEl.isVisible({ timeout: 500 }).catch(() => false)) {
+                  await _coEl.click({ timeout: 1500 }).catch(() => {});
+                  console.log(`[QUENDOO] Clicked checkout day via: ${_cs}`);
+                  await page.waitForTimeout(600);
+                  break;
+                }
+              } catch {}
+            }
+          }
+          
+          // Try search/reserve button in Quendoo iframe
+          const _qSearchSels = [
+            'button:has-text("Reserve")', 'button:has-text("Резервирай")',
+            'button:has-text("Book")', 'button:has-text("Search")',
+            'button:has-text("Check")', 'button[type="submit"]',
+            '.booking-button', '[class*="reserve"]', '[class*="submit"]',
+          ];
+          for (const _qss of _qSearchSels) {
+            try {
+              const _btn = _qBookingFrame.locator(_qss).first();
+              if (await _btn.isVisible({ timeout: 500 }).catch(() => false)) {
+                await _btn.click({ timeout: 2000 }).catch(() => {});
+                console.log(`[QUENDOO] Clicked search button: ${_qss}`);
+                break;
+              }
+            } catch {}
+          }
+        }
+
+        await this.waitForAvailabilityResults(page);
+        const _qScreenshot = await this.takeAvailabilityScreenshot(page);
+        return {
+          ok: true,
+          message: 'quendoo_availability_attempted',
+          screenshot_base64: _qScreenshot,
         };
       }
 
@@ -4697,6 +4861,18 @@ class HotSessionManager {
         const CHECKOUT_KEYWORDS = /завършв|checkout|payment|плащ|details|данни\s*за\s*к|your\s*details|guest\s*details|contact|контакт/i;
         const TARIFF_KEYWORDS   = /тариф|rates?|price|цена|стаи\s*и|room\s*sel|select\s*room/i;
         const ROOMS_KEYWORDS    = /стаи|rooms?|accommodation|настанявне|нощувки/i;
+        // Noise filter — reject strings that look like dates, login buttons, or icon garbage
+        const isStepNoise = (s: string): boolean => {
+          const t = s.toLowerCase().trim();
+          if (!t || t.length < 2) return true;
+          if (t.length > 35) return true; // too long for a step label
+          if (/\d{1,2}\s+(яну|фев|мар|апр|май|юни|юли|авг|сеп|окт|ное|дек|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(t)) return true; // date string
+          if (/arrow_back|arrow_forward|arrow_drop|chevron|expand_more|expand_less/i.test(t)) return true; // icon
+          if (/вход|sign.?in|log.?in|регистр|имейл|email.*вход|login/i.test(t)) return true; // login
+          if (/резервирам за|book for|reserve for/i.test(t)) return true; // toggle
+          if (/\d{4}/.test(t)) return true; // year in step label = it's a date
+          return false;
+        };
 
         const isVisible = (el: Element): boolean => {
           const s = window.getComputedStyle(el as any);
@@ -4741,8 +4917,8 @@ class HotSessionManager {
         // Стратегия 1: Quasar q-tabs (Clock PMS)
         const qTabs = Array.from(document.querySelectorAll(".q-tab, [class*='q-tab']")).filter(isVisible);
         if (qTabs.length >= 2 && qTabs.length <= 8) {
-          const steps = qTabs.map(t => extractStepText(t)).filter(s => s.length > 1);
-          const currentIdx = qTabs.findIndex(t => getActiveClass(t));
+          const steps = qTabs.map(t => extractStepText(t)).filter(s => s.length > 1 && !isStepNoise(s));
+          const currentIdx = qTabs.findIndex(t => getActiveClass(t) && !isStepNoise(extractStepText(t)));
           if (steps.length >= 2) {
             const cur = currentIdx >= 0 ? steps[currentIdx] : steps[0];
             const nxt = currentIdx >= 0 && currentIdx < steps.length - 1 ? steps[currentIdx + 1] : "";
@@ -5428,8 +5604,26 @@ rooms: rooms,
             `[RESERVATION] Using availability iframe schema ui_type=${uiType} vendor=${vendor} url=${availSchema.url}`
           );
 
-          await this.ensureOnSchemaUrl(page, availSchema.url);
-          await page.waitForTimeout(1000);
+          // ✅ v10 FIX: Smart URL — if iframe is already on page, don't navigate
+          const _mrkHasFrame = !!this.findBookingFrame(page);
+          if (!_mrkHasFrame) {
+            await this.ensureOnSchemaUrl(page, availSchema.url);
+            await page.waitForTimeout(1200);
+            // If still no iframe at schema URL, try site root
+            if (!this.findBookingFrame(page) && availSchema.url) {
+              try {
+                const _siteRoot = new URL(availSchema.url).origin + "/";
+                if (_siteRoot !== page.url()) {
+                  console.log(`[RESERVATION][CHECK] No iframe at schema URL → trying site root: ${_siteRoot}`);
+                  await page.goto(_siteRoot, { waitUntil: "domcontentloaded", timeout: 12000 });
+                  await page.waitForTimeout(1800);
+                }
+              } catch {}
+            }
+          } else {
+            console.log(`[RESERVATION][CHECK] Booking iframe present on ${page.url()} — skipping schema URL nav`);
+            await page.waitForTimeout(800);
+          }
 
           const result = await this.fillIframeBookingWidget(
             page,
@@ -6584,8 +6778,8 @@ async function main() {
   app.get("/", (_, res) => {
     res.json({
       name: "NEO Worker",
-      version: "9.0.0",
-      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
+      version: "10.0.0",
+      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
       mode: "universal-dom-first",
       has_make_reservation: true,
       has_universal_widget_engine: true,
@@ -6595,8 +6789,8 @@ async function main() {
    app.get("/health", (_, res) => {
     res.json({
       status: "ok",
-      version: "9.0.0",
-      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
+      version: "10.0.0",
+      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
       has_make_reservation: true,
       has_universal_widget_engine: true,
       ...manager.getStatus()
@@ -6606,8 +6800,8 @@ async function main() {
   app.get("/__routes", (_, res) => {
     res.json({
       success: true,
-      version: "9.0.0",
-      build: "neo-worker_v9_step_indicator_dom_scan_2026-03-15",
+      version: "10.0.0",
+      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
       routes: [
         "GET /",
         "GET /health",
@@ -6721,8 +6915,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v9.0.0 Universal Widget Engine + Step Indicator listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v9_step_indicator_dom_scan_2026-03-15 port=${PORT}`);
+    console.log(`🚀 NEO Worker v10.0.0 listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
