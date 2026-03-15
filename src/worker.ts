@@ -1,5 +1,5 @@
 /**
- * NEO WORKER v10.0.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
+ * NEO WORKER v11.0.0 — Universal Widget Engine + Smart URL + Quendoo + Verbatim
  *
  * v8.0.0 — НОВА АРХИТЕКТУРА:
  * ─────────────────────────────────────────────────────────────────
@@ -3453,72 +3453,75 @@ class HotSessionManager {
     try {
       console.log(`[IFRAME] vendor=${vendor} src=${iframeSrc.slice(0, 80)}`);
 
-      // Locate the iframe
+      // ✅ v11 FIX: Detect vendor FIRST so we can skip frameLocator for clock_pms/quendoo
+      // clock_pms uses bookingFrame (Playwright Frame object), NOT frameLocator
+      // quendoo uses its own calendar handler
+      const _earlyNormalizedVendor = this.normalizeBookingEngine(vendor);
+      const _isClockPms  = _earlyNormalizedVendor === 'clock_pms';
+      const _isQuendoo   = _earlyNormalizedVendor === 'quendoo' || vendor.toLowerCase().includes('quendoo');
+
+      // Locate the iframe via CSS frameLocator (needed for non-clock_pms generic fill)
       let frameLocator: any = null;
-             const iframeSelectors = [
-        iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
-        `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
-        "iframe",
-      ].filter(Boolean) as string[];
-      for (const sel of iframeSelectors) {
-        try {
-          const el = await page.$(sel);
-          if (!el) continue;
-          const visible = await el.isVisible().catch(() => false);
-          if (!visible) continue;
-          frameLocator = page.frameLocator(sel);
-          break;
-        } catch {}
+      if (!_isClockPms && !_isQuendoo) {
+        const iframeSelectors = [
+          iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
+          `iframe[src*="${vendor !== "unknown" ? vendor : "booking"}"]`,
+          "iframe",
+        ].filter(Boolean) as string[];
+        for (const sel of iframeSelectors) {
+          try {
+            const el = await page.$(sel);
+            if (!el) continue;
+            const visible = await el.isVisible().catch(() => false);
+            if (!visible) continue;
+            frameLocator = page.frameLocator(sel);
+            break;
+          } catch {}
+        }
+      } else {
+        console.log(`[IFRAME] vendor=${_earlyNormalizedVendor} — skipping frameLocator, using direct Frame`);
       }
-      if (!frameLocator) {
-        // ✅ v10 FIX: Before falling back, try site root URL
+      if (!frameLocator && !_isClockPms && !_isQuendoo) {
+        // Generic vendor — try site root before main-page fallback
         const _curUrl = page.url();
-        let _retriedRoot = false;
         try {
           const _siteRoot = new URL(_curUrl).origin + "/";
           if (_siteRoot !== _curUrl && !_curUrl.endsWith("/")) {
-            console.log(`[IFRAME] Iframe not found — trying site root: ${_siteRoot}`);
+            console.log(`[IFRAME] Generic vendor — trying site root: ${_siteRoot}`);
             await page.goto(_siteRoot, { waitUntil: "domcontentloaded", timeout: 12000 });
             await page.waitForTimeout(1800);
-            // Re-try frame locator after navigation
-            for (const sel of iframeSelectors) {
+            const iframeSelectors2 = [
+              iframeSrc ? `iframe[src*="${iframeSrc.slice(0, 40)}"]` : "",
+              "iframe",
+            ].filter(Boolean) as string[];
+            for (const sel of iframeSelectors2) {
               try {
                 const el2 = await page.$(sel);
                 if (!el2) continue;
                 if (!(await el2.isVisible().catch(() => false))) continue;
                 frameLocator = page.frameLocator(sel);
                 console.log(`[IFRAME] Found iframe at site root via: ${sel}`);
-                _retriedRoot = true;
                 break;
               } catch {}
             }
           }
         } catch {}
+
         if (!frameLocator) {
-        console.log("[IFRAME] Could not locate iframe even at site root — falling back to main page");
-        // Fall back to main page availability check
-        await this.fillAvailabilityDates(
-          page,
-          {
-            id: "",
-            session_id: "",
-            url: page.url(),
-            domain: "",
-            kind: "availability",
-            fingerprint: "",
-            schema: {},
-            dom_snapshot: null,
-          } as FormSchemaRow,
-          checkin,
-          checkout,
-          guests,
-          rooms
-        );
-        const clicked = await this.clickAvailabilitySearch(page);
-        await this.waitForAvailabilityResults(page);
-        const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
-        return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
-        } // end if (!frameLocator after root retry)
+          console.log("[IFRAME] Could not locate iframe — falling back to main page");
+          await this.fillAvailabilityDates(
+            page,
+            {
+              id: "", session_id: "", url: page.url(), domain: "",
+              kind: "availability", fingerprint: "", schema: {}, dom_snapshot: null,
+            } as FormSchemaRow,
+            checkin, checkout, guests, rooms
+          );
+          const clicked = await this.clickAvailabilitySearch(page);
+          await this.waitForAvailabilityResults(page);
+          const screenshot_base64 = await this.takeAvailabilityScreenshot(page);
+          return { ok: true, message: "iframe_fallback_main_page", screenshot_base64 };
+        }
       }
 
       // ── Vendor-specific date selectors ────────────────────
@@ -3753,121 +3756,172 @@ class HotSessionManager {
         };
       }
 
-      // ── Quendoo calendar-based widget ─────────────────────────
-      if (normalizedVendor === 'quendoo' || vendor.toLowerCase().includes('quendoo')) {
-        // Strategy 1: Reload iframe with date params in URL
-        try {
-          const _quendooBase = iframeSrc.split('?')[0];
-          const _quendooParams = new URLSearchParams(iframeSrc.includes('?') ? iframeSrc.split('?')[1] : '');
-          // Parse dates: checkin="2026-03-16" → DD.MM.YYYY for quendoo
-          const _ciParts = checkin.split('-');
-          const _coParts = checkout.split('-');
-          if (_ciParts.length === 3) {
-            _quendooParams.set('arrival', checkin);
-            _quendooParams.set('departure', checkout);
-            _quendooParams.set('checkin', `${_ciParts[2]}.${_ciParts[1]}.${_ciParts[0]}`);
-            _quendooParams.set('checkout', `${_coParts[2]}.${_coParts[1]}.${_coParts[0]}`);
-            _quendooParams.set('adults', guests);
-            _quendooParams.set('guests', guests);
-          }
-          const _newSrc = `${_quendooBase}?${_quendooParams.toString()}`;
-          console.log(`[QUENDOO] Reloading iframe with dates: ${_newSrc.slice(0, 120)}`);
-          // Find and reload the quendoo iframe
-          const _qFrame = await page.$('iframe[src*="quendoo"], iframe[src*="booking.quendoo"]').catch(() => null);
-          if (_qFrame) {
-            await page.evaluate((src: string) => {
-              const iframes = Array.from(document.querySelectorAll('iframe'));
-              for (const f of iframes) {
-                if (f.src && f.src.includes('quendoo')) {
-                  f.src = src;
-                  break;
-                }
-              }
-            }, _newSrc).catch(() => {});
-            await page.waitForTimeout(3000);
-          }
-        } catch (qErr) {
-          console.log(`[QUENDOO] URL param strategy failed: ${qErr instanceof Error ? qErr.message : String(qErr)}`);
-        }
+      // ── Quendoo calendar widget — click-based date picker ──────
+      if (_isQuendoo) {
+        // Quendoo is a SPA calendar — must click on "Пристигане"/"Напускане" labels
+        // then click the correct day numbers in the calendar grid
 
-        // Strategy 2: Try to interact with the calendar inside iframe
-        await page.waitForTimeout(2000);
-        const _qBookingFrame = await this.findBookingFrameWithContent(page, 5000).catch(() => null);
-        if (_qBookingFrame) {
-          const _qFrameText = (await _qBookingFrame.locator('body').innerText().catch(() => '')).slice(0, 200);
-          console.log(`[QUENDOO] iframe content after reload: len=${_qFrameText.length} preview="${_qFrameText.slice(0,80)}"`);
-          
-          // Try clicking calendar days in the iframe
-          const _ciDay = parseInt(checkin.split('-')[2] || '0');
-          const _coDay = parseInt(checkout.split('-')[2] || '0');
-          
-          // Click first available date matching checkin day
+        const _qFrame = await this.findBookingFrameWithContent(page, 5000).catch(() => null);
+        const _qCtx: any = _qFrame || page;
+
+        console.log(`[QUENDOO] Starting calendar interaction frame=${!!_qFrame}`);
+
+        // Parse dates
+        const _ciParts = checkin.split('-');  // ["2026","03","16"]
+        const _coParts = checkout.split('-');
+        const _ciDay = parseInt(_ciParts[2] || '1');
+        const _coDay = parseInt(_coParts[2] || '1');
+        const _ciMonth = parseInt(_ciParts[1] || '1');
+        const _coMonth = parseInt(_coParts[1] || '1');
+
+        // Helper: click a day in the Quendoo calendar
+        const clickQuendooDay = async (dayNum: number, monthNum: number, hint: string): Promise<boolean> => {
+          // Quendoo calendar day selectors (SPA React/Vue calendar)
           const _daySels = [
-            `[class*="day"]:has-text("${_ciDay}")`,
-            `td:has-text("${_ciDay}")`,
-            `[role="gridcell"]:has-text("${_ciDay}")`,
-            `[data-date*="${checkin}"]`,
-            `[aria-label*="${_ciDay}"]`,
+            `[class*="day"][data-date*="${checkin.slice(0,7)}-${String(dayNum).padStart(2,'0')}"]`,
+            `[class*="day"][data-date*="-${String(dayNum).padStart(2,'0')}"]`,
+            `[class*="DayCell"]:not([class*="disabled"]):not([class*="past"])`,
+            `[class*="calendar-day"]:not([class*="disabled"])`,
+            `[role="gridcell"]:not([aria-disabled="true"])`,
+            `td[class*="available"]:not([class*="disabled"])`,
+            `[class*="day"]:not([class*="disabled"]):not([class*="inactive"])`,
           ];
-          let _calClickOk = false;
-          for (const _ds of _daySels) {
+
+          // First try: click by data-date attribute
+          for (const sel of _daySels.slice(0, 2)) {
             try {
-              const _dayEl = _qBookingFrame.locator(_ds).first();
-              if (await _dayEl.isVisible({ timeout: 500 }).catch(() => false)) {
-                await _dayEl.click({ timeout: 1500 }).catch(() => {});
-                console.log(`[QUENDOO] Clicked checkin day via: ${_ds}`);
-                _calClickOk = true;
-                await page.waitForTimeout(600);
-                break;
+              const el = _qCtx.locator(sel).first();
+              if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+                await el.click({ timeout: 2000 });
+                console.log(`[QUENDOO] ${hint}: clicked via data-date selector`);
+                return true;
               }
             } catch {}
           }
-          
-          if (_calClickOk) {
-            // Click checkout day
-            const _coSels = [
-              `[class*="day"]:has-text("${_coDay}")`,
-              `td:has-text("${_coDay}")`,
-              `[role="gridcell"]:has-text("${_coDay}")`,
-              `[data-date*="${checkout}"]`,
-            ];
-            for (const _cs of _coSels) {
-              try {
-                const _coEl = _qBookingFrame.locator(_cs).first();
-                if (await _coEl.isVisible({ timeout: 500 }).catch(() => false)) {
-                  await _coEl.click({ timeout: 1500 }).catch(() => {});
-                  console.log(`[QUENDOO] Clicked checkout day via: ${_cs}`);
-                  await page.waitForTimeout(600);
-                  break;
-                }
-              } catch {}
+
+          // Second: find by text content matching day number
+          try {
+            const allDays = await _qCtx.locator(`[class*="day"], [class*="Day"], [role="gridcell"], td`).all().catch(() => []);
+            for (const dayEl of allDays) {
+              const txt = (await dayEl.textContent().catch(() => "")).trim();
+              if (txt !== String(dayNum)) continue;
+              const visible = await dayEl.isVisible().catch(() => false);
+              if (!visible) continue;
+              // Check not disabled
+              const cls = await dayEl.getAttribute('class').catch(() => '') || '';
+              if (/disabled|inactive|past|prev|next/i.test(cls)) continue;
+              await dayEl.click({ timeout: 2000 });
+              console.log(`[QUENDOO] ${hint}: clicked day ${dayNum} by text`);
+              return true;
+            }
+          } catch {}
+          return false;
+        };
+
+        let _calSuccess = false;
+
+        // Step 1: Click the "Пристигане" / checkin field to open calendar
+        const _ciFieldSels = [
+          '[class*="arrival"], [class*="Arrival"], [class*="checkin"], [class*="CheckIn"]',
+          'input[placeholder*="Пристигане"], input[placeholder*="Check-in"], input[placeholder*="Arrival"]',
+          '[class*="date-picker"]:first-child, [class*="datepicker"]:first-child',
+          'button[class*="date"]:first-child',
+          'div[class*="input"]:has-text("Пристигане"), div[class*="input"]:has-text("Arrival")',
+        ];
+
+        let _ciFieldClicked = false;
+        for (const sel of _ciFieldSels) {
+          try {
+            const el = _qCtx.locator(sel).first();
+            if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+              await el.click({ timeout: 2000 });
+              console.log(`[QUENDOO] Opened checkin picker via: ${sel}`);
+              _ciFieldClicked = true;
+              await page.waitForTimeout(800);
+              break;
+            }
+          } catch {}
+        }
+
+        // Step 2: If calendar opened, click the checkin day
+        if (_ciFieldClicked) {
+          _calSuccess = await clickQuendooDay(_ciDay, _ciMonth, 'checkin');
+          if (_calSuccess) {
+            await page.waitForTimeout(600);
+
+            // Step 3: Click checkout day (calendar may already be on checkout mode)
+            const _coSuccess = await clickQuendooDay(_coDay, _coMonth, 'checkout');
+            if (!_coSuccess) {
+              // Try clicking the checkout field first
+              const _coFieldSels = [
+                'input[placeholder*="Заминаване"], input[placeholder*="Check-out"], input[placeholder*="Departure"]',
+                '[class*="departure"], [class*="Departure"], [class*="checkout"], [class*="CheckOut"]',
+              ];
+              for (const sel of _coFieldSels) {
+                try {
+                  const el = _qCtx.locator(sel).first();
+                  if (await el.isVisible({ timeout: 600 }).catch(() => false)) {
+                    await el.click({ timeout: 1500 });
+                    await page.waitForTimeout(500);
+                    await clickQuendooDay(_coDay, _coMonth, 'checkout-after-click');
+                    break;
+                  }
+                } catch {}
+              }
+            }
+            await page.waitForTimeout(500);
+          }
+        }
+
+        // Step 4: Set guests count
+        try {
+          const _guestSelectors = [
+            'input[placeholder*="Гости"], input[placeholder*="Adults"], select[class*="guests"]',
+            '[class*="guests"] input, [class*="adult"] input, [class*="person"] input',
+          ];
+          for (const gSel of _guestSelectors) {
+            const gEl = _qCtx.locator(gSel).first();
+            if (await gEl.isVisible({ timeout: 500 }).catch(() => false)) {
+              await gEl.fill(guests).catch(() => {});
+              break;
             }
           }
-          
-          // Try search/reserve button in Quendoo iframe
-          const _qSearchSels = [
-            'button:has-text("Reserve")', 'button:has-text("Резервирай")',
-            'button:has-text("Book")', 'button:has-text("Search")',
-            'button:has-text("Check")', 'button[type="submit"]',
-            '.booking-button', '[class*="reserve"]', '[class*="submit"]',
-          ];
-          for (const _qss of _qSearchSels) {
-            try {
-              const _btn = _qBookingFrame.locator(_qss).first();
-              if (await _btn.isVisible({ timeout: 500 }).catch(() => false)) {
-                await _btn.click({ timeout: 2000 }).catch(() => {});
-                console.log(`[QUENDOO] Clicked search button: ${_qss}`);
-                break;
-              }
-            } catch {}
-          }
+        } catch {}
+
+        // Step 5: Click search/reserve button
+        const _qSearchSels = [
+          'button:has-text("РЕЗЕРВИРАЙ")', 'button:has-text("Резервирай")',
+          'button:has-text("Reserve")', 'button:has-text("Book")',
+          'button:has-text("Search")', 'button:has-text("Търси")',
+          'button[type="submit"]', '[class*="submit"]', '[class*="search-btn"]',
+        ];
+        let _qSearchClicked = false;
+        for (const sel of _qSearchSels) {
+          try {
+            const btn = _qCtx.locator(sel).first();
+            if (await btn.isVisible({ timeout: 600 }).catch(() => false)) {
+              await btn.click({ timeout: 2000 });
+              console.log(`[QUENDOO] Clicked search: ${sel}`);
+              _qSearchClicked = true;
+              break;
+            }
+          } catch {}
         }
 
+        await page.waitForTimeout(2500);
         await this.waitForAvailabilityResults(page);
         const _qScreenshot = await this.takeAvailabilityScreenshot(page);
+
+        const _qFrameAfter = await this.findBookingFrameWithContent(page, 3000).catch(() => null);
+        const _qResultText = _qFrameAfter
+          ? (await _qFrameAfter.locator('body').innerText().catch(() => '')).slice(0, 200)
+          : '';
+        const _qHasRooms = _qResultText.length > 100 && !/^(Пристигане|Arrival|Check-in)/.test(_qResultText.trim());
+        console.log(`[QUENDOO] Result: calSuccess=${_calSuccess} searchClicked=${_qSearchClicked} hasRooms=${_qHasRooms} len=${_qResultText.length}`);
+
         return {
-          ok: true,
-          message: 'quendoo_availability_attempted',
+          ok: _qSearchClicked || _calSuccess,
+          message: _qHasRooms ? 'quendoo_availability_ready' : 'quendoo_availability_attempted',
           screenshot_base64: _qScreenshot,
         };
       }
@@ -6779,7 +6833,7 @@ async function main() {
     res.json({
       name: "NEO Worker",
       version: "10.0.0",
-      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
+      build: "neo-worker_v11_clock_fix_quendoo_calendar_2026-03-15",
       mode: "universal-dom-first",
       has_make_reservation: true,
       has_universal_widget_engine: true,
@@ -6790,7 +6844,7 @@ async function main() {
     res.json({
       status: "ok",
       version: "10.0.0",
-      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
+      build: "neo-worker_v11_clock_fix_quendoo_calendar_2026-03-15",
       has_make_reservation: true,
       has_universal_widget_engine: true,
       ...manager.getStatus()
@@ -6801,7 +6855,7 @@ async function main() {
     res.json({
       success: true,
       version: "10.0.0",
-      build: "neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15",
+      build: "neo-worker_v11_clock_fix_quendoo_calendar_2026-03-15",
       routes: [
         "GET /",
         "GET /health",
@@ -6915,8 +6969,8 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v10.0.0 listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v10_smart_url_quendoo_verbatim_2026-03-15 port=${PORT}`);
+    console.log(`🚀 NEO Worker v11.0.0 listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v11_clock_fix_quendoo_calendar_2026-03-15 port=${PORT}`);
     console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
