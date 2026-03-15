@@ -382,7 +382,7 @@ function isBadClickableLabel(raw: string): boolean {
   if (!s) return true;
 
   // ✅ Booking action labels — ALWAYS allow these regardless of other checks
-  if (/покажи\s*тарифит|show\s*rate|izberi|избери|book\s*now|резервирай|напред|next\s*step/i.test(s)) return false;
+  if (/покажи\s*тарифит|show\s*rate|избери|book\s*now|резервирай|напред|next\s*step/i.test(s)) return false;
 
   // Exact match — pure icon-only labels
   const exactBad = new Set([
@@ -396,6 +396,9 @@ function isBadClickableLabel(raw: string): boolean {
     "календар на заетостта", "calendar на заетостта", "availability calendar",
   ]);
   if (exactBad.has(s)) return true;
+
+  // Bad if label starts with "покажи повече" (expand details, not booking)
+  if (/^покажи\s*повече/i.test(s)) return true;
 
   // Bad if label ENDS with an icon word (e.g. "покажи повече expand_more" → bad)
   const badSuffixes = ["expand more", "expand less", "chevron right", "chevron left", "arrow drop down"];
@@ -4599,6 +4602,24 @@ class HotSessionManager {
             console.log("[BOOKING_NAV] Checkout reached after modal handling ✓"); return true;
           }
 
+          // ✅ If stuck on tariff step with no ИЗБЕРИ found, try scrolling frame
+          // and searching for ИЗБЕРИ with force approach
+          if (_sameTextCount >= 2 && hasTariffContent) {
+            console.log("[BOOKING_NAV] Stuck on tariff step — trying frame-wide ИЗБЕРИ search");
+            const _stuckBtns = await ctx.locator("button, [role='button']").all().catch(() => []);
+            for (const _sb of _stuckBtns) {
+              const _st = (await _sb.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+              if (!/избери|ИЗБЕРИ|select|reserve/i.test(_st) || _st.length > 60) continue;
+              await _sb.scrollIntoViewIfNeeded().catch(() => {});
+              await page.waitForTimeout(200);
+              await _sb.click({ timeout: 2000, force: true }).catch(() => {});
+              console.log(`[BOOKING_NAV] Stuck-recovery clicked: "${_st}"`);
+              _sameTextCount = 0; _prevFrameText = "";
+              await page.waitForTimeout(800);
+              break;
+            }
+          }
+
           if (_sameTextCount >= 4) {
             console.log("[BOOKING_NAV] Stuck — same frame text 4+ times, stopping");
             break;
@@ -4616,10 +4637,11 @@ class HotSessionManager {
       }
 
       // ── Room/accommodation selection step ────────────────
-      // NOTE: room card buttons may contain "тариф" (e.g. "ПОКАЖИ ТАРИФИТЕ")
-      // so we detect ACTUAL tariff content by price-per-night patterns or rate plan names
+      // NOTE: "нощувка с" appears in BOTH rooms descriptions AND tariff pages.
+      // We must only match ACTUAL tariff/rates page indicators.
       const hasTariffContent = (
-        /standard.?rate|нощувка\s*с|meal\s*plan|breakfast\s*included|закуска\s*включ/i.test(frameText) ||
+        /standard.?rate|standard.?rate.?bb|meal\s*plan|bb\s*plan|rate\s*name/i.test(frameText) ||
+        /breakfast\s*included|нощувка\s*с\s*закуска|закуска\s*включен/i.test(frameText) ||
         /\d+[\.,]\d+\s*(лв|bgn|eur|€|\$)\s*[\/на]\s*нощ/i.test(frameText)
       );
       const isRoomStep = (
@@ -4701,7 +4723,7 @@ class HotSessionManager {
         'button:has-text("ИЗБЕРИ"), button:has-text("Избери"), [role="button"]:has-text("ИЗБЕРИ")'
       ).count().catch(() => 0) > 0;
       const isTariffStep = hasTariffContent || hasIzberiBtn ||
-        /standard.?rate|нощувка\s*с\s*закуска|meal\s*plan|rate\s*name|bb\s*plan|закуска\s*включ/i.test(frameText);
+        /standard.?rate|standard.?rate.?bb|meal\s*plan|rate\s*name|bb\s*plan|нощувка\s*с\s*закуска|закуска\s*включен/i.test(frameText);
       if (isTariffStep) {
         console.log(`[BOOKING_NAV] On tariff/rate step hasIzberi=${hasIzberiBtn} hasTariffContent=${hasTariffContent}`);
 
@@ -4718,13 +4740,12 @@ class HotSessionManager {
           console.log(`[BOOKING_NAV] Set guests via <select> to ${guestNum}`);
         }
 
-        // 2. Clock PMS Quasar dropdown — click to open, then pick value
+        // 2. Clock PMS Quasar dropdown — click to open "Възрастни/Adults" specifically
         if (!_guestsSet) {
+          // Only target the Adults/Guests dropdown by label — NOT any q-field (would open language/other dropdowns)
           const _qDropLabel = ctx.locator('[class*="q-field"], [class*="q-select"]').filter({ hasText: /Възрастни|Adults|Гости|Guests/i }).first();
-          const _qDropAny = ctx.locator('[class*="q-field"], [class*="q-select"]').first();
-          const _dropTarget = (await _qDropLabel.count().catch(() => 0) > 0) ? _qDropLabel : _qDropAny;
-          if (await _dropTarget.isVisible().catch(() => false)) {
-            await _dropTarget.click({ timeout: 1500 }).catch(() => {});
+          if (await _qDropLabel.count().catch(() => 0) > 0 && await _qDropLabel.isVisible().catch(() => false)) {
+            await _qDropLabel.click({ timeout: 1500 }).catch(() => {});
             await page.waitForTimeout(400);
             // Pick the right option from the opened list
             const _optSel = `[role="option"]:has-text("${guestNum}"), li:has-text("${guestNum}"), .q-item:has-text("${guestNum}")`;
@@ -4738,6 +4759,9 @@ class HotSessionManager {
               await _optInCtx.click({ timeout: 1500 }).catch(() => {});
               _guestsSet = true;
               console.log(`[BOOKING_NAV] Set guests via Quasar dropdown (iframe) to ${guestNum}`);
+            } else {
+              // Close the dropdown if no matching option found
+              await page.keyboard.press("Escape").catch(() => {});
             }
             await page.waitForTimeout(300);
           }
@@ -4765,14 +4789,20 @@ class HotSessionManager {
           const _t = (await _btn.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
           if (!_t) continue;
           if (/избери|select|book|резерв|choose|reserve/i.test(_t) && _t.length <= 60) {
-            if (await _btn.isVisible().catch(() => false)) {
-              await _btn.scrollIntoViewIfNeeded().catch(() => {});
+            // scrollIntoViewIfNeeded to handle buttons below fold
+            await _btn.scrollIntoViewIfNeeded().catch(() => {});
+            await page.waitForTimeout(100);
+            const _vis = await _btn.isVisible().catch(() => false);
+            if (_vis) {
               await _btn.click({ timeout: 2000 }).catch(() => {});
               console.log(`[BOOKING_NAV] Clicked rate CTA: "${_t.replace(/\s+/g, " ")}"`);
               _izberiClicked = true;
               break;
             }
           }
+        }
+        if (!_izberiClicked) {
+          console.log(`[BOOKING_NAV] ИЗБЕРИ not found on tariff step — hasTariffContent=${hasTariffContent}`);
         }
 
         // ── Step C: After ИЗБЕРИ, handle Clock PMS main page overlay ──
@@ -5291,7 +5321,7 @@ rooms: rooms,
                 }
                 // Even if snapshot text didn't change in length, check for tariff/checkout keywords appearing
                 const newSnapLower = newSnap.toLowerCase();
-                if (/тариф|standard.?rate|bb\b|нощувка\s*с|plan|покажи тарифите/i.test(newSnapLower) &&
+                if (/тариф|standard.?rate|bb\b|нощувка\s*с\s*закуска|plan|покажи тарифите/i.test(newSnapLower) &&
                     !/апартамент.*апартамент.*апартамент/i.test(newSnapLower)) {
                   console.log("[RESERVATION][ROOM] tariff step detected in iframe — booking progressed");
                   return true;
@@ -5314,7 +5344,6 @@ rooms: rooms,
             const ctaSelectors = [
               `button:has-text("ПОКАЖИ ТАРИФИТЕ")`,
               `button:has-text("Покажи тарифите")`,
-              `button:has-text("Покажи")`,
               `button:has-text("Тарифи")`,
               `button:has-text("Резервирай")`,
               `button:has-text("Избери")`,
