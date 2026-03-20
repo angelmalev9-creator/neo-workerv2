@@ -7014,10 +7014,11 @@ async function main() {
     res.json({
       name: "NEO Worker",
       version: "10.0.0",
-      build: "neo-worker_v12-1_ts_fixes_2026-03-15",
-      mode: "universal-dom-first",
-      has_make_reservation: true,
-      has_universal_widget_engine: true,
+      build: "neo-worker_v13-0_form-only_2026-03-20",
+      mode: "form-fill-only",
+      has_make_reservation: false,
+      has_universal_widget_engine: false,
+      reservations: "google-calendar",
     });
   });
 
@@ -7025,9 +7026,10 @@ async function main() {
     res.json({
       status: "ok",
       version: "10.0.0",
-      build: "neo-worker_v12-1_ts_fixes_2026-03-15",
-      has_make_reservation: true,
-      has_universal_widget_engine: true,
+      build: "neo-worker_v13-0_form-only_2026-03-20",
+      has_make_reservation: false,
+      has_universal_widget_engine: false,
+      reservations: "google-calendar",
       ...manager.getStatus()
     });
   });
@@ -7043,8 +7045,6 @@ async function main() {
         "GET /__routes",
         "POST /prepare-session",
         "POST /fill-form",
-        "POST /check-availability",
-        "POST /make-reservation",
         "POST /execute",
         "GET /forms/:sessionId",
         "POST /refresh-forms",
@@ -7076,39 +7076,24 @@ async function main() {
     res.json(r);
   });
 
-  app.post("/check-availability", async (req: Request, res: Response) => {
-    const { site_id, session_id, form_id, fingerprint, data } = req.body || {};
-    if (!site_id || !data) {
-      return res.json({ success: false, message: "Missing site_id/data" });
-    }
-    console.log(`[HTTP][/check-availability] site_id=${site_id} session_id=${session_id || ""}`);
-
-    // Delegate through executeFillForm with kind=availability
-    const r = await manager.executeFillForm({
-      site_id: String(site_id),
-      session_id: session_id ? String(session_id) : undefined,
-      form_id: form_id ? String(form_id) : undefined,
-      fingerprint: fingerprint ? String(fingerprint) : undefined,
-      kind: "availability",
-      data: data as Record<string, unknown>,
-      auto_submit: false,
+  // ── /check-availability: DISABLED — reservations now handled via Google Calendar ──
+  app.post("/check-availability", (_req: Request, res: Response) => {
+    console.log("[HTTP][/check-availability] DISABLED — reservations via Google Calendar");
+    res.status(410).json({
+      success: false,
+      disabled: true,
+      message: "check-availability is disabled. Reservations are now managed via Google Calendar.",
     });
-    res.json(r);
   });
 
-  // ── /make-reservation: full hotel booking workflow ─────────────────
-  app.post("/make-reservation", async (req: Request, res: Response) => {
-    const body = req.body as MakeReservationRequest;
-    if (!body?.site_id || !body?.phase) {
-      return res.json({ success: false, message: "Missing site_id/phase" });
-    }
-    if (body.phase === "check" && (!body.check_in || !body.check_out)) {
-      return res.json({ success: false, message: "Missing check_in/check_out for phase=check" });
-    }
-
-           console.log(`[HTTP][/make-reservation] HIT site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""} guests=${body.guests || ""} session_id=${body.session_id || ""}`);
-    const r = await manager.makeReservation(body);
-    res.json(r);
+  // ── /make-reservation: DISABLED — reservations now handled via Google Calendar ──
+  app.post("/make-reservation", (_req: Request, res: Response) => {
+    console.log("[HTTP][/make-reservation] DISABLED — reservations via Google Calendar");
+    res.status(410).json({
+      success: false,
+      disabled: true,
+      message: "make-reservation is disabled. Reservations are now managed via Google Calendar.",
+    });
   });
 
   app.post("/execute", async (req: Request, res: Response) => {
@@ -7150,9 +7135,10 @@ async function main() {
   });
 
   app.listen(PORT, () => {
-    console.log(`🚀 NEO Worker v12.1.0 listening on :${PORT}`);
-    console.log(`[BOOT] build=neo-worker_v12-1_ts_fixes_2026-03-15 port=${PORT}`);
-    console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /check-availability, POST /make-reservation, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
+    console.log(`🚀 NEO Worker v13.0.0 listening on :${PORT}`);
+    console.log(`[BOOT] build=neo-worker_v13-0_form-only_2026-03-20 port=${PORT}`);
+    console.log(`[BOOT] mode=form-fill-only reservations=google-calendar`);
+    console.log(`[BOOT] routes=GET /, GET /health, GET /__routes, POST /prepare-session, POST /fill-form, POST /execute, GET /forms/:sessionId, POST /refresh-forms, POST /close-session`);
   });
 
   await manager.start();
