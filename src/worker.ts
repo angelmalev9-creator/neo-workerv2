@@ -7062,6 +7062,8 @@ async function main() {
         "GET /__routes",
         "POST /prepare-session",
         "POST /fill-form",
+        "POST /check-availability",
+        "POST /make-reservation",
         "POST /execute",
         "GET /forms/:sessionId",
         "POST /refresh-forms",
@@ -7093,24 +7095,43 @@ async function main() {
     res.json(r);
   });
 
-  // ── /check-availability: DISABLED — reservations now handled via Google Calendar ──
-  app.post("/check-availability", (_req: Request, res: Response) => {
-    console.log("[HTTP][/check-availability] DISABLED — reservations via Google Calendar");
-    res.status(410).json({
-      success: false,
-      disabled: true,
-      message: "check-availability is disabled. Reservations are now managed via Google Calendar.",
+  // External/native website availability remains browser-driven.
+  // Owner-configured NEO Google Calendar uses widget-book-slot and never reaches these routes.
+  app.post("/check-availability", async (req: Request, res: Response) => {
+    const { site_id, session_id, form_id, fingerprint, data } = req.body || {};
+    if (!site_id || !data) {
+      return res.json({ success: false, message: "Missing site_id/data" });
+    }
+    console.log(`[HTTP][/check-availability] site_id=${site_id} session_id=${session_id || ""}`);
+
+    const r = await manager.executeFillForm({
+      site_id: String(site_id),
+      session_id: session_id ? String(session_id) : undefined,
+      form_id: form_id ? String(form_id) : undefined,
+      fingerprint: fingerprint ? String(fingerprint) : undefined,
+      kind: "availability",
+      data: data as Record<string, unknown>,
+      auto_submit: false,
     });
+    res.json(r);
   });
 
-  // ── /make-reservation: DISABLED — reservations now handled via Google Calendar ──
-  app.post("/make-reservation", (_req: Request, res: Response) => {
-    console.log("[HTTP][/make-reservation] DISABLED — reservations via Google Calendar");
-    res.status(410).json({
-      success: false,
-      disabled: true,
-      message: "make-reservation is disabled. Reservations are now managed via Google Calendar.",
-    });
+  // Accommodation/stay booking workflow. The Supabase proxy capability-gates this
+  // route so only crawler-proven accommodation flows can reach it.
+  app.post("/make-reservation", async (req: Request, res: Response) => {
+    const body = req.body as MakeReservationRequest;
+    if (!body?.site_id || !body?.phase) {
+      return res.json({ success: false, message: "Missing site_id/phase" });
+    }
+    if (body.phase === "check" && (!body.check_in || !body.check_out)) {
+      return res.json({ success: false, message: "Missing check_in/check_out for phase=check" });
+    }
+
+    console.log(
+      `[HTTP][/make-reservation] HIT site_id=${body.site_id} phase=${body.phase} check_in=${body.check_in || ""} check_out=${body.check_out || ""} guests=${body.guests || ""} session_id=${body.session_id || ""}`,
+    );
+    const r = await manager.makeReservation(body);
+    res.json(r);
   });
 
   app.post("/execute", async (req: Request, res: Response) => {
