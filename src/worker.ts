@@ -857,7 +857,8 @@ class HotSessionManager {
 
     for (let step = 1; step <= maxSteps; step++) {
       const beforeSig = await this.getWizardDomSignature(page);
-      const scanned = await this.scanWizardStep(page);
+      let scanned = await this.scanWizardStep(page);
+      let interactedThisStep = false;
 
       console.log(
         `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
@@ -880,7 +881,10 @@ class HotSessionManager {
           actions.push(`${f.label || f.name || f.placeholder || f.type}: ${summarizeValue(f.name || f.type, v)}`);
         }
       }
-      if (filled > 0) didInteract = true;
+      if (filled > 0) {
+        didInteract = true;
+        interactedThisStep = true;
+      }
 
       // 2) Handle choice button groups (generic — matches any choice from data)
       for (const group of scanned.choiceGroups) {
@@ -936,10 +940,23 @@ class HotSessionManager {
           if (clicked) {
             actions.push(`${group.name}: ${pick.text}`);
             didInteract = true;
+            interactedThisStep = true;
           }
         } else {
           console.log(`[WIZARD][CHOICE] group="${group.name}" desired="${desiredValue}" NO MATCH in options=[${group.options.map(o => o.text).join(",")}]`);
         }
+      }
+
+      // Dynamic booking widgets often reveal the next controls immediately after a
+      // select/button/radio/date interaction WITHOUT a separate "Next" button.
+      // The initial scan above is therefore stale as soon as we interact.
+      // Always rescan the live DOM before deciding what is missing or available.
+      if (interactedThisStep) {
+        await page.waitForTimeout(180);
+        scanned = await this.scanWizardStep(page);
+        console.log(
+          `[WIZARD][RESCAN_AFTER_INTERACTION] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} groups=${scanned.choiceGroups.length}`,
+        );
       }
 
       // 2.5) Missing required: payload-based + DOM verification fallback
