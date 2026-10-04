@@ -843,6 +843,7 @@ class HotSessionManager {
     try {
     const actions: string[] = [];
     const maxSteps = 8;
+    const probeOnly = String((data as any)?.__neo_probe || "").trim() === "1";
 
     const hasAnyData = Object.values(data || {}).some((v) => String(v ?? "").trim().length > 0);
     if (!hasAnyData) {
@@ -861,8 +862,29 @@ class HotSessionManager {
       let interactedThisStep = false;
 
       console.log(
-        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)}`
+        `[WIZARD] step=${step} fields=${scanned.fields.length} choices=${scanned.choices.length} sig=${beforeSig.slice(0, 40)} probe=${probeOnly}`
       );
+
+      // Read-only capability probe: report the CURRENT live controls without
+      // clicking, filling, advancing or submitting anything. This is the contract
+      // expected by the universal appointment orchestrator.
+      if (probeOnly) {
+        const probeNeed = this.buildWizardNeedPayload(scanned, {});
+        const obs = await this.quickObserve(page);
+        (obs as any).needs_input = true;
+        (obs as any).wizard_next = {
+          ...probeNeed,
+          step,
+          total_steps: maxSteps,
+          advanced: false,
+          last_clicked: null,
+          probe: true,
+        };
+        console.log(
+          `[WIZARD][PROBE] read-only fields=${scanned.fields.length} choices=${scanned.choices.length} groups=${scanned.choiceGroups.length}`,
+        );
+        return { ok: false, message: "Wizard: probe", observation: obs };
+      }
 
       // 1) Fill visible fields
       let filled = 0;
